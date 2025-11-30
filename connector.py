@@ -15,7 +15,7 @@ import logging
 import time
 from logging import Logger
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
 
 import pandas as pd
 from dotenv import load_dotenv
