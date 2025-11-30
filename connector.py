@@ -1014,6 +1014,14 @@ def _fetch_and_publish_recent(
         return pd.DataFrame()
 
     df_to_publish = df_ohlcv
+
+    if redis_client is None:
+        if data_gate is not None:
+            data_gate.record_publish(df_to_publish, symbol=symbol, timeframe=timeframe_norm)
+        newest = int(df_to_publish["open_time"].max())
+        last_open_time_ms[key] = newest
+        return df_to_publish
+
     publish_ok = publish_ohlcv_to_redis(
         df_to_publish,
         symbol=symbol,
@@ -1173,6 +1181,7 @@ def stream_fx_data(
     fx: ForexConnect,
     *,
     redis_client: Optional[Any],
+    require_redis: bool = True,
     poll_seconds: int,
     publish_interval_seconds: int,
     lookback_minutes: int,
@@ -1192,7 +1201,7 @@ def stream_fx_data(
     `publish_interval_seconds` — мінімальний інтервал між публікаціями свічок у Redis.
     """
 
-    if redis_client is None:
+    if require_redis and redis_client is None:
         log.error("Стрім неможливий без Redis-клієнта.")
         return
 
@@ -1384,15 +1393,23 @@ def main() -> None:
         _ensure_metrics_server(config.observability.metrics_port)
 
     redis_client = _create_redis_client(config.redis)
-    if redis_client is not None:
+    if redis_client is not None and config.redis_required:
         redis_ok = run_redis_healthcheck(redis_client)
         if not redis_ok:
             log.error(
                 "Redis health-check не пройдено. Публікацію буде вимкнено на цю сесію."
             )
             redis_client = None
-    else:
-        log.warning("Redis не налаштований — дані не будуть відправлені.")
+
+    if redis_client is None:
+        if config.redis_required:
+            log.error(
+                "Redis не налаштований, а FXCM_REDIS_REQUIRED=1 — завершую роботу."
+            )
+            return
+        log.warning(
+            "Redis недоступний — публікація вимкнена (file-only режим)."
+        )
 
     cache_manager: Optional[HistoryCache] = None
     if config.cache.enabled:
@@ -1422,7 +1439,7 @@ def main() -> None:
 
     redis_holder: Dict[str, Optional[Any]] = {"client": redis_client}
     redis_reconnector: Optional[Callable[[], Any]] = None
-    if redis is not None:
+    if config.redis_required and redis is not None:
         redis_stream_backoff = BackoffController(config.backoff.redis_stream)
 
         def _redis_reconnect() -> Any:
@@ -1515,17 +1532,28 @@ def main() -> None:
                     len(warmup_slice),
                 )
         if stream_mode:
-            if redis is None:
-                log.error("Пакет redis не встановлено — режим стріму неможливий.")
-                return
-            if redis_holder["client"] is None:
-                if redis_reconnector is None:
-                    log.error("Redis недоступний — режим стріму неможливий.")
+            if config.redis_required:
+                if redis is None:
+                    log.error("Пакет redis не встановлено — режим стріму неможливий.")
                     return
-                redis_holder["client"] = redis_reconnector()
+                if redis_holder["client"] is None:
+                    if redis_reconnector is None:
+                        log.error("Redis недоступний — режим стріму неможливий.")
+                        return
+                    redis_holder["client"] = redis_reconnector()
+            else:
+                if redis is None:
+                    log.info(
+                        "Пакет redis не встановлено — продовжуємо лише з файловим кешем."
+                    )
+                elif redis_holder["client"] is None:
+                    log.info(
+                        "Redis недоступний — працюємо у file-only режимі (без публікацій)."
+                    )
             stream_fx_data(
                 fx_active,
                 redis_client=redis_holder["client"],
+                require_redis=config.redis_required,
                 poll_seconds=poll_seconds,
                 publish_interval_seconds=config.publish_interval_seconds,
                 lookback_minutes=lookback_minutes,

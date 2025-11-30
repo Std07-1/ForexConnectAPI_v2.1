@@ -391,6 +391,34 @@ class ReconnectLogicTest(unittest.TestCase):
         self.assertGreater(len(replacement_redis.messages), 0)
 
 
+class FileOnlyModeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixed_now = dt.datetime(2025, 5, 5, 12, 0, tzinfo=dt.timezone.utc)
+
+    def test_stream_runs_without_redis_when_not_required(self) -> None:
+        fx = FakeForexConnect(_make_sample_df(self.fixed_now - dt.timedelta(minutes=5), 5))
+        gate = PublishDataGate()
+
+        with mock.patch("connector._now_utc", return_value=self.fixed_now), mock.patch(
+            "connector.is_trading_time", return_value=True
+        ):
+            stream_fx_data(
+                cast(connector.ForexConnect, fx),
+                redis_client=None,
+                require_redis=False,
+                poll_seconds=0,
+                publish_interval_seconds=0,
+                lookback_minutes=5,
+                config=[("XAU/USD", "m1")],
+                cache_manager=None,
+                max_cycles=1,
+                data_gate=gate,
+            )
+
+        staleness = gate.staleness_seconds(symbol="XAU/USD", timeframe="m1")
+        self.assertIsNotNone(staleness)
+
+
 class DataQualityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.fixed_now = dt.datetime(2025, 5, 6, 12, 0, tzinfo=dt.timezone.utc)

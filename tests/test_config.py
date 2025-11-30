@@ -23,10 +23,13 @@ class BackoffConfigTest(unittest.TestCase):
             tmp_path = Path(tmp.name)
         return tmp_path
 
-    def _load_with_payload(self, payload: dict[str, object]):
+    def _load_with_payload(self, payload: dict[str, object], extra_env: dict[str, str] | None = None):
         runtime_path = self._write_runtime_settings(payload)
         try:
-            with mock.patch.dict(os.environ, self._base_env, clear=False):
+            env = dict(self._base_env)
+            if extra_env:
+                env.update(extra_env)
+            with mock.patch.dict(os.environ, env, clear=False):
                 with mock.patch.object(config, "RUNTIME_SETTINGS_FILE", runtime_path):
                     return config.load_config()
         finally:
@@ -86,6 +89,13 @@ class BackoffConfigTest(unittest.TestCase):
         cfg_override = self._load_with_payload(runtime_payload)
         self.assertEqual(cfg_override.poll_seconds, 3)
         self.assertEqual(cfg_override.publish_interval_seconds, 9)
+
+    def test_redis_required_flag_respects_env_override(self) -> None:
+        cfg_default = self._load_with_payload({})
+        self.assertTrue(cfg_default.redis_required)
+
+        cfg_optional = self._load_with_payload({}, {"FXCM_REDIS_REQUIRED": "0"})
+        self.assertFalse(cfg_optional.redis_required)
 
 
 if __name__ == "__main__":

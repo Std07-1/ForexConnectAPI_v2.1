@@ -237,6 +237,7 @@ class FXCMConfig:
     backoff: BackoffSettings
     hmac_secret: Optional[str]
     hmac_algo: str
+    redis_required: bool
 
 
 def load_config() -> FXCMConfig:
@@ -341,6 +342,8 @@ def load_config() -> FXCMConfig:
         os.environ.get("FXCM_HMAC_ALGO", "sha256").strip().lower() or "sha256"
     )
 
+    redis_required = _get_bool_env("FXCM_REDIS_REQUIRED", True)
+
     return FXCMConfig(
         username=username,
         password=password,
@@ -359,4 +362,5 @@ def load_config() -> FXCMConfig:
         backoff=backoff_settings,
         hmac_secret=hmac_secret,
         hmac_algo=hmac_algo,
+        redis_required=redis_required,
     )

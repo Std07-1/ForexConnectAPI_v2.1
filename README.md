@@ -94,6 +94,7 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 | `FXCM_CONNECTION` | `Demo` | Demo/Real. |
 | `FXCM_HOST_URL` | `http://www.fxcorporate.com/Hosts.jsp` | Endpoint для SDK. |
 | `FXCM_REDIS_HOST` / `FXCM_REDIS_PORT` | `127.0.0.1` / `6379` | Redis для стріму. |
+| `FXCM_REDIS_REQUIRED` | `1` | Якщо `1` — Redis обов'язковий; `0` → file-only режим (лише кеш). |
 | `FXCM_REDIS_PASSWORD` | – | Опційний пароль (ACL). |
 | `FXCM_CACHE_ENABLED` | `1` | Керує HistoryCache. |
 | `FXCM_METRICS_ENABLED` | `1` | Вмикає Prometheus-server. |
@@ -146,6 +147,7 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 - `PublishDataGate` відкидає дублікати та зберігає останні `open_time` / `close_time` для lag-метрик.
 - Кожне видання барів → Prometheus `fxcm_ohlcv_bars_total` та оновлення лагів.
 - Якщо FXCM повертає `PriceHistoryCommunicator is not ready` або торгове вікно закрите — піднімається `MarketTemporarilyClosed`, публікується `state=closed` і heartbeat `idle` з `next_open`.
+- File-only fallback: встанови `FXCM_REDIS_REQUIRED=0`, щоб дозволити стрім працювати навіть без Redis (оновлюється лише кеш + лаг-метрики).
 
 ## 8. Runbook продакшн-деплою
 
