@@ -1,0 +1,65 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.env.*
+.envrc
+.venv/
+.venv_fxcm37/
+env/
+venv/
+ENV/
+
+# Cache & state directories
+cache/
+.pytest_cache/
+.mypy_cache/
+
+# History files
+.pyre/
+History/
+
+# Editors / IDE
+.idea/
+.vscode/
+
+# Logs & temp files
+*.log
+*.tmp
+*.swp
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Local runtime overrides (if created)
+config/runtime_settings.local.json
+config/calendar_overrides.local.json
+
+# Secrets / keys
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.der
+secrets/

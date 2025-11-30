@@ -1,0 +1,7 @@
+forexconnect==1.6.43
+pandas>=1.1.5,<1.2
+rich>=13.0
+python-dotenv>=0.21,<1.0
+redis>=4.6
+typing-extensions>=4.0
+prometheus-client>=0.17

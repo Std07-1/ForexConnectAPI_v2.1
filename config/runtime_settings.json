@@ -1,0 +1,37 @@
+{
+    "cache": {
+        "dir": "cache",
+        "max_bars": 3000,
+        "warmup_bars": 1000
+    },
+    "stream": {
+        "mode": 1,
+        "poll_seconds": 5,
+        "fetch_interval_seconds": 5,
+        "publish_interval_seconds": 5,
+        "lookback_minutes": 5,
+        "config": "XAU/USD:m1,XAU/USD:m5, EUR/USD:m1,EUR/USD:m5"
+    },
+    "sample_request": {
+        "symbol": "XAU/USD",
+        "timeframe": "m1",
+        "hours": 24
+    },
+    "backoff": {
+        "fxcm_login": {
+            "base_delay": 2.0,
+            "factor": 2.0,
+            "max_delay": 60.0
+        },
+        "fxcm_stream": {
+            "base_delay": 5.0,
+            "factor": 2.0,
+            "max_delay": 300.0
+        },
+        "redis_stream": {
+            "base_delay": 1.0,
+            "factor": 2.0,
+            "max_delay": 60.0
+        }
+    }
+}
