@@ -18,6 +18,13 @@ from connector import HistoryCache, PublishDataGate, publish_ohlcv_to_redis, str
 from fxcm_security import compute_payload_hmac
 
 
+def _make_session_match(now: dt.datetime, tag: str = "LDN_METALS") -> sessions.SessionMatch:
+    base_date = now.date()
+    session_open = dt.datetime.combine(base_date, dt.time(8, 30), tzinfo=dt.timezone.utc)
+    session_close = dt.datetime.combine(base_date, dt.time(16, 30), tzinfo=dt.timezone.utc)
+    return sessions.SessionMatch(tag, "Europe/London", session_open, session_close, "UTC")
+
+
 class FakeForexConnect:
     def __init__(self, df: pd.DataFrame) -> None:
         self.df = df.copy()
@@ -220,7 +227,13 @@ class WarmupStreamTest(unittest.TestCase):
             if channel == connector.REDIS_STATUS_CHANNEL
         ]
         self.assertTrue(status_messages)
-        self.assertEqual(status_messages[-1]["state"], "closed")
+        last_status = status_messages[-1]
+        self.assertEqual(last_status["state"], "closed")
+        self.assertIn("next_open_ms", last_status)
+        self.assertIn("next_open_in_seconds", last_status)
+        self.assertIn("session", last_status)
+        self.assertEqual(last_status["session"].get("tag"), "NY_METALS")
+        self.assertIn("timezone", last_status["session"])
 
         heartbeat_messages = [
             json.loads(payload)
@@ -228,7 +241,12 @@ class WarmupStreamTest(unittest.TestCase):
             if channel == heartbeat_channel
         ]
         self.assertTrue(heartbeat_messages)
-        self.assertEqual(heartbeat_messages[-1]["state"], "idle")
+        last_heartbeat = heartbeat_messages[-1]
+        self.assertEqual(last_heartbeat["state"], "idle")
+        self.assertIn("context", last_heartbeat)
+        self.assertEqual(last_heartbeat["context"]["mode"], "idle")
+        self.assertIn("idle_reason", last_heartbeat["context"])
+        self.assertIn("session", last_heartbeat["context"])
 
 
 class HeartbeatContractTest(unittest.TestCase):
@@ -260,17 +278,24 @@ class HeartbeatContractTest(unittest.TestCase):
         self.assertTrue(published)
         heartbeat_messages = self._extract_channel_messages(redis_client, heartbeat_channel)
         self.assertTrue(heartbeat_messages)
-        self.assertEqual(heartbeat_messages[-1]["state"], "warmup")
-        self.assertIn("last_bar_close_ms", heartbeat_messages[-1])
+        last_msg = heartbeat_messages[-1]
+        self.assertEqual(last_msg["state"], "warmup")
+        self.assertIn("last_bar_close_ms", last_msg)
+        self.assertIn("context", last_msg)
+        self.assertEqual(last_msg["context"].get("mode"), "warmup_sample")
+        self.assertIn("stream_targets", last_msg["context"])
+        self.assertIn("session", last_msg["context"])
 
     def test_stream_publishes_stream_heartbeat(self) -> None:
         fx = FakeForexConnect(_make_sample_df(self.fixed_now - dt.timedelta(minutes=10), 10))
         redis_client = FakeRedis()
         heartbeat_channel = "fxcm:test:heartbeat"
 
+        session_match = _make_session_match(self.fixed_now)
+
         with mock.patch("connector._now_utc", return_value=self.fixed_now), mock.patch(
             "connector.is_trading_time", return_value=True
-        ):
+        ), mock.patch("connector.resolve_session", return_value=session_match):
             stream_fx_data(
                 cast(connector.ForexConnect, fx),
                 redis_client=redis_client,
@@ -285,8 +310,28 @@ class HeartbeatContractTest(unittest.TestCase):
 
         heartbeat_messages = self._extract_channel_messages(redis_client, heartbeat_channel)
         self.assertTrue(heartbeat_messages)
-        self.assertEqual(heartbeat_messages[-1]["state"], "stream")
-        self.assertIn("last_bar_close_ms", heartbeat_messages[-1])
+        last_msg = heartbeat_messages[-1]
+        self.assertEqual(last_msg["state"], "stream")
+        self.assertIn("last_bar_close_ms", last_msg)
+        self.assertIn("context", last_msg)
+        ctx = last_msg["context"]
+        self.assertEqual(ctx.get("mode"), "stream")
+        self.assertIn("stream_targets", ctx)
+        self.assertIn("cycle_seconds", ctx)
+        self.assertIn("session", ctx)
+        session_block = ctx["session"]
+        self.assertEqual(session_block.get("tag"), "LDN_METALS")
+        self.assertEqual(session_block.get("timezone"), "Europe/London")
+        self.assertEqual(session_block.get("session_open_utc"), session_match.session_open_utc.isoformat())
+        stats = session_block.get("stats")
+        self.assertIsInstance(stats, dict)
+        self.assertIn("LDN_METALS", stats)
+        symbols = stats["LDN_METALS"].get("symbols")
+        self.assertTrue(symbols)
+        first_symbol = symbols[0]
+        self.assertIn("range", first_symbol)
+        self.assertIn("avg", first_symbol)
+        self.assertGreater(first_symbol["bars"], 0)
 
     def test_idle_heartbeat_uses_cache_last_close(self) -> None:
         df = _make_sample_df(self.fixed_now - dt.timedelta(minutes=5), 5)
@@ -323,6 +368,11 @@ class HeartbeatContractTest(unittest.TestCase):
         last_msg = heartbeat_messages[-1]
         self.assertEqual(last_msg["state"], "idle")
         self.assertEqual(last_msg.get("last_bar_close_ms"), expected_close)
+        self.assertIn("context", last_msg)
+        ctx = last_msg["context"]
+        self.assertEqual(ctx.get("mode"), "idle")
+        self.assertIn("lag_seconds", ctx)
+        self.assertIn("session", ctx)
 
 
 class ReconnectLogicTest(unittest.TestCase):
@@ -553,6 +603,23 @@ class CalendarOverrideTest(unittest.TestCase):
             weekly_close=self.snapshot["weekly_close"],
             replace_holidays=True,
         )
+
+    def test_next_trading_open_respects_new_york_standard_time(self) -> None:
+        ts = dt.datetime(2025, 11, 30, 21, 29, 43, tzinfo=dt.timezone.utc)
+        expected = dt.datetime(2025, 11, 30, 23, 0, tzinfo=dt.timezone.utc)
+        self.assertEqual(sessions.next_trading_open(ts), expected)
+
+    def test_next_trading_open_respects_new_york_dst(self) -> None:
+        ts = dt.datetime(2025, 7, 13, 20, 29, 0, tzinfo=dt.timezone.utc)
+        expected = dt.datetime(2025, 7, 13, 22, 0, tzinfo=dt.timezone.utc)
+        self.assertEqual(sessions.next_trading_open(ts), expected)
+
+    def test_is_trading_time_false_during_new_york_maintenance(self) -> None:
+        maintenance_dt = dt.datetime(2025, 7, 7, 21, 30, tzinfo=dt.timezone.utc)
+        after_reopen = dt.datetime(2025, 7, 7, 22, 5, tzinfo=dt.timezone.utc)
+        self.assertFalse(sessions.is_trading_time(maintenance_dt))
+        self.assertTrue(sessions.is_trading_time(after_reopen))
+
 
     def test_override_calendar_with_extra_holiday(self) -> None:
         sessions.override_calendar(holidays=["2030-01-02"], replace_holidays=True)

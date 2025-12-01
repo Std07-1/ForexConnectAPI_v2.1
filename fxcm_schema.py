@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from typing import Dict, List
 
 try:  # Python 3.7 fallback для TypedDict
     from typing import TypedDict
@@ -24,8 +25,44 @@ class RedisBar(TypedDict):
     volume: float
 
 
+class SessionSymbolStatsPayload(TypedDict, total=False):
+    symbol: str
+    tf: str
+    bars: int
+    range: float
+    avg: float
+    high: float
+    low: float
+
+
+class SessionStatsEntryPayload(TypedDict, total=False):
+    tag: str
+    timezone: str
+    session_open_utc: str
+    session_close_utc: str
+    symbols: List[SessionSymbolStatsPayload]
+
+
+class SessionContextPayload(TypedDict, total=False):
+    tag: str
+    timezone: str
+    weekly_open: str
+    weekly_close: str
+    daily_breaks: List[dict]
+    holidays: List[str]
+    next_open_utc: str
+    next_open_ms: int
+    next_open_seconds: float
+    session_open_utc: str
+    session_close_utc: str
+    stats: Dict[str, SessionStatsEntryPayload]
+
+
 class MarketStatusPayload(TypedDict, total=False):
     type: str
     state: str
     ts: str
     next_open_utc: str
+    next_open_ms: int
+    next_open_in_seconds: float
+    session: SessionContextPayload

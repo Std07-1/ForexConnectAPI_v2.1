@@ -17,8 +17,8 @@
 Конектор логіниться в FXCM через ForexConnect, витягує OHLCV-бари, нормалізує їх до AiOne_t-схеми та транслює у Redis:
 
 - `fxcm:ohlcv` — основні дані (із опційним HMAC-підписом `sig`).
-- `fxcm:market_status` — події `open/closed` з `next_open_utc`.
-- `fxcm:heartbeat` (налаштовується) — технічний стан процесу.
+- `fxcm:market_status` — події `open/closed` з `next_open_utc`, `next_open_ms`, `next_open_in_seconds` та блоком `session` (таймзона, години роботи, перерви).
+- `fxcm:heartbeat` (налаштовується) — технічний стан процесу з розширеним `context` (канал, Redis-стан, лаг, стрім-таргети, причина паузи, тривалість циклу тощо).
 
 Локальний файловий кеш (`cache/` або зовнішня директорія) мінімізує холодний старт, а Prometheus-метрики дають спостережність.
 
@@ -26,6 +26,7 @@
 
 - Warmup історії + стрім `m1/m5/...` таймфреймів у Redis.
 - Торговий календар з урахуванням 24/5, денних перерв і свят (`sessions.py`).
+- Автоматичне визначення активної сесії (Tokyo/London/New York) + статистика range/avg по кожній сесії у heartbeat/market-status.
 - Прометеус-метрики: опубліковані бари, лаг, стейлнесс, статус ринку, помилки.
 - HMAC-підпис/верифікація (спільний `fxcm_security.compute_payload_hmac`).
 - Graceful cache fallback: при IO-помилці кеш стає read-only, але стрім триває.
@@ -100,9 +101,29 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 | `FXCM_METRICS_ENABLED` | `1` | Вмикає Prometheus-server. |
 | `FXCM_METRICS_PORT` | `9200` | Порт `/metrics`. |
 | `FXCM_HEARTBEAT_CHANNEL` | `fxcm:heartbeat` | Куди шлеться heartbeat. |
+| `FXCM_SESSION_TAG` | `AUTO` | Якщо `AUTO` — тег визначається за `session_windows`; можна вказати фіксований (наприклад, `LDN_METALS`). |
 | `FXCM_HMAC_SECRET` | – | Секрет для `sig`. Якщо задано — `fxcm_ingestor` вимагає підпис. |
 | `FXCM_HMAC_ALGO` | `sha256` | Алгоритм (`sha256`, `sha512`, ...). |
 | `FXCM_INGEST_HMAC_SECRET` | – | (ingestor) переозначення секрету, fallback → `FXCM_HMAC_SECRET`. |
+
+> **Мультисесії:** `sessions.py` тепер використовує `zoneinfo`, тож календарні оверрайди можуть посилатися на `Europe/London`, `Asia/Tokyo` тощо. Для кожного потоку можна виставити власний тег (наприклад, `FXCM_SESSION_TAG=LDN_METALS`) або залишити `AUTO`, тоді тег вибирається відповідно до `session_windows`. Приклад для «недільного» старту через Токіо з паузою перед Лондоном:
+>
+> ```json
+> {
+>   "weekly_open_utc": "00:00@Asia/Tokyo",
+>   "daily_breaks": [
+>     "06:00-08:30@UTC",
+>     "21:55-23:00@UTC"
+>   ],
+>   "session_windows": [
+>     { "tag": "TOKYO_METALS", "start": "00:00", "end": "06:00", "tz": "UTC", "timezone": "Asia/Tokyo" },
+>     { "tag": "LDN_METALS", "start": "08:30", "end": "14:30", "tz": "UTC", "timezone": "Europe/London" },
+>     { "tag": "NY_METALS", "start": "14:30", "end": "21:55", "tz": "UTC", "timezone": "America/New_York" }
+>   ]
+> }
+> ```
+>
+> Heartbeat/market-status `context.session` тепер містить актуальний тег, таймзону, `session_open_utc`/`session_close_utc` та секцію `stats` (range/avg) для кожної сесії за останні 24 години, тож UI може показувати реальний перехід «Tokyo → London → New York» без накладок.
 
 > **Секрети:** `.env.template` — лише плейсхолдер. Використовуй секрет-стор (Azure Key Vault, GitHub Secrets тощо). Не коміть `.env`.
 
@@ -198,6 +219,113 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
   - `fxcm_connector_errors_total{type}` — `fxcm`, `redis`, `cache_io`, `pricehistory_not_ready`.
   - `fxcm_market_status` (0/1), `fxcm_next_open_seconds`.
 
+  ### 9.1 Контракти heartbeat та market-status
+
+  **Heartbeat (`fxcm:heartbeat`):**
+
+  ```json
+  {
+    "type": "heartbeat",
+    "state": "stream",
+    "ts": "2025-11-30T22:28:52+00:00",
+    "last_bar_close_ms": 1764541739999,
+    "context": {
+      "channel": "fxcm:heartbeat",
+      "mode": "stream",
+      "redis_connected": true,
+      "redis_required": true,
+      "redis_channel": "fxcm:ohlcv",
+      "poll_seconds": 5,
+      "lookback_minutes": 5,
+      "publish_interval_seconds": 5,
+      "cycle_seconds": 0.42,
+      "lag_seconds": 1.1,
+      "stream_targets": [
+        { "symbol": "XAU/USD", "tf": "m1", "staleness_seconds": 1.1 }
+      ],
+      "published_bars": 2,
+      "cache_enabled": true,
+      "session": {
+        "tag": "LDN_METALS",
+        "timezone": "Europe/London",
+        "session_open_utc": "2025-11-30T08:30:00+00:00",
+        "session_close_utc": "2025-11-30T14:30:00+00:00",
+        "weekly_open": "00:00@Asia/Tokyo",
+        "weekly_close": "21:55@America/New_York",
+        "daily_breaks": [
+          { "start": "06:00", "end": "08:30", "tz": "UTC" },
+          { "start": "21:55", "end": "23:00", "tz": "UTC" }
+        ],
+        "next_open_utc": "2025-11-30T23:00:00+00:00",
+        "next_open_ms": 1764543600000,
+        "next_open_seconds": 1800.0,
+        "stats": {
+          "TOKYO_METALS": {
+            "tag": "TOKYO_METALS",
+            "timezone": "Asia/Tokyo",
+            "session_open_utc": "2025-11-30T00:00:00+00:00",
+            "session_close_utc": "2025-11-30T06:00:00+00:00",
+            "symbols": [
+              { "symbol": "XAUUSD", "tf": "1m", "bars": 360, "range": 4084.0, "avg": 4235.32 }
+            ]
+          },
+          "LDN_METALS": {
+            "tag": "LDN_METALS",
+            "timezone": "Europe/London",
+            "session_open_utc": "2025-11-30T08:30:00+00:00",
+            "session_close_utc": "2025-11-30T14:30:00+00:00",
+            "symbols": [
+              { "symbol": "XAUUSD", "tf": "1m", "bars": 240, "range": 2383.0, "avg": 4251.0 }
+            ]
+          }
+        }
+      }
+    }
+  }
+  ```
+
+  **Market status (`fxcm:market_status`):**
+
+  ```json
+  {
+    "type": "market_status",
+    "state": "closed",
+    "ts": "2025-11-30T22:29:00+00:00",
+    "next_open_utc": "2025-11-30T23:00:00+00:00",
+    "next_open_ms": 1764543600000,
+    "next_open_in_seconds": 1800.0,
+    "session": {
+      "tag": "LDN_METALS",
+      "timezone": "Europe/London",
+      "session_open_utc": "2025-11-30T08:30:00+00:00",
+      "session_close_utc": "2025-11-30T14:30:00+00:00",
+      "weekly_open": "00:00@Asia/Tokyo",
+      "weekly_close": "21:55@America/New_York",
+      "daily_breaks": [
+        { "start": "06:00", "end": "08:30", "tz": "UTC" },
+        { "start": "21:55", "end": "23:00", "tz": "UTC" }
+      ],
+      "next_open_utc": "2025-11-30T23:00:00+00:00",
+      "next_open_ms": 1764543600000,
+      "next_open_seconds": 1800.0,
+      "stats": {
+        "TOKYO_METALS": {
+          "tag": "TOKYO_METALS",
+          "timezone": "Asia/Tokyo",
+          "session_open_utc": "2025-11-30T00:00:00+00:00",
+          "session_close_utc": "2025-11-30T06:00:00+00:00",
+          "symbols": [
+            { "symbol": "XAUUSD", "tf": "1m", "bars": 360, "range": 4084.0, "avg": 4235.32 }
+          ]
+        }
+      }
+    }
+  }
+  ```
+
+  Контекст idle/warmup/warmup_cache додає `idle_reason`, `next_open_seconds`, `cache_source`, `published_bars` тощо; `lag_seconds` обчислюється навіть коли нових барів немає.
+  `context.session` синхронізований із торговим календарем (`sessions.py`) і містить тег сесії, таймзону, години роботи, перерви, наступне відкриття/завершення поточної сесії та `stats` (range/avg/bars) для кожної сесії за останню добу.
+
 - **Heartbeat payload:**
 
   ```json
@@ -278,6 +406,10 @@ ruff check .
 
 - Календар зберігається у `config/calendar_overrides.json`.
 - Атрибути: `holidays`, `daily_breaks`, `weekly_open_utc`, `weekly_close_utc`.
+- `session_windows` — необов'язковий масив `{tag,start,end,tz,timezone}` для автоперемикання heartbeat-тегів та підрахунку сесійних метрик.
+- `daily_breaks` приймає рядки `HH:MM-HH:MM@TZ`, масиви `['HH:MM','HH:MM','America/New_York']` або об'єкти `{start,end,tz}`.
+- `weekly_open_utc`/`weekly_close_utc` підтримують суфікс таймзони (`@America/New_York`), за замовчуванням UTC.
+- Дефолт відповідає FXCM/TradingView для металів: неділя 18:00  п'ятниця 16:55 (New York) з щоденною паузою 17:00-18:00 (New York) та автоматичним DST.
 - Усі середовища читають один файл, але deployment tooling може підміняти під конкретний контур.
 - Під час старту логуються активні оверрайди.
 

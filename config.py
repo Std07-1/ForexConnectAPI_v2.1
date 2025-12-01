@@ -154,6 +154,7 @@ class CalendarSettings:
     daily_breaks: List[Any]
     weekly_open: Optional[str]
     weekly_close: Optional[str]
+    session_windows: List[Any]
 
 
 @dataclass(frozen=True)
@@ -197,11 +198,17 @@ def _load_calendar_settings() -> CalendarSettings:
     weekly_open_norm = str(weekly_open).strip() if isinstance(weekly_open, str) else None
     weekly_close_norm = str(weekly_close).strip() if isinstance(weekly_close, str) else None
 
+    session_windows_raw = payload.get("session_windows")
+    session_windows: List[Any] = (
+        list(session_windows_raw) if isinstance(session_windows_raw, list) else []
+    )
+
     return CalendarSettings(
         holidays=holidays,
         daily_breaks=daily_breaks,
         weekly_open=weekly_open_norm or None,
         weekly_close=weekly_close_norm or None,
+        session_windows=session_windows,
     )
 
 

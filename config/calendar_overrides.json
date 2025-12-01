@@ -11,12 +11,32 @@
         "2025-12-25"
     ],
     "daily_breaks": [
-        "21:58-22:05",
-        [
-            "22:00",
-            "22:15"
-        ]
+        "06:00-08:30@UTC",
+        "21:55-23:00@UTC"
     ],
-    "weekly_open_utc": "22:00",
-    "weekly_close_utc": "22:00"
+    "weekly_open_utc": "00:00@Asia/Tokyo",
+    "weekly_close_utc": "21:55@America/New_York",
+    "session_windows": [
+        {
+            "tag": "TOKYO_METALS",
+            "start": "00:00",
+            "end": "06:00",
+            "tz": "UTC",
+            "timezone": "Asia/Tokyo"
+        },
+        {
+            "tag": "LDN_METALS",
+            "start": "08:30",
+            "end": "14:30",
+            "tz": "UTC",
+            "timezone": "Europe/London"
+        },
+        {
+            "tag": "NY_METALS",
+            "start": "14:30",
+            "end": "21:55",
+            "tz": "UTC",
+            "timezone": "America/New_York"
+        }
+    ]
 }

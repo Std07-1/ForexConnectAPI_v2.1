@@ -5,3 +5,5 @@ python-dotenv>=0.21,<1.0
 redis>=4.6
 typing-extensions>=4.0
 prometheus-client>=0.17
+backports.zoneinfo>=0.2.1; python_version<"3.9"
+tzdata>=2024.1

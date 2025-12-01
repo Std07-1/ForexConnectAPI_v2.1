@@ -9,9 +9,11 @@ POC:
 Приклад запуску:
     $ python connector.py
 """
+from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import time
 from logging import Logger
 from pathlib import Path
@@ -75,16 +77,19 @@ from config import (
     load_config,
 )
 from sessions import (
+    calendar_snapshot,
     generate_request_windows,
     is_trading_time,
     next_trading_open,
     override_calendar,
+    resolve_session,
 )
 from fxcm_security import compute_payload_hmac
 from fxcm_schema import (
     MAX_FUTURE_DRIFT_SECONDS,
     MIN_ALLOWED_BAR_TIMESTAMP_MS,
     MarketStatusPayload,
+    SessionContextPayload,
     RedisBar,
 )
 
@@ -101,8 +106,14 @@ REDIS_CHANNEL = "fxcm:ohlcv"  # канал публікації OHLCV-барів
 REDIS_STATUS_CHANNEL = "fxcm:market_status"  # канал публікації статусу ринку
 BAR_INTERVAL_MS = 60_000  # 1 хвилина у мілісекундах
 _LAST_MARKET_STATUS: Optional[Tuple[str, Optional[int]]] = None  # останній статус ринку для приглушення спаму
+_LAST_MARKET_STATUS_TS: Optional[float] = None  # час останньої трансляції статусу
 _METRICS_SERVER_STARTED = False
 IDLE_LOG_INTERVAL_SECONDS = 300.0  # мінімальний інтервал між повідомленнями про паузу торгів
+MARKET_STATUS_REFRESH_SECONDS = 30.0  # як часто повторно транслювати незмінний статус
+_SESSION_STATS_TRACKER: Optional[SessionStatsTracker] = None
+_SESSION_TAG_SETTING = os.environ.get("FXCM_SESSION_TAG", "AUTO").strip() or "AUTO"
+_AUTO_SESSION_TAG = _SESSION_TAG_SETTING.upper() == "AUTO"
+_DEFAULT_SESSION_TAG = "NY_METALS"
 
 PROM_BARS_PUBLISHED = Counter(
     "fxcm_ohlcv_bars_total",
@@ -117,6 +128,11 @@ PROM_STREAM_LAG_SECONDS = Gauge(
 PROM_STREAM_STALENESS_SECONDS = Gauge(
     "fxcm_stream_staleness_seconds",
     "Час у секундах від останнього опублікованого close_time",
+    ["symbol", "tf"],
+)
+PROM_STREAM_LAST_CLOSE_MS = Gauge(
+    "fxcm_stream_last_close_ms",
+    "Unix epoch (ms) close_time останнього опублікованого бару",
     ["symbol", "tf"],
 )
 PROM_ERROR_COUNTER = Counter(
@@ -231,6 +247,7 @@ def _apply_calendar_overrides(settings: CalendarSettings) -> None:
         daily_breaks=settings.daily_breaks or None,
         weekly_open=settings.weekly_open,
         weekly_close=settings.weekly_close,
+        session_windows=settings.session_windows or None,
         replace_holidays=bool(settings.holidays),
     )
 
@@ -566,14 +583,19 @@ def _publish_market_status(
     *,
     next_open: Optional[dt.datetime] = None,
 ) -> None:
-    global _LAST_MARKET_STATUS
+    global _LAST_MARKET_STATUS, _LAST_MARKET_STATUS_TS
 
     if redis_client is None:
         return
 
     next_open_key = int(next_open.timestamp() * 1000) if next_open else None
     status_key = (state, next_open_key)
-    if _LAST_MARKET_STATUS == status_key:
+    now_monotonic = time.monotonic()
+    if (
+        _LAST_MARKET_STATUS == status_key
+        and _LAST_MARKET_STATUS_TS is not None
+        and now_monotonic - _LAST_MARKET_STATUS_TS < MARKET_STATUS_REFRESH_SECONDS
+    ):
         return
 
     payload: MarketStatusPayload = {
@@ -583,11 +605,18 @@ def _publish_market_status(
     }
     if state == "closed" and next_open is not None:
         payload["next_open_utc"] = next_open.replace(microsecond=0).isoformat()
+        payload["next_open_ms"] = int(next_open.timestamp() * 1000)
+        payload["next_open_in_seconds"] = max(
+            0.0,
+            (next_open - _now_utc()).total_seconds(),
+        )
+    payload["session"] = _build_session_context(next_open, session_stats=_session_stats_snapshot())
 
     message = json.dumps(payload, separators=(",", ":"))
     try:
         redis_client.publish(REDIS_STATUS_CHANNEL, message)
         _LAST_MARKET_STATUS = status_key
+        _LAST_MARKET_STATUS_TS = now_monotonic
         log.info("Статус ринку → %s", state)
         PROM_MARKET_STATUS.set(1 if state == "open" else 0)
     except Exception as exc:  # noqa: BLE001
@@ -602,6 +631,7 @@ def _publish_heartbeat(
     last_bar_close_ms: Optional[int],
     next_open: Optional[dt.datetime] = None,
     sleep_seconds: Optional[float] = None,
+    context: Optional[Dict[str, Any]] = None,
 ) -> None:
     if redis_client is None or not channel:
         return
@@ -617,6 +647,8 @@ def _publish_heartbeat(
         payload["next_open_utc"] = next_open.replace(microsecond=0).isoformat()
     if sleep_seconds is not None:
         payload["sleep_seconds"] = sleep_seconds
+    if context:
+        payload["context"] = context
 
     message = json.dumps(payload, separators=(",", ":"))
     try:
@@ -625,6 +657,67 @@ def _publish_heartbeat(
     except Exception as exc:  # noqa: BLE001
         PROM_ERROR_COUNTER.labels(type="redis").inc()
         log.debug("Heartbeat publish неуспішний: %s", exc)
+
+
+def _calc_lag_seconds(last_close_ms: Optional[int]) -> Optional[float]:
+    if last_close_ms is None:
+        return None
+    now = _now_utc().timestamp()
+    return max(0.0, now - last_close_ms / 1000.0)
+
+
+def _session_stats_snapshot() -> Optional[Dict[str, Any]]:
+    if _SESSION_STATS_TRACKER is None:
+        return None
+    snapshot = _SESSION_STATS_TRACKER.snapshot()
+    return snapshot or None
+
+
+def _build_session_context(
+    next_open: Optional[dt.datetime] = None,
+    *,
+    session_stats: Optional[Dict[str, Any]] = None,
+) -> SessionContextPayload:
+    snapshot = calendar_snapshot()
+    weekly_open = snapshot.get("weekly_open")
+    weekly_close = snapshot.get("weekly_close")
+    default_timezone = "UTC"
+    for candidate in (weekly_open, weekly_close):
+        if isinstance(candidate, str) and "@" in candidate:
+            default_timezone = candidate.split("@", 1)[1] or default_timezone
+            break
+    reference_ts = _now_utc()
+    target_next_open = next_open or next_trading_open(reference_ts)
+    resolved_session = resolve_session(reference_ts) if _AUTO_SESSION_TAG else None
+    if resolved_session is not None:
+        tag = resolved_session.tag
+        timezone = resolved_session.timezone
+    else:
+        tag = _SESSION_TAG_SETTING if not _AUTO_SESSION_TAG else _DEFAULT_SESSION_TAG
+        timezone = default_timezone
+    context: SessionContextPayload = {
+        "tag": tag,
+        "timezone": timezone,
+        "next_open_utc": target_next_open.replace(microsecond=0).isoformat(),
+        "next_open_ms": int(target_next_open.timestamp() * 1000),
+        "next_open_seconds": max(0.0, (target_next_open - _now_utc()).total_seconds()),
+    }
+    if resolved_session is not None:
+        context["session_open_utc"] = resolved_session.session_open_utc.replace(microsecond=0).isoformat()
+        context["session_close_utc"] = resolved_session.session_close_utc.replace(microsecond=0).isoformat()
+    if isinstance(weekly_open, str):
+        context["weekly_open"] = weekly_open
+    if isinstance(weekly_close, str):
+        context["weekly_close"] = weekly_close
+    daily_breaks = snapshot.get("daily_breaks")
+    if isinstance(daily_breaks, list):
+        context["daily_breaks"] = daily_breaks
+    holidays = snapshot.get("holidays")
+    if isinstance(holidays, list):
+        context["holidays"] = holidays
+    if session_stats:
+        context["stats"] = session_stats
+    return context
 
 
 def _normalize_symbol(raw_symbol: str) -> str:
@@ -701,6 +794,157 @@ class PublishDataGate:
         now = _now_utc().timestamp()
         age = max(0.0, now - last_close / 1000.0)
         PROM_STREAM_STALENESS_SECONDS.labels(symbol=key[0], tf=key[1]).set(age)
+        PROM_STREAM_LAG_SECONDS.labels(symbol=key[0], tf=key[1]).set(age)
+        PROM_STREAM_LAST_CLOSE_MS.labels(symbol=key[0], tf=key[1]).set(last_close)
+
+
+class _SessionSymbolStats:
+    def __init__(
+        self,
+        *,
+        tag: str,
+        timezone: str,
+        session_open: dt.datetime,
+        session_close: dt.datetime,
+        symbol: str,
+        timeframe: str,
+    ) -> None:
+        self.tag = tag
+        self.timezone = timezone
+        self.session_open_utc = session_open
+        self.session_close_utc = session_close
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.high: Optional[float] = None
+        self.low: Optional[float] = None
+        self.sum_close = 0.0
+        self.bars = 0
+
+    def update(self, *, high: float, low: float, close: float) -> None:
+        if self.high is None or high > self.high:
+            self.high = high
+        if self.low is None or low < self.low:
+            self.low = low
+        self.sum_close += close
+        self.bars += 1
+
+    def to_symbol_payload(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "symbol": self.symbol,
+            "tf": self.timeframe,
+            "bars": self.bars,
+        }
+        if self.high is not None and self.low is not None:
+            payload["range"] = self.high - self.low
+            payload["high"] = self.high
+            payload["low"] = self.low
+        if self.bars > 0:
+            payload["avg"] = self.sum_close / self.bars
+        return payload
+
+
+class SessionStatsTracker:
+    RETENTION_HOURS = 24
+
+    def __init__(self) -> None:
+        self._entries: Dict[Tuple[str, str], _SessionSymbolStats] = {}
+
+    @staticmethod
+    def _session_key(tag: str, session_open: dt.datetime) -> str:
+        return f"{tag}:{int(session_open.timestamp())}"
+
+    @staticmethod
+    def _symbol_key(symbol: str, timeframe: str) -> str:
+        return f"{_normalize_symbol(symbol)}:{timeframe}"
+
+    def reset(self) -> None:
+        self._entries.clear()
+
+    def ingest(self, symbol: str, timeframe: str, df_bars: pd.DataFrame) -> None:
+        if df_bars.empty:
+            return
+        records = cast(Sequence[Dict[str, Any]], df_bars.to_dict("records"))
+        for record in records:
+            close_time_raw = record.get("close_time")
+            if close_time_raw is None:
+                continue
+            try:
+                close_ts = _ms_to_dt(int(close_time_raw))
+            except Exception:  # noqa: BLE001
+                continue
+            session_info = resolve_session(close_ts)
+            if session_info is None:
+                continue
+            session_key = self._session_key(session_info.tag, session_info.session_open_utc)
+            symbol_key = self._symbol_key(symbol, timeframe)
+            entry_key = (session_key, symbol_key)
+            entry = self._entries.get(entry_key)
+            if entry is None or close_ts >= entry.session_close_utc:
+                entry = _SessionSymbolStats(
+                    tag=session_info.tag,
+                    timezone=session_info.timezone,
+                    session_open=session_info.session_open_utc,
+                    session_close=session_info.session_close_utc,
+                    symbol=_normalize_symbol(symbol),
+                    timeframe=timeframe,
+                )
+                self._entries[entry_key] = entry
+            high_raw = record.get("high")
+            low_raw = record.get("low")
+            close_raw = record.get("close")
+            if high_raw is None or low_raw is None or close_raw is None:
+                continue
+            try:
+                high_val = float(high_raw)
+                low_val = float(low_raw)
+                close_val = float(close_raw)
+            except Exception:  # noqa: BLE001
+                continue
+            entry.update(high=high_val, low=low_val, close=close_val)
+        self._prune()
+
+    def snapshot(self) -> Dict[str, Any]:
+        self._prune()
+        result: Dict[str, Any] = {}
+        for entry in self._entries.values():
+            if entry.bars == 0:
+                continue
+            bucket = result.setdefault(
+                entry.tag,
+                {
+                    "tag": entry.tag,
+                    "timezone": entry.timezone,
+                    "session_open_utc": entry.session_open_utc.replace(microsecond=0).isoformat(),
+                    "session_close_utc": entry.session_close_utc.replace(microsecond=0).isoformat(),
+                    "symbols": [],
+                },
+            )
+            bucket.setdefault("symbols", []).append(entry.to_symbol_payload())
+        return result
+
+    def _prune(self) -> None:
+        cutoff = _now_utc() - dt.timedelta(hours=self.RETENTION_HOURS)
+        for key, entry in list(self._entries.items()):
+            if entry.session_close_utc < cutoff:
+                del self._entries[key]
+
+
+def _stream_targets_summary(
+    targets: Sequence[Tuple[str, str]],
+    gate: Optional[PublishDataGate] = None,
+) -> List[Dict[str, Any]]:
+    summary: List[Dict[str, Any]] = []
+    for symbol, tf_raw in targets:
+        entry: Dict[str, Any] = {
+            "symbol": symbol,
+            "tf": tf_raw,
+        }
+        if gate is not None:
+            staleness = gate.staleness_seconds(symbol=symbol, timeframe=tf_raw)
+            if staleness is not None:
+                entry["staleness_seconds"] = staleness
+        summary.append(entry)
+    return summary
 
 
 def _normalize_history_to_ohlcv(
@@ -960,6 +1204,7 @@ def _fetch_and_publish_recent(
     publish_rate_limit: Optional[Dict[Tuple[str, str], float]] = None,
     hmac_secret: Optional[str] = None,
     hmac_algo: str = "sha256",
+    session_stats: Optional[SessionStatsTracker] = None,
 ) -> pd.DataFrame:
     """Витягує останні `lookback_minutes` і публікує лише нові бари.
 
@@ -1014,6 +1259,9 @@ def _fetch_and_publish_recent(
         return pd.DataFrame()
 
     df_to_publish = df_ohlcv
+
+    if session_stats is not None:
+        session_stats.ingest(symbol, timeframe_norm, df_to_publish)
 
     if redis_client is None:
         if data_gate is not None:
@@ -1165,11 +1413,25 @@ def fetch_history_sample(
     if publish_ok:
         log.info("Warmup-пакет успішно опубліковано у Redis.")
         _publish_market_status(redis_client, "open")
+        last_close_ms = int(df_ohlcv["close_time"].max())
+        lag_seconds = _calc_lag_seconds(last_close_ms)
+        heartbeat_context: Dict[str, Any] = {
+            "channel": heartbeat_channel,
+            "mode": "warmup_sample",
+            "redis_connected": redis_client is not None,
+            "redis_channel": REDIS_CHANNEL,
+            "stream_targets": _stream_targets_summary([(symbol, timeframe)], None),
+            "published_bars": len(df_ohlcv),
+        }
+        if lag_seconds is not None:
+            heartbeat_context["lag_seconds"] = lag_seconds
+        heartbeat_context["session"] = _build_session_context(next_open=None)
         _publish_heartbeat(
             redis_client,
             heartbeat_channel,
             state="warmup",  # sample-mode heartbeat
-            last_bar_close_ms=int(df_ohlcv["close_time"].max()),
+            last_bar_close_ms=last_close_ms,
+            context=heartbeat_context,
         )
     else:
         log.error("Warmup-публікація OHLCV у Redis не підтверджена.")
@@ -1206,6 +1468,9 @@ def stream_fx_data(
         return
 
     gate = data_gate or PublishDataGate()
+    session_stats_tracker = SessionStatsTracker()
+    global _SESSION_STATS_TRACKER
+    _SESSION_STATS_TRACKER = session_stats_tracker
 
     current_fx = fx
     current_redis = redis_client
@@ -1241,10 +1506,13 @@ def stream_fx_data(
             restart_cycle = False
             market_pause = False
             closed_reference: Optional[dt.datetime] = None
+            idle_reason: Optional[str] = None
+            cycle_published_bars = 0
             now = _now_utc()
             if not is_trading_time(now):
                 market_pause = True
                 closed_reference = now
+                idle_reason = "calendar_closed"
             else:
                 for symbol, tf_raw in config:
                     try:
@@ -1260,11 +1528,13 @@ def stream_fx_data(
                             publish_rate_limit=publish_rate_limit,
                             hmac_secret=hmac_secret,
                             hmac_algo=hmac_algo,
+                            session_stats=session_stats_tracker,
                         )
                     except MarketTemporarilyClosed as exc:
                         log.info("Стрім: ринок недоступний (%s)", exc)
                         market_pause = True
                         closed_reference = _now_utc()
+                        idle_reason = "fxcm_temporarily_unavailable"
                         break
                     except FXCMRetryableError as exc:
                         log.warning("Втрачено з'єднання з FXCM: %s", exc)
@@ -1294,6 +1564,7 @@ def stream_fx_data(
                         len(df_new),
                     )
                     last_published_close_ms = int(df_new["close_time"].max())
+                    cycle_published_bars += len(df_new)
                     if cache_manager is not None:
                         cache_manager.append_stream_bars(
                             symbol_raw=symbol,
@@ -1305,6 +1576,7 @@ def stream_fx_data(
                 gate.update_staleness_metrics()
                 continue
 
+            elapsed = time.monotonic() - cycle_start
             if market_pause:
                 reference_time = closed_reference or _now_utc()
                 next_open = _notify_market_closed(reference_time, current_redis)
@@ -1330,6 +1602,30 @@ def stream_fx_data(
                         next_open.isoformat() if next_open else "невідомо",
                     )
                 PROM_NEXT_OPEN_SECONDS.set(seconds_to_open)
+                lag_seconds = _calc_lag_seconds(last_published_close_ms)
+                idle_context: Dict[str, Any] = {
+                    "channel": heartbeat_channel,
+                    "mode": "idle",
+                    "redis_connected": current_redis is not None,
+                    "redis_required": require_redis,
+                    "redis_channel": REDIS_CHANNEL,
+                    "poll_seconds": poll_seconds,
+                    "lookback_minutes": lookback_minutes,
+                    "publish_interval_seconds": publish_interval_seconds,
+                    "cycle_seconds": elapsed,
+                    "idle_reason": idle_reason or "market_closed",
+                    "next_open_seconds": seconds_to_open,
+                    "stream_targets": _stream_targets_summary(config, gate),
+                    "published_bars": cycle_published_bars,
+                    "cache_enabled": cache_manager is not None,
+                }
+                if lag_seconds is not None:
+                    idle_context["lag_seconds"] = lag_seconds
+                stats_snapshot = session_stats_tracker.snapshot()
+                idle_context["session"] = _build_session_context(
+                    next_open,
+                    session_stats=stats_snapshot,
+                )
                 _publish_heartbeat(
                     current_redis,
                     heartbeat_channel,
@@ -1337,20 +1633,43 @@ def stream_fx_data(
                     last_bar_close_ms=last_published_close_ms,
                     next_open=next_open,
                     sleep_seconds=poll_seconds,
+                    context=idle_context,
                 )
                 gate.update_staleness_metrics()
                 sleep_for = max(0.0, float(poll_seconds))
             else:
+                lag_seconds = _calc_lag_seconds(last_published_close_ms)
+                stream_context: Dict[str, Any] = {
+                    "channel": heartbeat_channel,
+                    "mode": "stream",
+                    "redis_connected": current_redis is not None,
+                    "redis_required": require_redis,
+                    "redis_channel": REDIS_CHANNEL,
+                    "poll_seconds": poll_seconds,
+                    "lookback_minutes": lookback_minutes,
+                    "publish_interval_seconds": publish_interval_seconds,
+                    "cycle_seconds": elapsed,
+                    "stream_targets": _stream_targets_summary(config, gate),
+                    "published_bars": cycle_published_bars,
+                    "cache_enabled": cache_manager is not None,
+                }
+                if lag_seconds is not None:
+                    stream_context["lag_seconds"] = lag_seconds
+                stats_snapshot = session_stats_tracker.snapshot()
+                stream_context["session"] = _build_session_context(
+                    None,
+                    session_stats=stats_snapshot,
+                )
                 _publish_heartbeat(
                     current_redis,
                     heartbeat_channel,
                     state="stream",
                     last_bar_close_ms=last_published_close_ms,
+                    context=stream_context,
                 )
                 last_idle_log_ts = None
                 last_idle_next_open = None
                 gate.update_staleness_metrics()
-                elapsed = time.monotonic() - cycle_start
                 sleep_for = max(0.0, poll_seconds - elapsed)
 
             cycles += 1
@@ -1360,6 +1679,9 @@ def stream_fx_data(
                 time.sleep(sleep_for)
     except KeyboardInterrupt:
         log.info("Стрім зупинено користувачем.")
+    finally:
+        if _SESSION_STATS_TRACKER is session_stats_tracker:
+            _SESSION_STATS_TRACKER = None
 
 
 def main() -> None:
@@ -1519,11 +1841,27 @@ def main() -> None:
                 )
                 if is_trading_time(_now_utc()):
                     _publish_market_status(redis_conn, "open")
+                last_close_ms = int(warmup_slice["close_time"].max())
+                lag_seconds = _calc_lag_seconds(last_close_ms)
+                warmup_context: Dict[str, Any] = {
+                    "channel": config.observability.heartbeat_channel,
+                    "mode": "warmup_cache",
+                    "redis_connected": redis_conn is not None,
+                    "redis_required": config.redis_required,
+                    "redis_channel": REDIS_CHANNEL,
+                    "stream_targets": _stream_targets_summary([(symbol, tf_raw)], publish_gate),
+                    "published_bars": len(warmup_slice),
+                    "cache_source": "history_cache",
+                }
+                if lag_seconds is not None:
+                    warmup_context["lag_seconds"] = lag_seconds
+                warmup_context["session"] = _build_session_context(next_open=None)
                 _publish_heartbeat(
                     redis_conn,
                     config.observability.heartbeat_channel,
                     state="warmup_cache",
-                    last_bar_close_ms=int(warmup_slice["close_time"].max()),
+                    last_bar_close_ms=last_close_ms,
+                    context=warmup_context,
                 )
                 log.info(
                     "Warmup із кешу: %s %s → %d барів",
