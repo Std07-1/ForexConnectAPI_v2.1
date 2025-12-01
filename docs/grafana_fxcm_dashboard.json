@@ -1,0 +1,501 @@
+{
+    "__inputs": [
+        {
+            "name": "DS_PROMETHEUS",
+            "label": "Prometheus",
+            "description": "Prometheus data source for FXCM metrics",
+            "type": "datasource",
+            "pluginId": "prometheus",
+            "pluginName": "Prometheus"
+        }
+    ],
+    "__elements": {},
+    "__requires": [
+        {
+            "type": "panel",
+            "id": "stat",
+            "name": "Stat",
+            "version": "8.5.0"
+        },
+        {
+            "type": "panel",
+            "id": "timeseries",
+            "name": "Time series",
+            "version": "8.5.0"
+        },
+        {
+            "type": "panel",
+            "id": "table",
+            "name": "Table",
+            "version": "8.5.0"
+        },
+        {
+            "type": "grafana",
+            "id": "grafana",
+            "name": "Grafana",
+            "version": "10.0.0"
+        },
+        {
+            "type": "datasource",
+            "id": "prometheus",
+            "name": "Prometheus",
+            "version": "2.40.0"
+        }
+    ],
+    "annotations": {
+        "list": [
+            {
+                "builtIn": 1,
+                "datasource": "-- Grafana --",
+                "enable": true,
+                "hide": true,
+                "iconColor": "rgba(0, 211, 255, 1)",
+                "name": "Annotations & Alerts",
+                "type": "dashboard"
+            }
+        ]
+    },
+    "editable": true,
+    "gnetId": null,
+    "graphTooltip": 0,
+    "id": null,
+    "iteration": 1,
+    "links": [],
+    "panels": [
+        {
+            "datasource": "${DS_PROMETHEUS}",
+            "description": "1=open, 0=closed. Відображає поточний статус ринку з fxcm_market_status.",
+            "fieldConfig": {
+                "defaults": {
+                    "mappings": [
+                        {
+                            "type": "value",
+                            "options": {
+                                "0": {
+                                    "color": "red",
+                                    "index": 0,
+                                    "text": "Closed"
+                                },
+                                "1": {
+                                    "color": "green",
+                                    "index": 1,
+                                    "text": "Open"
+                                }
+                            }
+                        }
+                    ],
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "red",
+                                "value": null
+                            },
+                            {
+                                "color": "green",
+                                "value": 1
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 0,
+                "y": 0
+            },
+            "id": 1,
+            "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "orientation": "horizontal",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "/^fxcm_market_status$/",
+                    "values": false
+                },
+                "text": {},
+                "textMode": "value"
+            },
+            "targets": [
+                {
+                    "datasource": "${DS_PROMETHEUS}",
+                    "expr": "max(fxcm_market_status)",
+                    "legendFormat": "",
+                    "refId": "A"
+                }
+            ],
+            "title": "FXCM Market Status",
+            "type": "stat"
+        },
+        {
+            "datasource": "${DS_PROMETHEUS}",
+            "description": "Скільки секунд залишилось до наступного торгового вікна.",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "orange",
+                                "value": 1800
+                            },
+                            {
+                                "color": "red",
+                                "value": 10800
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 8,
+                "y": 0
+            },
+            "id": 2,
+            "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "orientation": "horizontal",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                },
+                "textMode": "value"
+            },
+            "targets": [
+                {
+                    "datasource": "${DS_PROMETHEUS}",
+                    "expr": "max(fxcm_next_open_seconds)",
+                    "legendFormat": "",
+                    "refId": "A"
+                }
+            ],
+            "title": "Seconds until next open",
+            "type": "stat"
+        },
+        {
+            "datasource": "${DS_PROMETHEUS}",
+            "description": "Час, що минув з останнього heartbeat (секунди).",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "orange",
+                                "value": 30
+                            },
+                            {
+                                "color": "red",
+                                "value": 120
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 16,
+                "y": 0
+            },
+            "id": 3,
+            "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "orientation": "horizontal",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                },
+                "textMode": "value"
+            },
+            "targets": [
+                {
+                    "datasource": "${DS_PROMETHEUS}",
+                    "expr": "time() - max(fxcm_connector_heartbeat_timestamp)",
+                    "legendFormat": "",
+                    "refId": "A"
+                }
+            ],
+            "title": "Heartbeat drift",
+            "type": "stat"
+        },
+        {
+            "datasource": "${DS_PROMETHEUS}",
+            "description": "Поточні лаги/стейлнесс по кожній парі та таймфрейму.",
+            "fieldConfig": {
+                "defaults": {
+                    "custom": {},
+                    "unit": "s"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 9,
+                "w": 24,
+                "x": 0,
+                "y": 8
+            },
+            "id": 4,
+            "options": {
+                "showHeader": true
+            },
+            "targets": [
+                {
+                    "datasource": "${DS_PROMETHEUS}",
+                    "expr": "fxcm_stream_lag_seconds{symbol=~\"$symbol\",tf=~\"$tf\"}",
+                    "format": "table",
+                    "instant": true,
+                    "legendFormat": "{{symbol}} {{tf}}",
+                    "refId": "A"
+                },
+                {
+                    "datasource": "${DS_PROMETHEUS}",
+                    "expr": "fxcm_stream_staleness_seconds{symbol=~\"$symbol\",tf=~\"$tf\"}",
+                    "format": "table",
+                    "instant": true,
+                    "legendFormat": "staleness",
+                    "refId": "B"
+                }
+            ],
+            "title": "Stream targets lag / staleness",
+            "transformations": [
+                {
+                    "id": "merge",
+                    "options": {}
+                }
+            ],
+            "type": "table"
+        },
+        {
+            "datasource": "${DS_PROMETHEUS}",
+            "description": "Кількість опублікованих барів за хвилину (rate 5m).",
+            "fieldConfig": {
+                "defaults": {
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 2
+                    }
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 17
+            },
+            "id": 5,
+            "options": {
+                "legend": {
+                    "calcs": [],
+                    "displayMode": "table",
+                    "placement": "bottom"
+                }
+            },
+            "targets": [
+                {
+                    "datasource": "${DS_PROMETHEUS}",
+                    "expr": "sum by (symbol, tf) (rate(fxcm_ohlcv_bars_total{symbol=~\"$symbol\",tf=~\"$tf\"}[5m]))",
+                    "legendFormat": "{{symbol}} {{tf}}",
+                    "refId": "A"
+                }
+            ],
+            "title": "Bars/min (5m rate)",
+            "type": "timeseries"
+        },
+        {
+            "datasource": "${DS_PROMETHEUS}",
+            "description": "Графік лагу стріму по кожній парі/таймфрейму.",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 17
+            },
+            "id": 6,
+            "options": {
+                "legend": {
+                    "calcs": [],
+                    "displayMode": "table",
+                    "placement": "bottom"
+                }
+            },
+            "targets": [
+                {
+                    "datasource": "${DS_PROMETHEUS}",
+                    "expr": "fxcm_stream_lag_seconds{symbol=~\"$symbol\",tf=~\"$tf\"}",
+                    "legendFormat": "{{symbol}} {{tf}}",
+                    "refId": "A"
+                }
+            ],
+            "title": "Stream lag (s)",
+            "type": "timeseries"
+        },
+        {
+            "datasource": "${DS_PROMETHEUS}",
+            "description": "Стейлнесс останнього бару по символах.",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 25
+            },
+            "id": 7,
+            "options": {
+                "legend": {
+                    "calcs": [],
+                    "displayMode": "table",
+                    "placement": "bottom"
+                }
+            },
+            "targets": [
+                {
+                    "datasource": "${DS_PROMETHEUS}",
+                    "expr": "fxcm_stream_staleness_seconds{symbol=~\"$symbol\",tf=~\"$tf\"}",
+                    "legendFormat": "{{symbol}} {{tf}}",
+                    "refId": "A"
+                }
+            ],
+            "title": "Staleness seconds",
+            "type": "timeseries"
+        },
+        {
+            "datasource": "${DS_PROMETHEUS}",
+            "description": "Помилки FXCM/Redis/Cache за 15 хвилин.",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 25
+            },
+            "id": 8,
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "single"
+                }
+            },
+            "targets": [
+                {
+                    "datasource": "${DS_PROMETHEUS}",
+                    "expr": "increase(fxcm_connector_errors_total[15m])",
+                    "legendFormat": "{{type}}",
+                    "refId": "A"
+                },
+                {
+                    "datasource": "${DS_PROMETHEUS}",
+                    "expr": "increase(fxcm_pricehistory_not_ready_total[15m])",
+                    "legendFormat": "pricehistory_not_ready",
+                    "refId": "B"
+                }
+            ],
+            "title": "Error spikes (15m)",
+            "type": "timeseries"
+        }
+    ],
+    "refresh": "30s",
+    "schemaVersion": 39,
+    "style": "dark",
+    "tags": [
+        "fxcm",
+        "connector"
+    ],
+    "templating": {
+        "list": [
+            {
+                "current": {
+                    "selected": false,
+                    "text": "Prometheus",
+                    "value": "Prometheus"
+                },
+                "hide": 0,
+                "label": "Datasource",
+                "name": "DS_PROMETHEUS",
+                "options": [],
+                "query": "prometheus",
+                "refresh": 1,
+                "type": "datasource"
+            },
+            {
+                "datasource": "${DS_PROMETHEUS}",
+                "definition": "label_values(fxcm_stream_lag_seconds, symbol)",
+                "hide": 0,
+                "includeAll": true,
+                "label": "Symbol",
+                "multi": true,
+                "name": "symbol",
+                "options": [],
+                "query": "label_values(fxcm_stream_lag_seconds, symbol)",
+                "refresh": 2,
+                "sort": 1,
+                "type": "query"
+            },
+            {
+                "datasource": "${DS_PROMETHEUS}",
+                "definition": "label_values(fxcm_stream_lag_seconds, tf)",
+                "hide": 0,
+                "includeAll": true,
+                "label": "Timeframe",
+                "multi": true,
+                "name": "tf",
+                "options": [],
+                "query": "label_values(fxcm_stream_lag_seconds, tf)",
+                "refresh": 2,
+                "sort": 1,
+                "type": "query"
+            }
+        ]
+    },
+    "time": {
+        "from": "now-6h",
+        "to": "now"
+    },
+    "timepicker": {
+        "refresh_intervals": [
+            "5s",
+            "10s",
+            "30s",
+            "1m",
+            "5m",
+            "15m",
+            "1h"
+        ]
+    },
+    "timezone": "",
+    "title": "FXCM Connector Debug",
+    "uid": "fxcm-debug",
+    "version": 1
+}
