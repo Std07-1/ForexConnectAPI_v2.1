@@ -41,6 +41,7 @@
 - **Redis 6.x+** (локально або remote, підтримується AUTH/ACL).
 - **Windows Server / Linux** — перевірено на Windows (prod) + WSL для девелопменту.
 - **Prometheus** (опційно) для збору метрик через `start_http_server`.
+- **backports.zoneinfo + tzdata** — встановлюються автоматично через `requirements.txt` і потрібні Python 3.7 для коректної роботи торгового календаря.
 
 ## 4. Архітектура (високий рівень)
 
@@ -76,6 +77,8 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
  python -m pip install --upgrade pip
  python -m pip install -r requirements.txt
  ```
+
+  > `requirements.txt` вже містить `backports.zoneinfo` та `tzdata`, тож після інсталяції не буде помилок `ModuleNotFoundError: zoneinfo` навіть у старих середовищах.
 
 3. **Переконайся, що ForexConnect SDK доступний** (DLL/pyfxconnect у `PYTHONPATH`).
 
