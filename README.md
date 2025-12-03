@@ -108,15 +108,21 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 | `FXCM_HMAC_SECRET` | – | Секрет для `sig`. Якщо задано — `fxcm_ingestor` вимагає підпис. |
 | `FXCM_HMAC_ALGO` | `sha256` | Алгоритм (`sha256`, `sha512`, ...). |
 
-#### 6.1.1 Змінні середовища для `fxcm_ingestor`
+Окремий набір ENV для інгістора описано нижче.
 
-| Назва | Значення за замовчуванням | Опис |
+#### 6.1.1 FXCM ingestor (whitelist/ліміти)
+
+Інгістор підтягує whitelist-налаштування та ліміт розміру payload виключно з ENV/`runtime_settings.json`, тому їх варто явним чином задекларувати:
+
+| Назва | Дефолт / джерело | Опис |
 | --- | --- | --- |
-| `FXCM_INGEST_ALLOWED_SYMBOLS` | з `stream.config` або `XAU/USD,EUR/USD` | Кома-сепарований whitelist символів для інгестора; якщо порожньо — береться з `config/runtime_settings.json.stream.config` або дефолту. |
-| `FXCM_INGEST_ALLOWED_TIMEFRAMES` | з `stream.config` або `1m,5m,15m,30m,1h,4h,1d` | Кома-сепарований список таймфреймів; нормалізуються до `1m/5m/.../1d`. |
-| `FXCM_INGEST_MAX_BATCH` | `5000` | Максимальна кількість барів у payload; більші пакети дропаються. |
-| `FXCM_INGEST_HMAC_SECRET` | – | Секрет для перевірки `sig`; fallback → `FXCM_HMAC_SECRET`. |
-| `FXCM_INGEST_HMAC_ALGO` | `sha256` | Алгоритм HMAC інгістора; fallback → `FXCM_HMAC_ALGO`. |
+| `FXCM_INGEST_ALLOWED_SYMBOLS` | Значення `stream.config` → `DEFAULT_ALLOWED_SYMBOLS` (`XAU/USD, EUR/USD`) | Кома-сепарований whitelist символів. Якщо ENV порожній, береться масив з runtime settings або дефолт. |
+| `FXCM_INGEST_ALLOWED_TIMEFRAMES` | Значення `stream.config` → `DEFAULT_ALLOWED_TIMEFRAMES` (`1m,5m,15m,30m,1h,4h,1d`) | Перелік таймфреймів; нормалізуються в `1m/5m/.../1d`. |
+| `FXCM_INGEST_MAX_BATCH` | `DEFAULT_MAX_BARS_PER_PAYLOAD = 5_000` | Жорсткий ліміт на кількість барів у payload. Все, що вище, відкидається одразу. |
+| `FXCM_INGEST_HMAC_SECRET` | `FXCM_HMAC_SECRET` | Окремий секрет для підпису інгістора; якщо не задано, використовує той самий, що й конектор. |
+| `FXCM_INGEST_HMAC_ALGO` | `FXCM_HMAC_ALGO` або `sha256` | Алгоритм перевірки підпису. |
+
+Порядок резолву для whitelist-ів: спочатку ENV, далі `FXCM_STREAM_CONFIG` (якщо задано), потім `stream.config` у `runtime_settings.json`, і лише після цього — вбудований дефолт. `FXCM_INGEST_MAX_BATCH` завжди обрізається до мінімуму `1`, тож можна безпечно ставити значення з CLI/ENV.
 
 > **Мультисесії:** `sessions.py` тепер використовує `zoneinfo`, тож календарні оверрайди можуть посилатися на `Europe/London`, `Asia/Tokyo` тощо. Для кожного потоку можна виставити власний тег (наприклад, `FXCM_SESSION_TAG=LDN_METALS`) або залишити `AUTO`, тоді тег вибирається відповідно до `session_windows`. Приклад для «недільного» старту через Токіо з паузою перед Лондоном:
 >
@@ -143,36 +149,56 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 
 ```json
 {
-  "cache": { "dir": "cache", "max_bars": 3000, "warmup_bars": 1000 },
-  "stream": {
-  "mode": 1,
-  "poll_seconds": 5,
-  "fetch_interval_seconds": 5,
-  "publish_interval_seconds": 5,
-  "lookback_minutes": 5,
-  "config": "XAU/USD:m1,XAU/USD:m5, EUR/USD:m1,EUR/USD:m5"
+  "cache": {
+    "dir": "cache",
+    "max_bars": 3000,
+    "warmup_bars": 1000
   },
-  "sample_request": { "symbol": "XAU/USD", "timeframe": "m1", "hours": 24 },
+  "stream": {
+    "mode": 1,
+    "poll_seconds": 5,
+    "fetch_interval_seconds": 5,
+    "publish_interval_seconds": 5,
+    "lookback_minutes": 5,
+    "config": "XAU/USD:m1,XAU/USD:m5, EUR/USD:m1,EUR/USD:m5"
+  },
+  "sample_request": {
+    "symbol": "XAU/USD",
+    "timeframe": "m1",
+    "hours": 24
+  },
   "viewer": {
-  "heartbeat_channel": "fxcm:heartbeat",
-  "market_status_channel": "fxcm:market_status",
-  "ohlcv_channel": "fxcm:ohlcv",
-  "redis_health_interval": 8,
-  "lag_spike_threshold": 180,
-  "heartbeat_alert_seconds": 45,
-  "ohlcv_msg_idle_warn_seconds": 90,
-  "ohlcv_msg_idle_error_seconds": 180,
-  "ohlcv_lag_warn_seconds": 45,
-  "ohlcv_lag_error_seconds": 120,
-  "timeline_matrix_rows": 10,
-  "timeline_max_columns": 120,
-  "timeline_history_max": 2400,
-  "timeline_focus_minutes": 30
+    "heartbeat_channel": "fxcm:heartbeat",
+    "market_status_channel": "fxcm:market_status",
+    "ohlcv_channel": "fxcm:ohlcv",
+    "redis_health_interval": 8,
+    "lag_spike_threshold": 180,
+    "heartbeat_alert_seconds": 45,
+    "ohlcv_msg_idle_warn_seconds": 90,
+    "ohlcv_msg_idle_error_seconds": 180,
+    "ohlcv_lag_warn_seconds": 45,
+    "ohlcv_lag_error_seconds": 120,
+    "timeline_matrix_rows": 10,
+    "timeline_max_columns": 120,
+    "timeline_history_max": 2400,
+    "timeline_focus_minutes": 30
   },
   "backoff": {
-  "fxcm_login": { "base_delay": 2, "factor": 2, "max_delay": 60 },
-  "fxcm_stream": { "base_delay": 5, "factor": 2, "max_delay": 300 },
-  "redis_stream": { "base_delay": 1, "factor": 2, "max_delay": 60 }
+    "fxcm_login": {
+      "base_delay": 2.0,
+      "factor": 2.0,
+      "max_delay": 60.0
+    },
+    "fxcm_stream": {
+      "base_delay": 5.0,
+      "factor": 2.0,
+      "max_delay": 300.0
+    },
+    "redis_stream": {
+      "base_delay": 1.0,
+      "factor": 2.0,
+      "max_delay": 60.0
+    }
   }
 }
 ```
@@ -242,15 +268,18 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 ## 9. Моніторинг та алерти
 
 - **Prometheus:**
-  - `fxcm_ohlcv_bars_total{symbol,tf}` — публікації.
+  - `fxcm_ohlcv_bars_total{symbol,tf}` — публікації з конектора.
   - `fxcm_stream_lag_seconds{symbol,tf}` — різниця між `now` і `close_time`.
   - `fxcm_stream_staleness_seconds{symbol,tf}` — час із останнього бару.
   - `fxcm_stream_last_close_ms{symbol,tf}` — останній close у мс.
   - `fxcm_dropped_bars_total{symbol,tf}` — бари, відкинуті під час публікації/інгісту.
   - `fxcm_connector_errors_total{type}` — `fxcm`, `redis`, `cache_io`, `pricehistory_not_ready`.
   - `fxcm_pricehistory_not_ready_total` — скільки разів FXCM повернув «PriceHistoryCommunicator is not ready».
-  - `fxcm_market_status` (0/1), `fxcm_next_open_seconds`.
-  - `fxcm_connector_heartbeat_timestamp` — unix-час останнього heartbeat.
+  - `fxcm_market_status` (0/1) та `fxcm_next_open_seconds` — статус ринку й відлік до наступного відкриття.
+  - `fxcm_connector_heartbeat_timestamp` — UNIX-час останнього heartbeat.
+  - `ai_one_fxcm_ohlcv_lag_seconds{symbol,tf}` — лаги, які бачить `tools/debug_viewer.py` під час читання Redis (див. `docs/viewer.md`).
+  - `ai_one_fxcm_ohlcv_msg_age_seconds{symbol,tf}` — скільки триває тиша в каналі барів.
+  - `ai_one_fxcm_ohlcv_gaps_total{symbol,tf}` — кількість інцидентів idle/lag із боку viewer.
 
   ### 9.1 Контракти heartbeat та market-status
 
@@ -390,15 +419,15 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 2. **Валідація**
 
 - `fxcm_ingestor` (див. `tests/test_ingestor.py`) очікує `sig`, якщо конфіг має секрет.
-- Невірний/відсутній підпис → `IngestValidationError` та дроп payload.
-- Крім HMAC, інгістор перевіряє:
-  - що `symbol` ∈ `allowed_symbols`, `tf` ∈ `allowed_timeframes`;
-  - що `len(bars) ≤ FXCM_INGEST_MAX_BATCH` (дефолт 5000);
-  - що кожен бар має `open_time/close_time/open/high/low/close/volume` з коректними типами;
-  - що `close_time ≥ open_time`, `low ≤ high`;
-  - що `open_time` не старший за 2000-01-01 UTC та не випереджає поточний час більш ніж на 1 добу;
-  - що `open_time` суворо зростає в payload.
-- Для синхронізації просто вистав `FXCM_INGEST_HMAC_SECRET=$FXCM_HMAC_SECRET`.
+- Невірний/відсутній підпис → `IngestValidationError` та миттєвий дроп payload.
+- Після HMAC інгістор виконує повний чекліст:
+  1. `symbol` та `tf` повинні входити до whitelists (`FXCM_INGEST_ALLOWED_SYMBOLS` / `FXCM_INGEST_ALLOWED_TIMEFRAMES`, див. §6.1.1).
+  2. `len(bars) ≤ max_bars_per_payload` (дефолт `DEFAULT_MAX_BARS_PER_PAYLOAD = 5_000`).
+  3. Кожен бар містить `open_time`, `close_time`, `open`, `high`, `low`, `close`, `volume` і всі значення можна привести до int/float.
+  4. `close_time ≥ open_time`, `low ≤ high` — інакше payload вважається пошкодженим.
+  5. `open_time` ≥ `MIN_ALLOWED_BAR_TIMESTAMP_MS` (UTC 2000-01-01) та ≤ `now + MAX_FUTURE_DRIFT_SECONDS` (дозволяємо дрейф до 86 400 с).
+  6. `open_time` суворо зростає в межах одного payload, щоб уникати дубльованих/перемішаних свічок.
+- Для синхронізації просто вистав `FXCM_INGEST_HMAC_SECRET=$FXCM_HMAC_SECRET` (алгоритм також можна успадкувати через `FXCM_INGEST_HMAC_ALGO` → `FXCM_HMAC_ALGO`).
 
 3. **Практичні поради**
 
@@ -483,4 +512,4 @@ ruff check .
 
 ### Telegram: `@Std07_1`
 
-### Оновлено: 30.11.2025
+### Оновлено: 03.12.2025
