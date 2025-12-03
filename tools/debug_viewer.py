@@ -25,12 +25,13 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 import statistics
-from typing import Any, Deque, Dict, Optional, Tuple, Set
+from typing import Any, Deque, Dict, Optional, Tuple, Set, List, Union
 
 from dotenv import load_dotenv
 from rich import box
-from rich.console import Group
+from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -41,6 +42,12 @@ try:
     import redis  # type: ignore[import]
 except ImportError:  # pragma: no cover - viewer потребує redis-client
     redis = None
+
+try:
+    from prometheus_client import Counter as PromCounter, Gauge as PromGauge  # type: ignore[import]
+except ImportError:  # pragma: no cover - метрики не обов'язкові
+    PromCounter = None  # type: ignore[assignment]
+    PromGauge = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - доступно лише на Windows
     import msvcrt  # type: ignore[import]
@@ -56,6 +63,7 @@ except ImportError:  # noqa: SIM105
 
 HEARTBEAT_CHANNEL_DEFAULT = os.environ.get("FXCM_HEARTBEAT_CHANNEL", "fxcm:heartbeat")
 MARKET_STATUS_CHANNEL_DEFAULT = os.environ.get("FXCM_MARKET_STATUS_CHANNEL", "fxcm:market_status")
+OHLCV_CHANNEL_DEFAULT = os.environ.get("FXCM_OHLCV_CHANNEL", "fxcm:ohlcv")
 REDIS_HEALTH_INTERVAL = float(os.environ.get("FXCM_VIEWER_REDIS_HEALTH_INTERVAL", 8))
 LAG_SPIKE_THRESHOLD = float(os.environ.get("FXCM_VIEWER_LAG_SPIKE_THRESHOLD", 180))
 FXCM_PAUSE_REASONS = {"fxcm_temporarily_unavailable", "fxcm_unavailable"}
@@ -65,7 +73,50 @@ ISSUE_LABELS = {
     "calendar_pause": "Календарні паузи",
     "redis_disconnect": "Розриви Redis",
     "lag_spike": f"Лаг > {int(LAG_SPIKE_THRESHOLD)} с",
+    "ohlcv_msg_idle": "OHLCV idle",
+    "ohlcv_lag": "OHLCV лаги",
+    "ohlcv_empty": "OHLCV порожні payload",
 }
+HEARTBEAT_ALERT_SECONDS = float(os.environ.get("FXCM_VIEWER_HEARTBEAT_ALERT_SECONDS", 45))
+OHLCV_MSG_IDLE_WARN_SECONDS = float(os.environ.get("FXCM_VIEWER_OHLCV_MSG_WARN_SECONDS", 90))
+OHLCV_MSG_IDLE_ERROR_SECONDS = float(os.environ.get("FXCM_VIEWER_OHLCV_MSG_ERROR_SECONDS", 180))
+OHLCV_LAG_WARN_SECONDS = float(os.environ.get("FXCM_VIEWER_OHLCV_LAG_WARN_SECONDS", 45))
+OHLCV_LAG_ERROR_SECONDS = float(os.environ.get("FXCM_VIEWER_OHLCV_LAG_ERROR_SECONDS", 120))
+ALERT_SEVERITY_ORDER = {"danger": 0, "warning": 1, "info": 2}
+ALERT_SEVERITY_COLORS = {"danger": "red", "warning": "yellow", "info": "cyan"}
+MENU_TEXT = "[P] пауза  [C] очистити  [Q] вихід  [0] TL  [1] SUM  [2] SES  [3] ALERT  [4] STREAM"
+
+if PromGauge is not None:
+    PROM_VIEWER_OHLCV_LAG_SECONDS = PromGauge(
+        "ai_one_fxcm_ohlcv_lag_seconds",
+        "Lag between last close time and now (seconds) per symbol/tf as observed by debug viewer",
+        ["symbol", "tf"],
+    )
+    PROM_VIEWER_OHLCV_MSG_AGE_SECONDS = PromGauge(
+        "ai_one_fxcm_ohlcv_msg_age_seconds",
+        "Age of the latest OHLCV message per symbol/tf as observed by debug viewer",
+        ["symbol", "tf"],
+    )
+else:  # pragma: no cover - prom клієнт опціональний
+    PROM_VIEWER_OHLCV_LAG_SECONDS = None
+    PROM_VIEWER_OHLCV_MSG_AGE_SECONDS = None
+
+if PromCounter is not None:
+    PROM_VIEWER_OHLCV_GAPS_TOTAL = PromCounter(
+        "ai_one_fxcm_ohlcv_gaps_total",
+        "Number of OHLCV idle/lag gap events detected by debug viewer",
+        ["symbol", "tf"],
+    )
+else:  # pragma: no cover
+    PROM_VIEWER_OHLCV_GAPS_TOTAL = None
+
+
+class DashboardMode(Enum):
+    TIMELINE = 0
+    SUMMARY = 1
+    SESSION = 2
+    ALERTS = 3
+    STREAMS = 4
 
 
 @dataclass
@@ -77,23 +128,44 @@ class TimelineEvent:
 
 
 @dataclass
+class ViewerAlert:
+    key: str
+    message: str
+    severity: str
+    since_ts: float
+
+
+@dataclass
 class ViewerState:
     last_heartbeat: Optional[Dict[str, Any]] = None
     last_market_status: Optional[Dict[str, Any]] = None
     last_message_ts: float = field(default_factory=time.time)
-    timeline_events: Deque[TimelineEvent] = field(default_factory=lambda: deque(maxlen=60))
+    last_heartbeat_ts: Optional[float] = None
+    timeline_events: Deque[TimelineEvent] = field(default_factory=lambda: deque(maxlen=480))
     staleness_history: Dict[Tuple[str, str], Deque[float]] = field(default_factory=dict)
+    stream_target_updated: Dict[Tuple[str, str], float] = field(default_factory=dict)
     session_range_history: Dict[Tuple[str, str, str], Deque[float]] = field(default_factory=dict)
     session_range_snapshot: Dict[Tuple[str, str, str], Tuple[Optional[float], Optional[float]]] = field(default_factory=dict)
     redis_health: Dict[str, Any] = field(default_factory=dict)
+    ohlcv_targets: Dict[Tuple[str, str], Dict[str, Any]] = field(default_factory=dict)
+    ohlcv_lag_history: Dict[Tuple[str, str], Deque[float]] = field(default_factory=dict)
+    ohlcv_updated: Dict[Tuple[str, str], float] = field(default_factory=dict)
+    ohlcv_zero_bars_since: Dict[Tuple[str, str], float] = field(default_factory=dict)
+    ohlcv_idle_flags: Dict[Tuple[str, str], bool] = field(default_factory=dict)
+    ohlcv_lag_flags: Dict[Tuple[str, str], bool] = field(default_factory=dict)
     issue_counters: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     issue_state_flags: Dict[str, bool] = field(default_factory=dict)
     paused: bool = False
     last_action: Optional[str] = None
+    alerts: Dict[str, ViewerAlert] = field(default_factory=dict)
+    active_mode: DashboardMode = DashboardMode.SUMMARY
+    last_ohlcv_ts: Optional[float] = None
 
     def note_heartbeat(self, payload: Dict[str, Any]) -> None:
         self.last_heartbeat = payload
-        self.last_message_ts = time.time()
+        now_ts = time.time()
+        self.last_message_ts = now_ts
+        self.last_heartbeat_ts = now_ts
         context = payload.get("context") or {}
         state = str(payload.get("state", "?") or "?")
         self._update_staleness_history(context)
@@ -107,8 +179,87 @@ class ViewerState:
         self.last_message_ts = time.time()
         self._add_timeline_event(source="MS", state=str(payload.get("state", "?")), ts=payload.get("ts"))
 
+    def note_ohlcv(self, payload: Dict[str, Any]) -> None:
+        """Фіксує OHLCV-повідомлення та відокремлює Lag vs Msg age.
+
+        Lag (s)   = now - last_close_time (differentia між ринком і останньою свічкою).
+        Msg age   = now - last_receive_time (як давно приходили будь-які дані).
+        """
+
+        symbol_raw = payload.get("symbol")
+        tf_raw = payload.get("tf")
+        bars = payload.get("bars")
+        if not symbol_raw or not tf_raw or not isinstance(bars, list):
+            return
+
+        symbol = str(symbol_raw)
+        tf = str(tf_raw)
+        key = (symbol, tf)
+        bars_per_msg = len(bars)
+        now_ts = time.time()
+
+        last_close_ms: Optional[int] = None
+        for entry in bars:
+            if not isinstance(entry, dict):
+                continue
+            close_ms = _coerce_int(entry.get("close_time"))
+            if close_ms is None:
+                continue
+            if last_close_ms is None or close_ms > last_close_ms:
+                last_close_ms = close_ms
+        if last_close_ms is None and key in self.ohlcv_targets:
+            last_close_ms = _coerce_int(self.ohlcv_targets[key].get("last_close_ms"))
+
+        lag_seconds = None
+        if last_close_ms is not None:
+            lag_seconds = max(0.0, now_ts - (last_close_ms / 1000.0))
+
+        self.ohlcv_targets[key] = {
+            "symbol": symbol,
+            "tf": tf,
+            "bars_per_msg": bars_per_msg,
+            "last_close_ms": last_close_ms,
+        }
+        if lag_seconds is not None:
+            history = self.ohlcv_lag_history.setdefault(key, deque(maxlen=40))
+            history.append(lag_seconds)
+        self.ohlcv_updated[key] = now_ts
+        self.last_ohlcv_ts = now_ts
+
+        if bars_per_msg == 0:
+            self.ohlcv_zero_bars_since[key] = now_ts
+        else:
+            self.ohlcv_zero_bars_since.pop(key, None)
+
+        _update_ohlcv_metrics(symbol, tf, lag_seconds, msg_age=0.0)
+
+        if len(self.ohlcv_targets) > 200:
+            self._prune_ohlcv(now_ts)
+
+    def _prune_ohlcv(self, now_ts: float) -> None:
+        cutoff = now_ts - 6 * 3600
+        for key in list(self.ohlcv_targets.keys()):
+            updated = self.ohlcv_updated.get(key)
+            if updated is None or updated < cutoff:
+                self.ohlcv_targets.pop(key, None)
+                self.ohlcv_lag_history.pop(key, None)
+                self.ohlcv_updated.pop(key, None)
+                self.ohlcv_zero_bars_since.pop(key, None)
+                self.ohlcv_idle_flags.pop(key, None)
+                self.ohlcv_lag_flags.pop(key, None)
+
     def note_redis_health(self, payload: Dict[str, Any]) -> None:
         self.redis_health = payload
+        status = str(payload.get("status", "")).lower()
+        error_message = payload.get("error")
+        latency = payload.get("latency_ms")
+        if error_message:
+            message = f"Redis health: {error_message}"
+        elif latency is not None:
+            message = f"Redis latency {_format_ms(latency)}"
+        else:
+            message = "Redis ping ok"
+        self._set_alert("redis_health", status == "error", message, severity="danger")
 
     def _add_timeline_event(self, *, source: str, state: str, ts: Optional[str]) -> None:
         try:
@@ -123,11 +274,13 @@ class ViewerState:
     def _update_staleness_history(self, context: Dict[str, Any]) -> None:
         targets = context.get("stream_targets") or []
         seen_keys: Set[Tuple[str, str]] = set()
+        now_ts = time.time()
         for target in targets:
             symbol = str(target.get("symbol", "?"))
             tf = str(target.get("tf", "?"))
             key = (symbol, tf)
             seen_keys.add(key)
+            self.stream_target_updated[key] = now_ts
             staleness = _coerce_float(target.get("staleness_seconds"))
             if staleness is None:
                 continue
@@ -137,6 +290,9 @@ class ViewerState:
         for key in list(self.staleness_history.keys()):
             if key not in seen_keys and len(self.staleness_history) > 50:
                 self.staleness_history.pop(key, None)
+        for key in list(self.stream_target_updated.keys()):
+            if key not in seen_keys:
+                self.stream_target_updated.pop(key, None)
 
     def _update_session_ranges(self, session_context: Dict[str, Any]) -> None:
         stats = session_context.get("stats") if isinstance(session_context, dict) else None
@@ -186,6 +342,36 @@ class ViewerState:
     def note_action(self, text: str) -> None:
         self.last_action = text
 
+    def _set_alert(self, key: str, active: bool, message: Optional[str], severity: str = "warning") -> bool:
+        changed = False
+        if active:
+            existing = self.alerts.get(key)
+            if existing:
+                new_message = message or existing.message
+                if existing.message != new_message or existing.severity != severity:
+                    existing.message = new_message
+                    existing.severity = severity
+                    changed = True
+            else:
+                self.alerts[key] = ViewerAlert(
+                    key=key,
+                    message=message or "—",
+                    severity=severity,
+                    since_ts=time.time(),
+                )
+                changed = True
+        else:
+            if key in self.alerts:
+                self.alerts.pop(key, None)
+                changed = True
+        return changed
+
+    def active_alerts(self) -> List[ViewerAlert]:
+        return sorted(
+            self.alerts.values(),
+            key=lambda alert: (ALERT_SEVERITY_ORDER.get(alert.severity, 99), alert.since_ts),
+        )
+
     def _record_issue(self, key: str, detail: Optional[str]) -> None:
         entry = self.issue_counters.setdefault(key, {"count": 0})
         entry["count"] += 1
@@ -210,32 +396,31 @@ class ViewerState:
         )
         detail_fxcm = idle_reason_raw or pause_reason_raw or "fxcm pause"
         self._track_issue_state("fxcm_pause", fxcm_active, str(detail_fxcm))
+        self._set_alert("fxcm_pause", fxcm_active, str(detail_fxcm), severity="warning")
 
         calendar_active = state.lower() == "idle" and (
             idle_reason in CALENDAR_PAUSE_REASONS or pause_reason in CALENDAR_PAUSE_REASONS
         )
         detail_calendar = idle_reason_raw or pause_reason_raw or "calendar pause"
         self._track_issue_state("calendar_pause", calendar_active, str(detail_calendar))
+        self._set_alert("calendar_pause", calendar_active, str(detail_calendar), severity="info")
 
         redis_required = context.get("redis_required")
         redis_connected = context.get("redis_connected")
         redis_active = bool((redis_required is None or redis_required) and redis_connected is False)
         self._track_issue_state("redis_disconnect", redis_active, "Redis disconnected")
+        self._set_alert("redis_disconnect", redis_active, "Redis disconnected", severity="danger")
 
         lag_value = _coerce_float(context.get("lag_seconds"))
         lag_active = bool(lag_value is not None and lag_value >= LAG_SPIKE_THRESHOLD)
         detail_lag = f"Lag {lag_value:.1f}s" if lag_value is not None else None
         self._track_issue_state("lag_spike", lag_active, detail_lag)
+        self._set_alert("lag_spike", lag_active, detail_lag, severity="warning")
 
     def heartbeat_age(self) -> Optional[float]:
-        if not self.last_heartbeat:
+        if self.last_heartbeat_ts is None:
             return None
-        ts = self.last_heartbeat.get("ts")
-        try:
-            last_ts = _iso_to_epoch(ts)
-            return max(0.0, time.time() - last_ts)
-        except Exception:
-            return None
+        return max(0.0, time.time() - self.last_heartbeat_ts)
 
 
 def _iso_to_epoch(value: Optional[str]) -> float:
@@ -288,10 +473,18 @@ def _format_bool(value: Any) -> str:
 def _format_duration(seconds: Optional[float]) -> str:
     if seconds is None:
         return "—"
+    if seconds < 1:
+        return "<1s"
     total = int(seconds)
-    days, rem = divmod(total, 86_400)
-    hours, rem = divmod(rem, 3_600)
-    minutes, secs = divmod(rem, 60)
+    if total < 60:
+        return f"{total:02}s"
+    minutes, secs = divmod(total, 60)
+    if total < 3_600:
+        return f"{minutes:02}:{secs:02}"
+    hours, minutes = divmod(minutes, 60)
+    if total < 86_400:
+        return f"{hours:02}:{minutes:02}:{secs:02}"
+    days, hours = divmod(hours, 24)
     return f"{days:02}d {hours:02}:{minutes:02}:{secs:02}"
 
 
@@ -299,6 +492,22 @@ def _format_utc_timestamp(ts: Optional[float]) -> str:
     if ts is None:
         return "—"
     return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_short_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "—"
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes, secs = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{minutes:02d}"
+    days, hours = divmod(hours, 24)
+    return f"{days}d{hours:02d}"
 
 
 SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
@@ -322,6 +531,12 @@ def _render_sparkline(values: Optional[Deque[float]]) -> str:
         for val in normalized
     )
     return spark[-12:]
+
+
+def _format_lag_age(lag: Optional[float], age: Optional[float]) -> str:
+    lag_str = f"{lag:.1f}s" if lag is not None else "—"
+    age_str = _format_short_duration(age)
+    return f"{lag_str} / {age_str}"
 
 
 def _range_ratio(current: Optional[float], baseline: Optional[float]) -> Optional[float]:
@@ -386,7 +601,10 @@ class KeyboardInput:
 
     def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001, D401 - стандартний протокол
         if self.fd is not None and self._old_settings is not None and termios:
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, self._old_settings)
+            tcsetattr = getattr(termios, "tcsetattr", None)
+            tcsadrain = getattr(termios, "TCSADRAIN", None)
+            if callable(tcsetattr) and tcsadrain is not None:
+                tcsetattr(self.fd, tcsadrain, self._old_settings)
             self.fd = None
             self._old_settings = None
 
@@ -428,6 +646,18 @@ def handle_keypress(key: str, state: ViewerState) -> bool:
     if normalized == "c":
         state.clear_timeline()
         return False
+    mode_map = {
+        "0": DashboardMode.TIMELINE,
+        "1": DashboardMode.SUMMARY,
+        "2": DashboardMode.SESSION,
+        "3": DashboardMode.ALERTS,
+        "4": DashboardMode.STREAMS,
+    }
+    if normalized in mode_map:
+        new_mode = mode_map[normalized]
+        state.active_mode = new_mode
+        state.note_action(f"Mode → {new_mode.name}")
+        return False
     return False
 
 
@@ -456,6 +686,147 @@ def _format_bytes(value: Optional[int]) -> str:
         size /= 1024.0
         idx += 1
     return f"{size:.1f} {units[idx]}"
+
+
+def refresh_time_alerts(state: ViewerState) -> bool:
+    changed = False
+    if state.last_heartbeat is None:
+        changed |= state._set_alert("heartbeat_missing", True, "Очікуємо перший heartbeat…", severity="info")
+    else:
+        changed |= state._set_alert("heartbeat_missing", False, None)
+    hb_age = state.heartbeat_age()
+    if hb_age is not None:
+        changed |= state._set_alert(
+            "heartbeat_stale",
+            hb_age >= HEARTBEAT_ALERT_SECONDS,
+            f"Heartbeat затримався на {hb_age:.0f} с",
+            severity="danger",
+        )
+    else:
+        changed |= state._set_alert("heartbeat_stale", False, None)
+    return changed
+
+
+def refresh_ohlcv_alerts(state: ViewerState) -> bool:
+    changed = False
+    now = time.time()
+    if state.last_ohlcv_ts is None:
+        changed |= state._set_alert("ohlcv_missing", True, "Очікуємо перший OHLCV payload…", severity="info")
+        state._track_issue_state("ohlcv_msg_idle", False, None)
+        state._track_issue_state("ohlcv_lag", False, None)
+        state._track_issue_state("ohlcv_empty", False, None)
+        return changed
+
+    changed |= state._set_alert("ohlcv_missing", False, None)
+
+    if not state.ohlcv_targets:
+        state._track_issue_state("ohlcv_msg_idle", False, None)
+        state._track_issue_state("ohlcv_lag", False, None)
+        state._track_issue_state("ohlcv_empty", False, None)
+        changed |= state._set_alert("ohlcv_msg_idle", False, None)
+        changed |= state._set_alert("ohlcv_lag", False, None)
+        changed |= state._set_alert("ohlcv_empty", False, None)
+        return changed
+
+    market_open = str((state.last_market_status or {}).get("state", "")).lower() == "open"
+    idle_entries: List[Tuple[str, str, float]] = []
+    lag_entries: List[Tuple[str, str, float]] = []
+
+    for key, payload in state.ohlcv_targets.items():
+        symbol = payload.get("symbol", "?")
+        tf = payload.get("tf", "?")
+        updated_ts = state.ohlcv_updated.get(key)
+        msg_age = max(0.0, now - updated_ts) if updated_ts else None
+        last_close_ms = _coerce_int(payload.get("last_close_ms"))
+        lag_seconds = None
+        if last_close_ms is not None:
+            lag_seconds = max(0.0, now - (last_close_ms / 1000.0))
+        _update_ohlcv_metrics(symbol, tf, lag_seconds, msg_age)
+
+        idle_active = msg_age is not None and msg_age >= OHLCV_MSG_IDLE_WARN_SECONDS
+        if idle_active and msg_age is not None:
+            idle_entries.append((symbol, tf, msg_age))
+        previous_idle = state.ohlcv_idle_flags.get(key, False)
+        if idle_active:
+            state.ohlcv_idle_flags[key] = True
+        else:
+            state.ohlcv_idle_flags.pop(key, None)
+        if idle_active and not previous_idle:
+            _increment_ohlcv_gap(symbol, tf)
+
+        if lag_seconds is None:
+            lag_active = False
+        else:
+            lag_active = market_open and lag_seconds >= OHLCV_LAG_WARN_SECONDS
+            if lag_active:
+                lag_entries.append((symbol, tf, lag_seconds))
+        previous_lag = state.ohlcv_lag_flags.get(key, False)
+        if lag_active:
+            state.ohlcv_lag_flags[key] = True
+        else:
+            state.ohlcv_lag_flags.pop(key, None)
+        if lag_active and not previous_lag:
+            _increment_ohlcv_gap(symbol, tf)
+
+    idle_entries.sort(key=lambda item: item[2], reverse=True)
+    lag_entries.sort(key=lambda item: item[2], reverse=True)
+
+    if idle_entries:
+        worst_idle = idle_entries[0]
+        detail_idle = f"{worst_idle[0]} {worst_idle[1]} msg age {worst_idle[2]:.0f}s"
+        severity_idle = "danger" if worst_idle[2] >= OHLCV_MSG_IDLE_ERROR_SECONDS else "warning"
+        summary_idle = ", ".join(
+            f"{sym} {tf} {age:.0f}s" for sym, tf, age in idle_entries[:3]
+        )
+        state._track_issue_state("ohlcv_msg_idle", True, detail_idle)
+        changed |= state._set_alert(
+            "ohlcv_msg_idle",
+            True,
+            f"Немає нових OHLCV {summary_idle}",
+            severity=severity_idle,
+        )
+    else:
+        state._track_issue_state("ohlcv_msg_idle", False, None)
+        changed |= state._set_alert("ohlcv_msg_idle", False, None)
+
+    if lag_entries:
+        worst_lag = lag_entries[0]
+        detail_lag = f"{worst_lag[0]} {worst_lag[1]} lag {worst_lag[2]:.0f}s"
+        severity_lag = "danger" if worst_lag[2] >= OHLCV_LAG_ERROR_SECONDS else "warning"
+        summary_lag = ", ".join(
+            f"{sym} {tf} {lag:.0f}s" for sym, tf, lag in lag_entries[:3]
+        )
+        state._track_issue_state("ohlcv_lag", True, detail_lag)
+        changed |= state._set_alert(
+            "ohlcv_lag",
+            True,
+            f"OHLCV лаг: {summary_lag}",
+            severity=severity_lag,
+        )
+    else:
+        state._track_issue_state("ohlcv_lag", False, None)
+        changed |= state._set_alert("ohlcv_lag", False, None)
+
+    zero_entries = list(state.ohlcv_zero_bars_since.items())
+    zero_entries.sort(key=lambda item: item[1], reverse=True)
+    if zero_entries:
+        keys = [
+            f"{sym} {tf} ({int(now - since)}s)"
+            for (sym, tf), since in zero_entries[:3]
+        ]
+        detail_zero = ", ".join(keys)
+        state._track_issue_state("ohlcv_empty", True, detail_zero)
+        changed |= state._set_alert(
+            "ohlcv_empty",
+            True,
+            f"Порожні OHLCV payload: {detail_zero}",
+            severity="warning",
+        )
+    else:
+        state._track_issue_state("ohlcv_empty", False, None)
+        changed |= state._set_alert("ohlcv_empty", False, None)
+
+    return changed
 
 
 def refresh_redis_health(redis_client: "redis.Redis", state: ViewerState) -> None:  # type: ignore[name-defined]
@@ -496,6 +867,26 @@ def _format_epoch_ms(ms_value: Any) -> str:
     return f"{ms} ({dt_value.isoformat()})"
 
 
+def _format_epoch_ms_compact(ms_value: Any) -> str:
+    ms = _coerce_int(ms_value)
+    if ms is None:
+        return "—"
+    dt_value = dt.datetime.fromtimestamp(ms / 1000.0, tz=dt.timezone.utc)
+    return dt_value.strftime("%m-%d %H:%M:%S")
+
+
+def _update_ohlcv_metrics(symbol: str, tf: str, lag_seconds: Optional[float], msg_age: Optional[float]) -> None:
+    if PROM_VIEWER_OHLCV_LAG_SECONDS is not None and lag_seconds is not None:
+        PROM_VIEWER_OHLCV_LAG_SECONDS.labels(symbol=symbol, tf=tf).set(lag_seconds)
+    if PROM_VIEWER_OHLCV_MSG_AGE_SECONDS is not None and msg_age is not None:
+        PROM_VIEWER_OHLCV_MSG_AGE_SECONDS.labels(symbol=symbol, tf=tf).set(max(0.0, msg_age))
+
+
+def _increment_ohlcv_gap(symbol: str, tf: str) -> None:
+    if PROM_VIEWER_OHLCV_GAPS_TOTAL is not None:
+        PROM_VIEWER_OHLCV_GAPS_TOTAL.labels(symbol=symbol, tf=tf).inc()
+
+
 def _compute_next_open_seconds(
     heartbeat: Dict[str, Any],
     session: Dict[str, Any],
@@ -524,14 +915,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--redis-password", default=os.environ.get("FXCM_REDIS_PASSWORD"))
     parser.add_argument("--heartbeat-channel", default=HEARTBEAT_CHANNEL_DEFAULT)
     parser.add_argument("--market-status-channel", default=MARKET_STATUS_CHANNEL_DEFAULT)
+    parser.add_argument("--ohlcv-channel", default=OHLCV_CHANNEL_DEFAULT, help="канал OHLCV (порожній рядок = вимкнено)")
     parser.add_argument("--refresh", default=2.0, type=float, help="частота оновлення UI (сек)")
     return parser.parse_args()
 
 
 def build_summary_panel(state: ViewerState) -> Panel:
     table = Table.grid(padding=1)
-    table.add_column(justify="right", style="bold cyan")
-    table.add_column()
+    table.add_column(justify="right", style="bold cyan", overflow="fold")
+    table.add_column(overflow="fold")
 
     heartbeat = state.last_heartbeat or {}
     context = heartbeat.get("context") or {}
@@ -565,22 +957,39 @@ def build_summary_panel(state: ViewerState) -> Panel:
         table.add_row("Heartbeat age", _format_duration(hb_age))
 
     table.add_row("Cycle seconds", _format_float(_coerce_float(context.get("cycle_seconds")), digits=2))
-    table.add_row("Redis connected", _format_bool(context.get("redis_connected")))
-    table.add_row("Redis required", _format_bool(context.get("redis_required")))
-    table.add_row("Cache enabled", _format_bool(context.get("cache_enabled")))
+    table.add_row("Monitor mode", state.active_mode.name)
     table.add_row("Last action", state.last_action or "—")
 
-    controls_line = Text("Controls: [P] пауза  [C] очистити  [Q] вихід", style="dim")
-    content = Group(table, Text(""), controls_line)
-    return Panel(content, title="FXCM summary", border_style="cyan", box=box.ROUNDED)
+    return Panel(table, title="FXCM summary", border_style="cyan", box=box.ROUNDED)
 
+
+def build_menu_bar() -> Panel:
+    return Panel(Text(MENU_TEXT, justify="center", style="bold"), box=box.SIMPLE, border_style="dim")
+
+def build_alerts_panel(state: ViewerState) -> Panel:
+    alerts = state.active_alerts()
+    if not alerts:
+        return Panel("Активних алертів немає", title="Alerts", border_style="green", box=box.ROUNDED)
+
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("Severity", justify="left", style="bold", overflow="fold")
+    table.add_column("Since", justify="right", overflow="fold")
+    table.add_column("Message", overflow="fold")
+
+    for alert in alerts:
+        color = ALERT_SEVERITY_COLORS.get(alert.severity, "white")
+        label = Text(alert.severity.upper(), style=f"bold {color}")
+        table.add_row(label, _format_utc_timestamp(alert.since_ts), alert.message)
+
+    border = ALERT_SEVERITY_COLORS.get(alerts[0].severity, "yellow")
+    return Panel(table, title="Alerts", border_style=border, box=box.ROUNDED)
 
 def build_issue_panel(state: ViewerState) -> Panel:
-    table = Table(box=box.SIMPLE_HEAVY)
-    table.add_column("Issue", style="bold")
-    table.add_column("Count", justify="right")
-    table.add_column("Last seen", justify="right")
-    table.add_column("Details")
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("Issue", style="bold", overflow="fold")
+    table.add_column("Count", justify="right", overflow="fold")
+    table.add_column("Last seen", justify="right", overflow="fold")
+    table.add_column("Details", overflow="fold")
 
     has_activity = False
     for key, label in ISSUE_LABELS.items():
@@ -607,8 +1016,8 @@ def build_redis_panel(state: ViewerState) -> Panel:
         return Panel("Очікуємо ping/info…", title="Redis health", border_style="yellow", box=box.ROUNDED)
 
     table = Table.grid(padding=(0, 1))
-    table.add_column(style="bold cyan", justify="right")
-    table.add_column()
+    table.add_column(style="bold cyan", justify="right", overflow="fold")
+    table.add_column(overflow="fold")
 
     status = health.get("status", "unknown")
     table.add_row("Status", status)
@@ -649,32 +1058,102 @@ def build_stream_targets_panel(state: ViewerState) -> Panel:
     heartbeat = state.last_heartbeat or {}
     context = heartbeat.get("context") or {}
     targets = context.get("stream_targets") or []
+    entries: List[Dict[str, Any]] = []
+    now_ts = time.time()
+    for target in targets:
+        symbol = target.get("symbol", "?")
+        tf = target.get("tf", "?")
+        staleness = _coerce_float(target.get("staleness_seconds"))
+        ms_value = staleness * 1000.0 if staleness is not None else None
+        spark = _render_sparkline(state.staleness_history.get((symbol, tf)))
+        updated_ts = state.stream_target_updated.get((symbol, tf))
+        updated_age = max(0.0, now_ts - updated_ts) if updated_ts else None
+        entries.append(
+            {
+                "symbol": symbol,
+                "tf": tf,
+                "staleness": staleness,
+                "ms": ms_value,
+                "spark": spark,
+                "updated": updated_age,
+            }
+        )
 
-    table = Table(box=box.SIMPLE_HEAVY)
-    table.add_column("Symbol", style="bold")
-    table.add_column("TF")
-    table.add_column("Staleness (s)", justify="right")
-    table.add_column("Staleness (ms)", justify="right")
-    table.add_column("Trend", justify="left")
+    entries.sort(key=lambda item: item.get("staleness") or -1.0, reverse=True)
 
-    if not targets:
-        table.add_row("—", "—", "—", "—", "—")
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("Symbol", style="bold", overflow="fold")
+    table.add_column("TF", overflow="fold")
+    table.add_column("Staleness (s)", justify="right", overflow="fold")
+    table.add_column("Staleness (ms)", justify="right", overflow="fold")
+    table.add_column("Trend", justify="left", overflow="fold")
+    table.add_column("Updated", justify="right", overflow="fold")
+    if not entries:
+        table.add_row("—", "—", "—", "—", "—", "—")
     else:
-        for target in targets:
-            symbol = target.get("symbol", "?")
-            tf = target.get("tf", "?")
-            staleness = _coerce_float(target.get("staleness_seconds"))
-            ms_value = staleness * 1000.0 if staleness is not None else None
-            spark = _render_sparkline(state.staleness_history.get((symbol, tf)))
+        for item in entries:
             table.add_row(
-                symbol,
-                tf,
-                f"{staleness:.1f}" if staleness is not None else "—",
-                _format_float(ms_value, digits=0),
-                spark,
+                item["symbol"],
+                item["tf"],
+                f"{item['staleness']:.1f}" if item["staleness"] is not None else "—",
+                _format_float(item.get("ms"), digits=0),
+                item["spark"],
+                _format_duration(item.get("updated")),
             )
 
     return Panel(table, title="Stream targets", border_style="magenta")
+
+
+def build_ohlcv_panel(state: ViewerState) -> Panel:
+    if not state.ohlcv_targets:
+        return Panel("Очікуємо OHLCV payload…", title="OHLCV channel", border_style="yellow", box=box.ROUNDED)
+
+    now_ts = time.time()
+    entries: List[Dict[str, Any]] = []
+    for key, payload in state.ohlcv_targets.items():
+        last_close_ms = payload.get("last_close_ms")
+        lag = None
+        if last_close_ms is not None:
+            lag = max(0.0, now_ts - (last_close_ms / 1000.0))
+        updated = state.ohlcv_updated.get(key)
+        msg_age = max(0.0, now_ts - updated) if updated else None
+        entries.append(
+            {
+                "symbol": payload.get("symbol", "?"),
+                "tf": payload.get("tf", "?"),
+                "bars": payload.get("bars_per_msg", 0),
+                "last_close_ms": last_close_ms,
+                "lag": lag,
+                "msg_age": msg_age,
+                "spark": _render_sparkline(state.ohlcv_lag_history.get(key)),
+            }
+        )
+
+    entries.sort(key=lambda item: item.get("lag") or -1.0, reverse=True)
+
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("Symbol", style="bold", overflow="fold")
+    table.add_column("TF", overflow="fold")
+    table.add_column("Bars/msg", justify="right", overflow="fold")
+    table.add_column("Last close", justify="right", overflow="fold")
+    table.add_column("Lag (s)", justify="right", overflow="fold")
+    table.add_column("Msg age", justify="right", overflow="fold")
+    table.add_column("Trend", overflow="fold")
+    if not entries:
+        table.add_row("—", "—", "0", "—", "—", "—", "—")
+    else:
+        for item in entries:
+            table.add_row(
+                item.get("symbol", "?"),
+                item.get("tf", "?"),
+                str(item.get("bars", 0)),
+                _format_epoch_ms_compact(item.get("last_close_ms")),
+                f"{item['lag']:.1f}" if item.get("lag") is not None else "—",
+                _format_short_duration(item.get("msg_age")),
+                item.get("spark", "—"),
+            )
+
+    return Panel(table, title="OHLCV channel", border_style="blue", box=box.ROUNDED)
 
 
 def build_session_panel(state: ViewerState) -> Panel:
@@ -685,37 +1164,46 @@ def build_session_panel(state: ViewerState) -> Panel:
         return Panel("(session context відсутній)", title="Session", border_style="yellow")
 
     info = Table.grid(padding=(0, 1))
-    info.add_column(style="bold green")
-    info.add_column()
-    info.add_row("Tag", session.get("tag", "—"))
-    info.add_row("Timezone", session.get("timezone", "—"))
-    info.add_row("Session open", session.get("session_open_utc", "—"))
-    info.add_row("Session close", session.get("session_close_utc", "—"))
-    info.add_row("Weekly open", session.get("weekly_open", "—"))
-    info.add_row("Weekly close", session.get("weekly_close", "—"))
+    info.add_column(style="bold green", overflow="fold")
+    info.add_column(overflow="fold")
+    info_rows = [
+        ("Tag", session.get("tag", "—")),
+        ("Timezone", session.get("timezone", "—")),
+        ("Session open", session.get("session_open_utc", "—")),
+        ("Session close", session.get("session_close_utc", "—")),
+        ("Weekly open", session.get("weekly_open", "—")),
+        ("Weekly close", session.get("weekly_close", "—")),
+    ]
+    for label, value in info_rows:
+        info.add_row(label, value)
 
     stats = session.get("stats") or {}
-    stats_table = Table(box=box.MINIMAL_DOUBLE_HEAD)
-    stats_table.add_column("Session", style="bold")
-    stats_table.add_column("Symbol")
-    stats_table.add_column("TF")
-    stats_table.add_column("Bars", justify="right")
-    stats_table.add_column("High", justify="right")
-    stats_table.add_column("Low", justify="right")
-    stats_table.add_column("Δ", justify="right")
-    stats_table.add_column("Δ x bars", justify="right")
-    stats_table.add_column("Avg", justify="right")
+    stats_table = Table(box=box.MINIMAL_DOUBLE_HEAD, expand=True)
+    stats_table.add_column("Session", style="bold", overflow="fold")
+    stats_table.add_column("Symbol", overflow="fold")
+    stats_table.add_column("TF", overflow="fold")
+    stats_table.add_column("Bars", justify="right", overflow="fold")
+    stats_table.add_column("High", justify="right", overflow="fold")
+    stats_table.add_column("Low", justify="right", overflow="fold")
+    stats_table.add_column("Δ", justify="right", overflow="fold")
+    stats_table.add_column("Δ x bars", justify="right", overflow="fold")
+    stats_table.add_column("Avg", justify="right", overflow="fold")
 
-    range_table = Table(box=box.SIMPLE_HEAVY)
-    range_table.add_column("Session", style="bold")
-    range_table.add_column("Symbol")
-    range_table.add_column("TF")
-    range_table.add_column("Δ now", justify="right")
-    range_table.add_column("Baseline", justify="right")
-    range_table.add_column("Ratio", justify="right")
-    range_table.add_column("Indicator")
+    snapshot_items = sorted(
+        state.session_range_snapshot.items(),
+        key=lambda item: (_range_ratio(item[1][0], item[1][1]) or 0.0),
+        reverse=True,
+    )
 
-    snapshot_items = sorted(state.session_range_snapshot.items())
+    range_table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    range_table.add_column("Session", style="bold", overflow="fold")
+    range_table.add_column("Symbol", overflow="fold")
+    range_table.add_column("TF", overflow="fold")
+    range_table.add_column("Δ now", justify="right", overflow="fold")
+    range_table.add_column("Baseline", justify="right", overflow="fold")
+    range_table.add_column("Ratio", justify="right", overflow="fold")
+    range_table.add_column("Indicator", overflow="fold")
+
     if snapshot_items:
         for (tag, symbol, tf), (current, baseline) in snapshot_items:
             ratio = _range_ratio(current, baseline)
@@ -759,13 +1247,10 @@ def build_session_panel(state: ViewerState) -> Panel:
                     _format_float(cumulative_range),
                     _format_float(_coerce_float(entry.get("avg"))),
                 )
-    else:
+    elif not stats:
         stats_table.add_row("—", "—", "—", "0", "—", "—", "—", "—", "—")
 
-    content = [info, Text("")]
-    content.append(range_table)
-    content.append(Text(""))
-    content.append(stats_table)
+    content: List[Any] = [info, Text(""), range_table, Text(""), stats_table]
     return Panel(Group(*content), title="Session context", border_style="green", box=box.ROUNDED)
 
 
@@ -801,7 +1286,7 @@ def build_timeline_panel(state: ViewerState) -> Panel:
         symbol_line.append(f" {symbol} ", style=color)
         if idx % 3 == 0:
             label = dt.datetime.fromtimestamp(event.ts_epoch, tz=dt.timezone.utc).strftime("%H:%M")
-            time_line.append(f" {label} ", style="dim")
+            time_line.append(f" {label} ", style=color)
         else:
             time_line.append("    ")
 
@@ -810,24 +1295,44 @@ def build_timeline_panel(state: ViewerState) -> Panel:
     return Panel(content, title="Event timeline", border_style="blue", box=box.ROUNDED)
 
 
-def render_dashboard(state: ViewerState) -> Layout:
-    layout = Layout(name="root")
+def _render_mode_body(state: ViewerState) -> Union[Layout, Panel]:
+    mode = state.active_mode
+    if mode == DashboardMode.SUMMARY:
+        return build_summary_panel(state)
+    if mode == DashboardMode.SESSION:
+        return build_session_panel(state)
+    if mode == DashboardMode.TIMELINE:
+        return build_timeline_panel(state)
+    if mode == DashboardMode.STREAMS:
+        layout = Layout(name="streams_mode")
+        layout.split_column(
+            Layout(name="redis", ratio=1, minimum_size=5),
+            Layout(name="streams", ratio=2, minimum_size=6),
+        )
+        layout["redis"].update(build_redis_panel(state))
+        layout["streams"].update(build_stream_targets_panel(state))
+        return layout
+    layout = Layout(name="alerts_mode")
     layout.split_column(
-        Layout(name="top", ratio=3),
-        Layout(name="middle", size=9),
-        Layout(name="bottom", ratio=2),
+        Layout(name="alerts", ratio=1, minimum_size=5),
+        Layout(name="issues", ratio=1, minimum_size=5),
+        Layout(name="ohlcv", ratio=1, minimum_size=5),
     )
-    layout["top"].split_row(
-        Layout(build_summary_panel(state), name="summary"),
-        Layout(build_session_panel(state), name="session"),
-    )
-    layout["middle"].split_row(
-        Layout(build_issue_panel(state), name="issues"),
-        Layout(build_redis_panel(state), name="redis"),
-        Layout(build_stream_targets_panel(state), name="streams"),
-    )
-    layout["bottom"].update(build_timeline_panel(state))
+    layout["alerts"].update(build_alerts_panel(state))
+    layout["issues"].update(build_issue_panel(state))
+    layout["ohlcv"].update(build_ohlcv_panel(state))
     return layout
+
+
+def render_dashboard(state: ViewerState) -> Layout:
+    root = Layout(name="root")
+    root.split_column(
+        Layout(name="body", ratio=1),
+        Layout(name="menu", size=3),
+    )
+    root["body"].update(_render_mode_body(state))
+    root["menu"].update(build_menu_bar())
+    return root
 
 
 def run_viewer(args: argparse.Namespace) -> None:
@@ -836,15 +1341,25 @@ def run_viewer(args: argparse.Namespace) -> None:
 
     client = redis.Redis(host=args.redis_host, port=args.redis_port, password=args.redis_password, decode_responses=False)
     pubsub = client.pubsub(ignore_subscribe_messages=True)
-    pubsub.subscribe(args.heartbeat_channel, args.market_status_channel)
+    channels = [args.heartbeat_channel, args.market_status_channel]
+    if args.ohlcv_channel:
+        channels.append(args.ohlcv_channel)
+    pubsub.subscribe(*channels)
 
     state = ViewerState()
     last_render = 0.0
     next_health_check = 0.0
 
+    console = Console()
+    current_mode = state.active_mode
     force_render = True
     with KeyboardInput() as keyboard:
-        with Live(render_dashboard(state), refresh_per_second=max(1.0, 1.0 / args.refresh), screen=True) as live:
+        with Live(
+            render_dashboard(state),
+            refresh_per_second=max(1.0, 1.0 / args.refresh),
+            screen=True,
+            console=console,
+        ) as live:
             try:
                 while True:
                     message = pubsub.get_message(timeout=0.5)
@@ -865,6 +1380,8 @@ def run_viewer(args: argparse.Namespace) -> None:
                             state.note_heartbeat(payload)
                         elif channel == args.market_status_channel:
                             state.note_market_status(payload)
+                        elif args.ohlcv_channel and channel == args.ohlcv_channel:
+                            state.note_ohlcv(payload)
                         force_render = True
 
                     key = keyboard.poll()
@@ -873,7 +1390,15 @@ def run_viewer(args: argparse.Namespace) -> None:
                             raise KeyboardInterrupt
                         force_render = True
 
+                    if refresh_time_alerts(state):
+                        force_render = True
+                    if refresh_ohlcv_alerts(state):
+                        force_render = True
+
                     now = time.time()
+                    if state.active_mode != current_mode:
+                        current_mode = state.active_mode
+                        force_render = True
                     if now >= next_health_check:
                         refresh_redis_health(client, state)
                         next_health_check = now + max(2.0, REDIS_HEALTH_INTERVAL)
