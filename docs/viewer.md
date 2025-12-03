@@ -84,6 +84,27 @@ Viewer відстежує кілька ключових ситуацій:
 | `tf_1m_idle_warn_seconds`, `tf_1m_idle_error_seconds` | Спеціальні пороги для конкретного TF (доступні також для `tf_5m`, і можна додавати власні). |
 | `timeline_matrix_rows`, `timeline_max_columns`, `timeline_history_max`, `timeline_focus_minutes` | Контролюють розмірність таймлайну. |
 
+фрагмент:
+
+'''
+   "viewer": {
+     "heartbeat_channel": "fxcm:heartbeat",
+     "market_status_channel": "fxcm:market_status",
+     "ohlcv_channel": "fxcm:ohlcv",
+     "redis_health_interval_seconds": 30,
+     "lag_spike_threshold_seconds": 60,
+     "heartbeat_alert_seconds": 45,
+     "ohlcv_msg_idle_warn_seconds": 90,
+     "ohlcv_msg_idle_error_seconds": 180,
+     "ohlcv_lag_warn_seconds": 45,
+     "ohlcv_lag_error_seconds": 120,
+     "timeline_matrix_rows": 10,
+     "timeline_max_columns": 120,
+     "timeline_history_max": 5000,
+     "timeline_focus_minutes": 30
+   }
+'''
+
 ### TF-специфічні пороги
 
 Функція `resolve_idle_thresholds` шукає ключ `tf_<label>_idle_warn_seconds` / `_error_seconds`. Якщо їх немає, порогові

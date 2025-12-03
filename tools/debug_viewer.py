@@ -1,16 +1,18 @@
 """Консольний viewer для FXCM-конектора.
 
-Запускає простий live-dashboard у терміналі та показує:
-- останній heartbeat (стан, лаг, причину idle, таймінги);
-- market_status з next_open;
-- таблицю stream targets (staleness/lag);
-- сесійну інформацію (tag, timezone, вікно, stats).
+Формує live-dashboard у терміналі з такими панелями:
+- heartbeat/market_status діагностика (стан, лаг, цикл, next_open, Redis-зʼєднання);
+- інцидент-стрічка та алерти (fxcm_pause, calendar_pause, redis_disconnect, ohlcv_idle/lag/empty);
+- таймлайн подій HB/MS із підсумками та легендою;
+- таблиці stream targets та OHLCV (staleness, lag, msg age, sparkline-тренди);
+- сесійний блок із тегами, timezone, range/baseline та статистикою symbols;
+- Redis health, issue counters і меню режимів.
 
-Використання:
+Запуск:
     python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 
-Параметри каналів/таймінгів задаються блоком `viewer` у config/runtime_settings.json;
-redis host/port можна переозначити аргументами або через `.env`.
+Канали/пороги задаються секцією `viewer` у `config/runtime_settings.json`;
+redis host/port можна переозначити CLI або через `.env`.
 """
 
 from __future__ import annotations
