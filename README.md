@@ -180,7 +180,7 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 - `stream.mode=0` → один warmup-прохід; `1` → нескінченний стрім.
 - `stream.config` приймає рядок або масив `{ "symbol": ..., "tf": ... }`.
 - `cache.dir` можна винести у `/var/lib/fxcm_connector/<env>_cache` для продакшну.
-- `viewer.*` задає канали Redis та таймінги алертів для `tools/debug_viewer.py` (щоб не плодити ENV).
+- `viewer.*` задає канали Redis та таймінги алертів для `tools/debug_viewer.py` (щоб не плодити ENV). Деталі: `docs/viewer.md`.
 - `backoff.*` контролюють експоненційні паузи для FXCM/Redis.
 
 ## 7. Робочі режими
