@@ -25,7 +25,7 @@ from prometheus_client import Counter, Gauge, start_http_server
 try:
     from forexconnect import ForexConnect  # type: ignore[import]
 except ImportError:  # pragma: no cover - SDK може бути не встановлено під час тестів
-    class ForexConnect:  # type: ignore[override]
+    class ForexConnect:  # type: ignore[override, no-redef]
         """Заглушка, щоб тести могли імпортувати модуль без SDK."""
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401 - простий плейсхолдер
@@ -96,7 +96,7 @@ from fxcm_schema import (
 try:
     import redis
 except Exception:  # noqa: BLE001
-    redis = None
+    redis = None  # type: ignore[assignment]
 
 
 # Налаштування логування
@@ -598,11 +598,14 @@ def _publish_market_status(
     ):
         return
 
-    payload: MarketStatusPayload = {
-        "type": "market_status",
-        "state": state,
-        "ts": _now_utc().replace(microsecond=0).isoformat(),
-    }
+    payload = cast(
+        MarketStatusPayload,
+        {
+            "type": "market_status",
+            "state": state,
+            "ts": _now_utc().replace(microsecond=0).isoformat(),
+        },
+    )
     if state == "closed" and next_open is not None:
         payload["next_open_utc"] = next_open.replace(microsecond=0).isoformat()
         payload["next_open_ms"] = int(next_open.timestamp() * 1000)
@@ -695,13 +698,16 @@ def _build_session_context(
     else:
         tag = _SESSION_TAG_SETTING if not _AUTO_SESSION_TAG else _DEFAULT_SESSION_TAG
         timezone = default_timezone
-    context: SessionContextPayload = {
-        "tag": tag,
-        "timezone": timezone,
-        "next_open_utc": target_next_open.replace(microsecond=0).isoformat(),
-        "next_open_ms": int(target_next_open.timestamp() * 1000),
-        "next_open_seconds": max(0.0, (target_next_open - _now_utc()).total_seconds()),
-    }
+    context = cast(
+        SessionContextPayload,
+        {
+            "tag": tag,
+            "timezone": timezone,
+            "next_open_utc": target_next_open.replace(microsecond=0).isoformat(),
+            "next_open_ms": int(target_next_open.timestamp() * 1000),
+            "next_open_seconds": max(0.0, (target_next_open - _now_utc()).total_seconds()),
+        },
+    )
     if resolved_session is not None:
         context["session_open_utc"] = resolved_session.session_open_utc.replace(microsecond=0).isoformat()
         context["session_close_utc"] = resolved_session.session_close_utc.replace(microsecond=0).isoformat()
@@ -1034,7 +1040,7 @@ def _normalize_history_to_ohlcv(
         PROM_DROPPED_BARS.labels(symbol=symbol_norm, tf=timeframe).inc(dropped)
         ohlcv = ohlcv.loc[valid_mask]
 
-    ohlcv = ohlcv.sort_values("open_time").reset_index(drop=True)
+    ohlcv = cast(pd.DataFrame, ohlcv.sort_values(by="open_time", ignore_index=True))
 
     return ohlcv
 
@@ -1132,19 +1138,29 @@ def publish_ohlcv_to_redis(
         "close",
         "volume",
     ]
-    bars_raw = df_to_publish[bar_cols].to_dict("records")
-    bars: List[RedisBar] = [
-        {
-            "open_time": int(row["open_time"]),
-            "close_time": int(row["close_time"]),
-            "open": float(row["open"]),
-            "high": float(row["high"]),
-            "low": float(row["low"]),
-            "close": float(row["close"]),
-            "volume": float(row["volume"]),
-        }
-        for row in bars_raw
-    ]
+    bars: List[RedisBar] = []
+    for (
+        open_time,
+        close_time,
+        open_price,
+        high_price,
+        low_price,
+        close_price,
+        volume_value,
+    ) in df_to_publish[bar_cols].itertuples(index=False, name=None):
+        bar = cast(
+            RedisBar,
+            {
+                "open_time": int(open_time),
+                "close_time": int(close_time),
+                "open": float(open_price),
+                "high": float(high_price),
+                "low": float(low_price),
+                "close": float(close_price),
+                "volume": float(volume_value),
+            },
+        )
+        bars.append(bar)
 
     symbol_norm = _normalize_symbol(symbol)
     rate_limit_key = (symbol_norm, timeframe)

@@ -5,10 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Dict, List
 
-try:  # Python 3.7 fallback для TypedDict
-    from typing import TypedDict
-except ImportError:  # pragma: no cover - typing_extensions для старих інтерпретаторів
-    from typing_extensions import TypedDict
+from typing_extensions import TypedDict
 
 MIN_ALLOWED_BAR_TIMESTAMP_MS = int(dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc).timestamp() * 1000)
 MAX_FUTURE_DRIFT_SECONDS = 86_400  # дозволяємо бари з майбутнім часом до 1 доби

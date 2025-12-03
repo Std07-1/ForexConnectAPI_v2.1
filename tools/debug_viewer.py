@@ -9,8 +9,8 @@
 Використання:
     python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 
-Параметри можна не передавати, якщо у середовищі вже виставлені
-FXCM_REDIS_HOST / FXCM_REDIS_PORT / FXCM_HEARTBEAT_CHANNEL.
+Параметри каналів/таймінгів задаються блоком `viewer` у config/runtime_settings.json;
+redis host/port можна переозначити аргументами або через `.env`.
 """
 
 from __future__ import annotations
@@ -21,13 +21,14 @@ import json
 import os
 import select
 import signal
+import statistics
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from enum import Enum
-import statistics
-from typing import Any, Deque, Dict, Optional, Tuple, Set, List, Union
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from dotenv import load_dotenv
 from rich import box
@@ -61,11 +62,81 @@ except ImportError:  # noqa: SIM105
     termios = None  # type: ignore[assignment]
     tty = None  # type: ignore[assignment]
 
-HEARTBEAT_CHANNEL_DEFAULT = os.environ.get("FXCM_HEARTBEAT_CHANNEL", "fxcm:heartbeat")
-MARKET_STATUS_CHANNEL_DEFAULT = os.environ.get("FXCM_MARKET_STATUS_CHANNEL", "fxcm:market_status")
-OHLCV_CHANNEL_DEFAULT = os.environ.get("FXCM_OHLCV_CHANNEL", "fxcm:ohlcv")
-REDIS_HEALTH_INTERVAL = float(os.environ.get("FXCM_VIEWER_REDIS_HEALTH_INTERVAL", 8))
-LAG_SPIKE_THRESHOLD = float(os.environ.get("FXCM_VIEWER_LAG_SPIKE_THRESHOLD", 180))
+try:
+    from config import RUNTIME_SETTINGS_FILE as _RUNTIME_SETTINGS_PATH
+except Exception:  # pragma: no cover - fallback якщо модуль config недоступний
+    _RUNTIME_SETTINGS_PATH = Path("config/runtime_settings.json")
+
+
+def _load_viewer_settings() -> Dict[str, Any]:
+    try:
+        payload = json.loads(_RUNTIME_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+    viewer_cfg = payload.get("viewer")
+    return viewer_cfg if isinstance(viewer_cfg, dict) else {}
+
+
+_VIEWER_SETTINGS = _load_viewer_settings()
+
+
+def _cfg_str(key: str, default: str) -> str:
+    value = _VIEWER_SETTINGS.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+
+def _cfg_float(key: str, default: float, *, min_value: Optional[float] = None) -> float:
+    value = _VIEWER_SETTINGS.get(key)
+    if value is None:
+        return default
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        parsed = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            parsed = float(text)
+        except ValueError:
+            return default
+    else:
+        return default
+    if min_value is not None:
+        return max(min_value, parsed)
+    return parsed
+
+
+def _cfg_int(key: str, default: int, *, min_value: int = 1) -> int:
+    value = _VIEWER_SETTINGS.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        parsed = int(value)
+    elif isinstance(value, (int, float)):
+        parsed = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            parsed = int(float(text))
+        except ValueError:
+            return default
+    else:
+        return default
+    return max(min_value, parsed)
+
+HEARTBEAT_CHANNEL_DEFAULT = _cfg_str("heartbeat_channel", "fxcm:heartbeat")
+MARKET_STATUS_CHANNEL_DEFAULT = _cfg_str("market_status_channel", "fxcm:market_status")
+OHLCV_CHANNEL_DEFAULT = _cfg_str("ohlcv_channel", "fxcm:ohlcv")
+REDIS_HEALTH_INTERVAL = _cfg_float("redis_health_interval", 8.0, min_value=1.0)
+LAG_SPIKE_THRESHOLD = _cfg_float("lag_spike_threshold", 180.0, min_value=1.0)
 FXCM_PAUSE_REASONS = {"fxcm_temporarily_unavailable", "fxcm_unavailable"}
 CALENDAR_PAUSE_REASONS = {"calendar", "calendar_closed", "market_closed"}
 ISSUE_LABELS = {
@@ -77,14 +148,56 @@ ISSUE_LABELS = {
     "ohlcv_lag": "OHLCV лаги",
     "ohlcv_empty": "OHLCV порожні payload",
 }
-HEARTBEAT_ALERT_SECONDS = float(os.environ.get("FXCM_VIEWER_HEARTBEAT_ALERT_SECONDS", 45))
-OHLCV_MSG_IDLE_WARN_SECONDS = float(os.environ.get("FXCM_VIEWER_OHLCV_MSG_WARN_SECONDS", 90))
-OHLCV_MSG_IDLE_ERROR_SECONDS = float(os.environ.get("FXCM_VIEWER_OHLCV_MSG_ERROR_SECONDS", 180))
-OHLCV_LAG_WARN_SECONDS = float(os.environ.get("FXCM_VIEWER_OHLCV_LAG_WARN_SECONDS", 45))
-OHLCV_LAG_ERROR_SECONDS = float(os.environ.get("FXCM_VIEWER_OHLCV_LAG_ERROR_SECONDS", 120))
+HEARTBEAT_ALERT_SECONDS = _cfg_float("heartbeat_alert_seconds", 45.0, min_value=5.0)
+OHLCV_MSG_IDLE_WARN_SECONDS = _cfg_float("ohlcv_msg_idle_warn_seconds", 90.0, min_value=5.0)
+OHLCV_MSG_IDLE_ERROR_SECONDS = _cfg_float("ohlcv_msg_idle_error_seconds", 180.0, min_value=10.0)
+OHLCV_LAG_WARN_SECONDS = _cfg_float("ohlcv_lag_warn_seconds", 45.0, min_value=5.0)
+OHLCV_LAG_ERROR_SECONDS = _cfg_float("ohlcv_lag_error_seconds", 120.0, min_value=10.0)
+_IDLE_THRESHOLD_OVERRIDES: Dict[str, Tuple[float, float]] = {
+    "1m": (
+        _cfg_float("tf_1m_idle_warn_seconds", 70.0, min_value=5.0),
+        _cfg_float("tf_1m_idle_error_seconds", 90.0, min_value=10.0),
+    ),
+    "5m": (
+        _cfg_float("tf_5m_idle_warn_seconds", 450.0, min_value=5.0),
+        _cfg_float("tf_5m_idle_error_seconds", 900.0, min_value=10.0),
+    ),
+}
 ALERT_SEVERITY_ORDER = {"danger": 0, "warning": 1, "info": 2}
 ALERT_SEVERITY_COLORS = {"danger": "red", "warning": "yellow", "info": "cyan"}
 MENU_TEXT = "[P] пауза  [C] очистити  [Q] вихід  [0] TL  [1] SUM  [2] SES  [3] ALERT  [4] STREAM"
+TIMELINE_MATRIX_ROWS = _cfg_int("timeline_matrix_rows", 10, min_value=2)
+TIMELINE_MAX_COLUMNS = _cfg_int("timeline_max_columns", 120, min_value=10)
+_TIMELINE_HISTORY_DEFAULT = max(240, TIMELINE_MATRIX_ROWS * TIMELINE_MAX_COLUMNS * 2)
+TIMELINE_HISTORY_MAX = _cfg_int("timeline_history_max", _TIMELINE_HISTORY_DEFAULT, min_value=TIMELINE_MATRIX_ROWS)
+TIMELINE_FOCUS_MINUTES = _cfg_float("timeline_focus_minutes", 30.0, min_value=1.0)
+
+
+def _tf_label_to_minutes(tf_label: str) -> Optional[float]:
+    tf_norm = (tf_label or "").strip().lower()
+    if not tf_norm:
+        return None
+    if tf_norm.endswith("m") and tf_norm[:-1].isdigit():
+        return float(max(1, int(tf_norm[:-1] or "1")))
+    if tf_norm.endswith("h") and tf_norm[:-1].isdigit():
+        return float(max(1, int(tf_norm[:-1] or "1")) * 60)
+    if tf_norm.endswith("d") and tf_norm[:-1].isdigit():
+        return float(max(1, int(tf_norm[:-1] or "1")) * 1_440)
+    return None
+
+
+def resolve_idle_thresholds(tf_label: str) -> Tuple[float, float]:
+    tf_key = (tf_label or "").strip().lower()
+    override = _IDLE_THRESHOLD_OVERRIDES.get(tf_key)
+    if override:
+        return override
+    tf_minutes = _tf_label_to_minutes(tf_key)
+    if tf_minutes is not None:
+        tf_seconds = tf_minutes * 60.0
+        warn = max(OHLCV_MSG_IDLE_WARN_SECONDS, tf_seconds * 1.5)
+        error = max(OHLCV_MSG_IDLE_ERROR_SECONDS, tf_seconds * 3.0)
+        return warn, error
+    return OHLCV_MSG_IDLE_WARN_SECONDS, OHLCV_MSG_IDLE_ERROR_SECONDS
 
 if PromGauge is not None:
     PROM_VIEWER_OHLCV_LAG_SECONDS = PromGauge(
@@ -141,7 +254,7 @@ class ViewerState:
     last_market_status: Optional[Dict[str, Any]] = None
     last_message_ts: float = field(default_factory=time.time)
     last_heartbeat_ts: Optional[float] = None
-    timeline_events: Deque[TimelineEvent] = field(default_factory=lambda: deque(maxlen=480))
+    timeline_events: Deque[TimelineEvent] = field(default_factory=lambda: deque(maxlen=TIMELINE_HISTORY_MAX))
     staleness_history: Dict[Tuple[str, str], Deque[float]] = field(default_factory=dict)
     stream_target_updated: Dict[Tuple[str, str], float] = field(default_factory=dict)
     session_range_history: Dict[Tuple[str, str, str], Deque[float]] = field(default_factory=dict)
@@ -160,6 +273,7 @@ class ViewerState:
     alerts: Dict[str, ViewerAlert] = field(default_factory=dict)
     active_mode: DashboardMode = DashboardMode.SUMMARY
     last_ohlcv_ts: Optional[float] = None
+    incident_feed: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=24))
 
     def note_heartbeat(self, payload: Dict[str, Any]) -> None:
         self.last_heartbeat = payload
@@ -342,6 +456,16 @@ class ViewerState:
     def note_action(self, text: str) -> None:
         self.last_action = text
 
+    def _append_incident(self, key: str, active: bool, detail: Optional[str]) -> None:
+        entry = {
+            "key": key,
+            "label": ISSUE_LABELS.get(key, key),
+            "active": active,
+            "detail": detail or "—",
+            "ts": time.time(),
+        }
+        self.incident_feed.appendleft(entry)
+
     def _set_alert(self, key: str, active: bool, message: Optional[str], severity: str = "warning") -> bool:
         changed = False
         if active:
@@ -384,6 +508,8 @@ class ViewerState:
         self.issue_state_flags[key] = active
         if active and not previous:
             self._record_issue(key, detail)
+        if active != previous:
+            self._append_incident(key, active, detail)
 
     def _update_issue_counters(self, state: str, context: Dict[str, Any]) -> None:
         idle_reason_raw = context.get("idle_reason")
@@ -508,6 +634,36 @@ def _format_short_duration(seconds: Optional[float]) -> str:
         return f"{hours}h{minutes:02d}"
     days, hours = divmod(hours, 24)
     return f"{days}d{hours:02d}"
+
+
+def _format_diag_timestamp(value: Any) -> str:
+    if value is None:
+        return "—"
+    epoch: Optional[float] = None
+    if isinstance(value, (int, float)):
+        epoch = float(value)
+    elif isinstance(value, str) and value.strip():
+        text = value.replace("Z", "+00:00")
+        try:
+            epoch = dt.datetime.fromisoformat(text).timestamp()
+        except ValueError:
+            return value
+    if epoch is None:
+        return "—"
+    ts = dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc)
+    ago = max(0.0, time.time() - epoch)
+    return f"{ts.strftime('%H:%M:%S')}Z ({_format_short_duration(ago)} ago)"
+
+
+def _format_diag_duration(value: Any) -> str:
+    seconds = _coerce_float(value)
+    if seconds is None:
+        return "—"
+    if seconds < 1:
+        return f"{seconds * 1000:.0f} ms"
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    return _format_short_duration(seconds)
 
 
 SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
@@ -729,7 +885,7 @@ def refresh_ohlcv_alerts(state: ViewerState) -> bool:
         return changed
 
     market_open = str((state.last_market_status or {}).get("state", "")).lower() == "open"
-    idle_entries: List[Tuple[str, str, float]] = []
+    idle_entries: List[Tuple[str, str, float, float]] = []
     lag_entries: List[Tuple[str, str, float]] = []
 
     for key, payload in state.ohlcv_targets.items():
@@ -743,9 +899,10 @@ def refresh_ohlcv_alerts(state: ViewerState) -> bool:
             lag_seconds = max(0.0, now - (last_close_ms / 1000.0))
         _update_ohlcv_metrics(symbol, tf, lag_seconds, msg_age)
 
-        idle_active = msg_age is not None and msg_age >= OHLCV_MSG_IDLE_WARN_SECONDS
+        warn_threshold, error_threshold = resolve_idle_thresholds(tf)
+        idle_active = msg_age is not None and msg_age >= warn_threshold
         if idle_active and msg_age is not None:
-            idle_entries.append((symbol, tf, msg_age))
+            idle_entries.append((symbol, tf, msg_age, error_threshold))
         previous_idle = state.ohlcv_idle_flags.get(key, False)
         if idle_active:
             state.ohlcv_idle_flags[key] = True
@@ -774,9 +931,9 @@ def refresh_ohlcv_alerts(state: ViewerState) -> bool:
     if idle_entries:
         worst_idle = idle_entries[0]
         detail_idle = f"{worst_idle[0]} {worst_idle[1]} msg age {worst_idle[2]:.0f}s"
-        severity_idle = "danger" if worst_idle[2] >= OHLCV_MSG_IDLE_ERROR_SECONDS else "warning"
+        severity_idle = "danger" if worst_idle[2] >= worst_idle[3] else "warning"
         summary_idle = ", ".join(
-            f"{sym} {tf} {age:.0f}s" for sym, tf, age in idle_entries[:3]
+            f"{sym} {tf} {age:.0f}s" for sym, tf, age, _ in idle_entries[:3]
         )
         state._track_issue_state("ohlcv_msg_idle", True, detail_idle)
         changed |= state._set_alert(
@@ -961,6 +1118,85 @@ def build_summary_panel(state: ViewerState) -> Panel:
     table.add_row("Last action", state.last_action or "—")
 
     return Panel(table, title="FXCM summary", border_style="cyan", box=box.ROUNDED)
+
+
+def build_fxcm_diag_panel(state: ViewerState) -> Panel:
+    heartbeat = state.last_heartbeat or {}
+    context = heartbeat.get("context") or {}
+    if not context:
+        return Panel(
+            "Очікуємо контекст heartbeat…",
+            title="FXCM diagnostics",
+            border_style="yellow",
+            box=box.ROUNDED,
+        )
+
+    table = Table.grid(padding=(0, 1))
+    table.add_column(style="bold cyan", justify="right", overflow="fold")
+    table.add_column(overflow="fold")
+
+    diag_rows = [
+        ("Mode", context.get("mode", "—")),
+        ("Heartbeat ts", _format_diag_timestamp(heartbeat.get("ts"))),
+        ("Lag", _format_diag_duration(context.get("lag_seconds"))),
+        ("Cycle", _format_diag_duration(context.get("cycle_seconds"))),
+        ("Published bars", context.get("published_bars", "—")),
+        ("Poll seconds", _format_diag_duration(context.get("poll_seconds"))),
+        (
+            "Publish interval",
+            _format_diag_duration(context.get("publish_interval_seconds")),
+        ),
+        ("Lookback (min)", context.get("lookback_minutes", "—")),
+        ("Redis connected", _format_bool(context.get("redis_connected"))),
+        ("Redis required", _format_bool(context.get("redis_required"))),
+        ("Redis channel", context.get("redis_channel", "—")),
+        ("Cache enabled", _format_bool(context.get("cache_enabled"))),
+    ]
+    idle_reason = context.get("idle_reason")
+    if idle_reason:
+        diag_rows.append(("Idle reason", idle_reason))
+    next_open_seconds = _coerce_float(context.get("next_open_seconds"))
+    if next_open_seconds is not None:
+        diag_rows.append(("Next open (s)", f"{next_open_seconds:.0f}"))
+    stream_targets = context.get("stream_targets")
+    if isinstance(stream_targets, list):
+        diag_rows.append(("Targets tracked", len(stream_targets)))
+
+    for label, value in diag_rows:
+        table.add_row(label, str(value))
+
+    return Panel(table, title="FXCM diagnostics", border_style="cyan", box=box.ROUNDED)
+
+
+def build_incidents_panel(state: ViewerState) -> Panel:
+    incidents = list(state.incident_feed)
+    if not incidents:
+        return Panel(
+            "Інцидентів поки немає",
+            title="Recent incidents",
+            border_style="green",
+            box=box.ROUNDED,
+        )
+
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("When", justify="right", overflow="fold")
+    table.add_column("Issue", style="bold", overflow="fold")
+    table.add_column("State", justify="center", overflow="fold")
+    table.add_column("Detail", overflow="fold")
+
+    for entry in incidents[:8]:
+        ts_label = _format_diag_timestamp(entry.get("ts"))
+        label = entry.get("label") or entry.get("key") or "—"
+        active = bool(entry.get("active"))
+        state_text = Text(
+            "ACTIVE" if active else "CLEAR",
+            style=f"bold {'red' if active else 'green'}",
+        )
+        detail = entry.get("detail") or "—"
+        table.add_row(ts_label, label, state_text, detail)
+
+    border = "red" if incidents and incidents[0].get("active") else "cyan"
+    return Panel(table, title="Recent incidents", border_style=border, box=box.ROUNDED)
 
 
 def build_menu_bar() -> Panel:
@@ -1274,31 +1510,145 @@ def _symbol_for_event(event: TimelineEvent) -> tuple[str, str]:
     return symbol, color
 
 
+def _timeline_dimensions() -> tuple[int, int]:
+    try:
+        width = Console().width
+    except Exception:  # pragma: no cover - fallback для середовищ без TTY
+        width = 80
+    columns = max(10, min(TIMELINE_MAX_COLUMNS, width - 6))
+    rows = max(2, TIMELINE_MATRIX_ROWS)
+    return rows, columns
+
+
+def _build_timeline_grid(events: List[TimelineEvent]) -> tuple[list[list[Optional[TimelineEvent]]], List[TimelineEvent]]:
+    """
+    Будує сітку таймлайна «як книжку»: зліва направо, зверху вниз.
+
+    Старіші події йдуть у верхніх рядках, новіші – внизу праворуч.
+    Кількість рядків адаптується до обсягу подій (але не більше
+    TIMELINE_MATRIX_ROWS), щоб не тримати зайвий порожній простір
+    і не витісняти підсумкові рядки з панелі.
+    """
+    rows, columns = _timeline_dimensions()
+    max_cells = rows * columns
+    if max_cells <= 0:
+        return [], []
+    visible_events = events[-max_cells:]
+    grid: list[list[Optional[TimelineEvent]]] = [[None for _ in range(columns)] for _ in range(rows)]
+    # Починаємо з (row=0, col=0), щоб таймлайн читався як текст:
+    # зліва направо, зверху вниз; старі події поступово «виштовхуються»
+    # з верхньої частини вікна, але останні завжди внизу/праворуч.
+    for idx, event in enumerate(visible_events):
+        cell_index = idx
+        row = cell_index // columns
+        col = cell_index % columns
+        if 0 <= row < rows:
+            grid[row][col] = event
+    return grid, visible_events
+
+
+def _timeline_summary_lines(events: List[TimelineEvent], state: ViewerState) -> List[Text]:
+    if not events:
+        return [Text("Подій поки немає", style="dim")]
+
+    total = len(events)
+    counts: Counter[str] = Counter({"S": 0, "I": 0, "O": 0, "C": 0})
+    for event in events:
+        symbol, _ = _symbol_for_event(event)
+        if symbol in counts:
+            counts[symbol] += 1
+
+    summary_parts: List[str] = []
+    for label in ("S", "I", "O", "C"):
+        value = counts[label]
+        if total and value:
+            percent = int(round(100 * value / total))
+            summary_parts.append(f"{label}: {value} ({percent}%)")
+        else:
+            summary_parts.append(f"{label}: {value}")
+    summary_line = Text(" · ".join(summary_parts), style="bold")
+
+    gaps: List[float] = []
+    for idx in range(1, len(events)):
+        gap = events[idx].ts_epoch - events[idx - 1].ts_epoch
+        if gap >= 0:
+            gaps.append(gap)
+    max_gap = _format_short_duration(max(gaps)) if gaps else "—"
+    avg_gap_seconds = (sum(gaps) / len(gaps)) if gaps else None
+    if avg_gap_seconds is not None:
+        if avg_gap_seconds < 60:
+            avg_gap = f"{avg_gap_seconds:.1f}s"
+        else:
+            avg_gap = _format_short_duration(avg_gap_seconds)
+    else:
+        avg_gap = "—"
+    window_span = events[-1].ts_epoch - events[0].ts_epoch
+    window_label = _format_duration(window_span)
+    stats_line = Text(f"window: {window_label} · max_gap: {max_gap} · avg_gap: {avg_gap}")
+
+    last_ts = events[-1].ts_epoch
+    market_state = (state.last_market_status or {}).get("state")
+    if not market_state:
+        market_state = (state.last_heartbeat or {}).get("state")
+    tail_line = Text(
+        f"last_event: {_format_utc_timestamp(last_ts)} · market: {market_state or '—'}",
+        style="dim",
+    )
+
+    legend = Text("S=stream, I=idle, O=open, C=closed", style="dim")
+    return [summary_line, stats_line, tail_line, legend]
+
+
 def build_timeline_panel(state: ViewerState) -> Panel:
     events = list(state.timeline_events)
     if not events:
         return Panel("Очікуємо події…", title="Timeline", border_style="blue")
 
-    symbol_line = Text()
-    time_line = Text()
-    for idx, event in enumerate(events):
-        symbol, color = _symbol_for_event(event)
-        symbol_line.append(f" {symbol} ", style=color)
-        if idx % 3 == 0:
-            label = dt.datetime.fromtimestamp(event.ts_epoch, tz=dt.timezone.utc).strftime("%H:%M")
-            time_line.append(f" {label} ", style=color)
-        else:
-            time_line.append("    ")
+    grid, visible_events = _build_timeline_grid(events)
+    if not grid:
+        return Panel("Очікуємо події…", title="Timeline", border_style="blue")
 
-    legend = Text("S=stream, I=idle, O=open, C=closed", style="dim")
-    content = Group(symbol_line, time_line, Text(""), legend)
-    return Panel(content, title="Event timeline", border_style="blue", box=box.ROUNDED)
+    table = Table.grid(padding=0)
+    columns = len(grid[0]) if grid else 0
+    if columns <= 0:
+        columns = 1
+    for _ in range(columns):
+        table.add_column(justify="center", width=1, no_wrap=True)
+
+    focus_cutoff = time.time() - max(0.0, TIMELINE_FOCUS_MINUTES) * 60.0
+    for row in grid:
+        cells: List[Text] = []
+        for event in row:
+            if event is None:
+                cells.append(Text(" ", style="dim"))
+                continue
+            symbol, color = _symbol_for_event(event)
+            if event.ts_epoch >= focus_cutoff:
+                style = f"bold {color}"
+            else:
+                style = f"{color} dim"
+            cells.append(Text(symbol, style=style))
+        table.add_row(*cells)
+
+    summary_lines = _timeline_summary_lines(visible_events, state)
+    # Спочатку summary у лівому верхньому кутку, потім грід подій.
+    content_items: List[Any] = []
+    content_items.extend(summary_lines)
+    content_items.append(table)
+    return Panel(Group(*content_items), title="Event timeline", border_style="blue", box=box.ROUNDED)
 
 
 def _render_mode_body(state: ViewerState) -> Union[Layout, Panel]:
     mode = state.active_mode
     if mode == DashboardMode.SUMMARY:
-        return build_summary_panel(state)
+        layout = Layout(name="summary_mode")
+        layout.split_row(
+            Layout(name="fxcm_diag", ratio=2, minimum_size=6),
+            Layout(name="incidents", ratio=2, minimum_size=6),
+        )
+        layout["fxcm_diag"].update(build_fxcm_diag_panel(state))
+        layout["incidents"].update(build_incidents_panel(state))
+        return layout
     if mode == DashboardMode.SESSION:
         return build_session_panel(state)
     if mode == DashboardMode.TIMELINE:

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 try:
-    from zoneinfo import ZoneInfo
+    from zoneinfo import ZoneInfo  # type: ignore[import]
 except ImportError:  # pragma: no cover - Python 3.7 fallback
     from backports.zoneinfo import ZoneInfo  # type: ignore[assignment]
 

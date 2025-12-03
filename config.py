@@ -341,8 +341,11 @@ def load_config() -> FXCMConfig:
     )
 
     hmac_secret_raw = os.environ.get("FXCM_HMAC_SECRET")
-    hmac_secret = hmac_secret_raw.strip() if isinstance(hmac_secret_raw, str) else ""
-    if not hmac_secret:
+    hmac_secret: Optional[str]
+    if isinstance(hmac_secret_raw, str):
+        stripped = hmac_secret_raw.strip()
+        hmac_secret = stripped or None
+    else:
         hmac_secret = None
 
     hmac_algo = (

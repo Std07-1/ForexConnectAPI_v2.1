@@ -49,7 +49,8 @@ def test_refresh_ohlcv_alerts_sets_missing_before_messages() -> None:
 def test_refresh_ohlcv_alerts_detects_stale(age_delta: float) -> None:
     state = dv.ViewerState()
     key = ("XAU/USD", "1m")
-    state.last_ohlcv_ts = time.time() - (dv.OHLCV_MSG_IDLE_WARN_SECONDS + age_delta)
+    warn_threshold, _ = dv.resolve_idle_thresholds("1m")
+    state.last_ohlcv_ts = time.time() - (warn_threshold + age_delta)
     state.ohlcv_targets[key] = {
         "symbol": "XAU/USD",
         "tf": "1m",
@@ -100,7 +101,8 @@ def test_refresh_ohlcv_alerts_ignores_lag_when_market_closed() -> None:
 def test_refresh_ohlcv_alerts_sets_idle_warning_per_symbol() -> None:
     state = dv.ViewerState()
     key = ("XAU/USD", "1m")
-    last_update = time.time() - (dv.OHLCV_MSG_IDLE_WARN_SECONDS + 5)
+    warn_threshold, _ = dv.resolve_idle_thresholds("1m")
+    last_update = time.time() - (warn_threshold + 5)
     state.last_ohlcv_ts = last_update
     state.ohlcv_targets[key] = {
         "symbol": "XAU/USD",
@@ -117,4 +119,20 @@ def test_refresh_ohlcv_alerts_sets_idle_warning_per_symbol() -> None:
     assert alert is not None
     assert "XAU/USD" in alert.message
     assert alert.severity in {"warning", "danger"}
+
+
+def test_incident_feed_tracks_issue_transitions() -> None:
+    state = dv.ViewerState()
+
+    state._track_issue_state("fxcm_pause", True, "fxcm pause")
+
+    assert state.incident_feed
+    entry = state.incident_feed[0]
+    assert entry["active"] is True
+    assert entry["key"] == "fxcm_pause"
+
+    state._track_issue_state("fxcm_pause", False, "recovered")
+
+    assert len(state.incident_feed) >= 2
+    assert state.incident_feed[0]["active"] is False
 
