@@ -7,6 +7,7 @@
 - таблиці stream targets та OHLCV (staleness, lag, msg age, sparkline-тренди);
 - сесійний блок із тегами, timezone, range/baseline та статистикою symbols;
 - Redis health, issue counters і меню режимів.
+- режим supervisor для моніторингу async supervisor (черги sink-ів, таски та останні помилки).
 
 Запуск:
     python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
@@ -30,7 +31,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from dotenv import load_dotenv
 from rich import box
@@ -134,6 +135,39 @@ def _cfg_int(key: str, default: int, *, min_value: int = 1) -> int:
         return default
     return max(min_value, parsed)
 
+
+def _cfg_list(key: str, default: Sequence[str]) -> List[str]:
+    value = _VIEWER_SETTINGS.get(key)
+    items: List[str] = []
+    if isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, str):
+        raw_items = [part.strip() for part in value.split(",")]
+    else:
+        raw_items = list(default)
+    for item in raw_items:
+        if not item:
+            continue
+        text = str(item).strip()
+        if text:
+            items.append(text)
+    if not items:
+        return list(default)
+    return items
+
+
+def _cfg_dict_str(key: str) -> Dict[str, str]:
+    value = _VIEWER_SETTINGS.get(key)
+    if not isinstance(value, dict):
+        return {}
+    result: Dict[str, str] = {}
+    for raw_key, raw_val in value.items():
+        key_text = str(raw_key).strip()
+        val_text = str(raw_val).strip()
+        if key_text and val_text:
+            result[key_text] = val_text
+    return result
+
 HEARTBEAT_CHANNEL_DEFAULT = _cfg_str("heartbeat_channel", "fxcm:heartbeat")
 MARKET_STATUS_CHANNEL_DEFAULT = _cfg_str("market_status_channel", "fxcm:market_status")
 OHLCV_CHANNEL_DEFAULT = _cfg_str("ohlcv_channel", "fxcm:ohlcv")
@@ -167,12 +201,38 @@ _IDLE_THRESHOLD_OVERRIDES: Dict[str, Tuple[float, float]] = {
 }
 ALERT_SEVERITY_ORDER = {"danger": 0, "warning": 1, "info": 2}
 ALERT_SEVERITY_COLORS = {"danger": "red", "warning": "yellow", "info": "cyan"}
-MENU_TEXT = "[P] пауза  [C] очистити  [Q] вихід  [0] TL  [1] SUM  [2] SES  [3] ALERT  [4] STREAM"
+MENU_TEXT = "[P] пауза  [C] очистити  [Q] вихід  [0] TL  [1] SUM  [2] SES  [3] ALERT  [4] STREAM  [5] PRICE  [6] SUPR"
 TIMELINE_MATRIX_ROWS = _cfg_int("timeline_matrix_rows", 10, min_value=2)
 TIMELINE_MAX_COLUMNS = _cfg_int("timeline_max_columns", 120, min_value=10)
 _TIMELINE_HISTORY_DEFAULT = max(240, TIMELINE_MATRIX_ROWS * TIMELINE_MAX_COLUMNS * 2)
 TIMELINE_HISTORY_MAX = _cfg_int("timeline_history_max", _TIMELINE_HISTORY_DEFAULT, min_value=TIMELINE_MATRIX_ROWS)
 TIMELINE_FOCUS_MINUTES = _cfg_float("timeline_focus_minutes", 30.0, min_value=1.0)
+SUPERVISOR_CHANNELS_DEFAULT = ("ohlcv", "heartbeat", "market_status", "price")
+SUPERVISOR_CHANNELS = tuple(_cfg_list("supervisor_channels", SUPERVISOR_CHANNELS_DEFAULT))
+_SUPERVISOR_CHANNEL_HINT_DEFAULTS = {
+    "ohlcv": "Основний sink для OHLCV повідомлень (fxcm:ohlcv).",
+    "heartbeat": "Публікація heartbeat із контекстом stream (fxcm:heartbeat).",
+    "market_status": "Оновлення стану ринку (fxcm:market_status).",
+    "price": "Снепшоти цін із PriceSnapshotWorker (fxcm:price_tik).",
+}
+SUPERVISOR_CHANNEL_HINT_OVERRIDES = _cfg_dict_str("supervisor_channel_hints")
+
+
+def _resolve_channel_hint(name: str) -> str:
+    return SUPERVISOR_CHANNEL_HINT_OVERRIDES.get(name) or _SUPERVISOR_CHANNEL_HINT_DEFAULTS.get(name, "")
+
+
+SUPERVISOR_CHANNEL_HINTS = {name: _resolve_channel_hint(name) for name in SUPERVISOR_CHANNELS}
+SUPERVISOR_METRIC_HINTS = {
+    "total_enqueued": "Скільки payload покладено в черги (включно з необробленими).",
+    "total_processed": "Скільки payload знято воркерами (успішно/помилково).",
+    "total_dropped": "Кількість дропів через переповнення черги.",
+    "queue_depth_total": "Сумарна глибина черг (допомагає бачити беклог).",
+    "publishes_total": "Загальна кількість publish викликів із моменту старту supervisor.",
+    "active_tasks": "Скільки тасків зараз у стані running.",
+    "task_errors": "Сумарні помилки, які повідомили таски.",
+    "backpressure_events": "Скільки разів enqueue повертав QueueFull (backpressure).",
+}
 
 
 def _tf_label_to_minutes(tf_label: str) -> Optional[float]:
@@ -232,6 +292,8 @@ class DashboardMode(Enum):
     SESSION = 2
     ALERTS = 3
     STREAMS = 4
+    PRICE = 5
+    SUPERVISOR = 6
 
 
 @dataclass
@@ -276,6 +338,11 @@ class ViewerState:
     active_mode: DashboardMode = DashboardMode.SUMMARY
     last_ohlcv_ts: Optional[float] = None
     incident_feed: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=24))
+    price_stream: Dict[str, Any] = field(default_factory=dict)
+    price_stream_updated: Optional[float] = None
+    tick_silence_seconds: Optional[float] = None
+    supervisor_diag: Dict[str, Any] = field(default_factory=dict)
+    supervisor_updated: Optional[float] = None
 
     def note_heartbeat(self, payload: Dict[str, Any]) -> None:
         self.last_heartbeat = payload
@@ -289,6 +356,25 @@ class ViewerState:
         self._update_session_ranges(session_context)
         self._update_issue_counters(state, context)
         self._add_timeline_event(source="HB", state=state, ts=payload.get("ts"))
+        self.tick_silence_seconds = _coerce_float(context.get("tick_silence_seconds"))
+        price_ctx = context.get("price_stream")
+        if isinstance(price_ctx, dict):
+            self.price_stream = price_ctx
+            self.price_stream_updated = now_ts
+        else:
+            self.price_stream = {}
+        supervisor_ctx = None
+        for key in ("supervisor", "async_supervisor"):
+            candidate = context.get(key)
+            if isinstance(candidate, dict):
+                supervisor_ctx = candidate
+                break
+        if supervisor_ctx is not None:
+            self.supervisor_diag = supervisor_ctx
+            self.supervisor_updated = now_ts
+        else:
+            self.supervisor_diag = {}
+            self.supervisor_updated = None
 
     def note_market_status(self, payload: Dict[str, Any]) -> None:
         self.last_market_status = payload
@@ -668,6 +754,67 @@ def _format_diag_duration(value: Any) -> str:
     return _format_short_duration(seconds)
 
 
+def _normalize_epoch_seconds(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric > 10_000_000_000:  # мс → секунди
+            numeric /= 1000.0
+        return numeric
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            numeric = float(text)
+        except ValueError:
+            try:
+                return _iso_to_epoch(text)
+            except Exception:
+                return None
+        if numeric > 10_000_000_000:
+            numeric /= 1000.0
+        return numeric
+    return None
+
+
+def _format_age_label(age_seconds: Optional[float], ts_value: Any = None) -> str:
+    if age_seconds is not None:
+        return _format_short_duration(age_seconds)
+    epoch = _normalize_epoch_seconds(ts_value)
+    if epoch is None:
+        return "—"
+    return _format_short_duration(max(0.0, time.time() - epoch))
+
+
+def _format_usage_text(ratio: Optional[float]) -> Text:
+    if ratio is None:
+        return Text("—", style="dim")
+    ratio = max(0.0, min(1.0, ratio))
+    percent = ratio * 100.0
+    if percent >= 90:
+        style = "bold red"
+    elif percent >= 70:
+        style = "yellow"
+    else:
+        style = "green"
+    return Text(f"{percent:.0f}%", style=style)
+
+
+def _format_int_value(value: Optional[float]) -> str:
+    if value is None:
+        return "—"
+    return f"{int(round(value)):,}"
+
+
+def _shorten_text(value: Any, limit: int = 60) -> str:
+    if value is None:
+        return "—"
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
 SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
 RANGE_BAR_WIDTH = 14
 
@@ -810,6 +957,8 @@ def handle_keypress(key: str, state: ViewerState) -> bool:
         "2": DashboardMode.SESSION,
         "3": DashboardMode.ALERTS,
         "4": DashboardMode.STREAMS,
+        "5": DashboardMode.PRICE,
+        "6": DashboardMode.SUPERVISOR,
     }
     if normalized in mode_map:
         new_mode = mode_map[normalized]
@@ -1160,6 +1309,9 @@ def build_fxcm_diag_panel(state: ViewerState) -> Panel:
     next_open_seconds = _coerce_float(context.get("next_open_seconds"))
     if next_open_seconds is not None:
         diag_rows.append(("Next open (s)", f"{next_open_seconds:.0f}"))
+    tick_silence = _coerce_float(context.get("tick_silence_seconds"))
+    if tick_silence is not None:
+        diag_rows.append(("Tick silence (s)", f"{tick_silence:.1f}"))
     stream_targets = context.get("stream_targets")
     if isinstance(stream_targets, list):
         diag_rows.append(("Targets tracked", len(stream_targets)))
@@ -1246,6 +1398,327 @@ def build_issue_panel(state: ViewerState) -> Panel:
 
     border = "red" if has_activity else "green"
     return Panel(table, title="Issue counters", border_style=border, box=box.ROUNDED)
+
+
+_QUEUE_DEPTH_KEYS = ("size", "depth", "pending", "queued", "count")
+_QUEUE_MAX_KEYS = ("maxsize", "capacity", "limit")
+_QUEUE_PROCESSED_KEYS = ("processed", "published", "sent", "ok", "success")
+_QUEUE_DROPPED_KEYS = ("dropped", "failed", "errors", "rejected")
+_QUEUE_AGE_KEYS = ("age_seconds", "idle_seconds", "oldest_age_seconds")
+_QUEUE_TS_KEYS = ("last_enqueue_ts", "last_event_ts", "updated_ts")
+
+_TASK_STATE_KEYS = ("state", "status")
+_TASK_PROCESSED_KEYS = ("processed", "published", "ok", "success", "handled")
+_TASK_ERROR_KEYS = ("errors", "failed", "exceptions")
+_TASK_IDLE_KEYS = ("idle_seconds", "lag_seconds", "age_seconds")
+_TASK_TS_KEYS = ("last_processed_ts", "last_success_ts", "last_event_ts")
+
+
+def _extract_numeric(entry: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[float]:
+    for key in keys:
+        if key in entry:
+            parsed = _coerce_float(entry.get(key))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _extract_timestamp(entry: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[float]:
+    for key in keys:
+        if key in entry:
+            ts_val = _normalize_epoch_seconds(entry.get(key))
+            if ts_val is not None:
+                return ts_val
+    return None
+
+
+def _resolve_entry_name(entry: Dict[str, Any], fallback: str) -> str:
+    for key in ("name", "queue", "task", "key"):
+        value = entry.get(key)
+        if value:
+            return str(value)
+    return fallback
+
+
+def _supervisor_queue_entries(diag: Dict[str, Any]) -> List[Dict[str, Any]]:
+    payload = diag.get("queues") or diag.get("queue")
+    entries: List[Dict[str, Any]] = []
+    if isinstance(payload, dict):
+        for name, info in payload.items():
+            if isinstance(info, dict):
+                entry = dict(info)
+                entry.setdefault("name", str(name))
+                entries.append(entry)
+    elif isinstance(payload, list):
+        for idx, info in enumerate(payload):
+            if isinstance(info, dict):
+                entry = dict(info)
+                entry.setdefault("name", _resolve_entry_name(entry, f"queue_{idx}"))
+                entries.append(entry)
+    return entries
+
+
+def _supervisor_task_entries(diag: Dict[str, Any]) -> List[Dict[str, Any]]:
+    payload = diag.get("tasks") or diag.get("workers") or diag.get("consumers")
+    entries: List[Dict[str, Any]] = []
+    if isinstance(payload, dict):
+        for name, info in payload.items():
+            if isinstance(info, dict):
+                entry = dict(info)
+                entry.setdefault("name", str(name))
+                entries.append(entry)
+    elif isinstance(payload, list):
+        for idx, info in enumerate(payload):
+            if isinstance(info, dict):
+                entry = dict(info)
+                entry.setdefault("name", _resolve_entry_name(entry, f"task_{idx}"))
+                entries.append(entry)
+    return entries
+
+
+def _task_state_text(value: Any) -> Text:
+    label = str(value or "?").lower()
+    style = "white"
+    if label in {"running", "active", "ok"}:
+        style = "green"
+    elif label in {"idle", "waiting"}:
+        style = "yellow"
+    elif label in {"error", "failed", "stopped"}:
+        style = "red"
+    return Text(label or "?", style=f"bold {style}" if style != "white" else style)
+
+
+def build_supervisor_summary_panel(
+    state: ViewerState,
+    diag: Dict[str, Any],
+    queues: List[Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+) -> Panel:
+    table = Table.grid(padding=(0, 1))
+    table.add_column(style="bold cyan", justify="right", overflow="fold")
+    table.add_column(overflow="fold")
+
+    rows: List[Tuple[str, str]] = []
+    rows.append(("Стан", str(diag.get("state", "—"))))
+    rows.append(("Loop", _format_bool(diag.get("loop_alive"))))
+    backpressure = diag.get("backpressure")
+    if backpressure is None:
+        backpressure = diag.get("backpressure_active")
+    rows.append(("Backpressure", _format_bool(backpressure)))
+    uptime = _coerce_float(diag.get("uptime_seconds"))
+    if uptime is None and diag.get("started_at") is not None:
+        started = _normalize_epoch_seconds(diag.get("started_at"))
+        if started is not None:
+            uptime = max(0.0, time.time() - started)
+    rows.append(("Uptime", _format_duration(uptime)))
+    last_publish = diag.get("last_publish_ts") or diag.get("last_success_ts")
+    if last_publish is not None:
+        rows.append(("Остання публікація", _format_diag_timestamp(last_publish)))
+    if state.supervisor_updated is not None:
+        rows.append(("Оновлено", _format_short_duration(max(0.0, time.time() - state.supervisor_updated))))
+    rows.append(("Черги", str(len(queues))))
+    rows.append(("Таски", str(len(tasks))))
+    last_error = diag.get("last_error") or diag.get("error")
+    if last_error:
+        rows.append(("Остання помилка", _shorten_text(last_error)))
+
+    for label, value in rows:
+        table.add_row(label, value)
+
+    return Panel(table, title="Async supervisor", border_style="cyan", box=box.ROUNDED)
+
+
+def build_supervisor_queues_panel(queues: List[Dict[str, Any]]) -> Panel:
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("Черга", style="bold", overflow="fold")
+    table.add_column("Depth", justify="right", overflow="fold")
+    table.add_column("Max", justify="right", overflow="fold")
+    table.add_column("Заповнення", justify="right", overflow="fold")
+    table.add_column("Вік", justify="right", overflow="fold")
+    table.add_column("Віпрацьовано", justify="right", overflow="fold")
+    table.add_column("Відкинуто", justify="right", overflow="fold")
+
+    if not queues:
+        table.add_row("—", "—", "—", Text("—", style="dim"), "—", "—", "—")
+        return Panel(table, title="Supervisor: черги", border_style="yellow", box=box.ROUNDED)
+
+    def _queue_depth(entry: Dict[str, Any]) -> Optional[float]:
+        return _extract_numeric(entry, _QUEUE_DEPTH_KEYS)
+
+    sorted_entries = sorted(queues, key=lambda item: _queue_depth(item) or 0.0, reverse=True)
+    for entry in sorted_entries:
+        name = _resolve_entry_name(entry, "queue")
+        depth = _queue_depth(entry)
+        capacity = _extract_numeric(entry, _QUEUE_MAX_KEYS)
+        usage = None
+        if depth is not None and capacity is not None and capacity > 0:
+            usage = depth / capacity
+        age_seconds = _extract_numeric(entry, _QUEUE_AGE_KEYS)
+        age_label = _format_age_label(age_seconds, _extract_timestamp(entry, _QUEUE_TS_KEYS))
+        processed = _extract_numeric(entry, _QUEUE_PROCESSED_KEYS)
+        dropped = _extract_numeric(entry, _QUEUE_DROPPED_KEYS)
+        table.add_row(
+            name,
+            _format_int_value(depth),
+            _format_int_value(capacity),
+            _format_usage_text(usage),
+            age_label,
+            _format_int_value(processed),
+            _format_int_value(dropped),
+        )
+
+    return Panel(table, title="Supervisor: черги", border_style="magenta", box=box.ROUNDED)
+
+
+def build_supervisor_tasks_panel(tasks: List[Dict[str, Any]]) -> Panel:
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("Таск", style="bold", overflow="fold")
+    table.add_column("Стан", justify="left", overflow="fold")
+    table.add_column("Віпрацьовано", justify="right", overflow="fold")
+    table.add_column("Помилки", justify="right", overflow="fold")
+    table.add_column("Простій", justify="right", overflow="fold")
+    table.add_column("Остання помилка", overflow="fold")
+
+    if not tasks:
+        table.add_row("—", "—", "—", "—", "—", "—")
+        return Panel(table, title="Supervisor: таски", border_style="yellow", box=box.ROUNDED)
+
+    for entry in tasks:
+        name = _resolve_entry_name(entry, "task")
+        state_text = _task_state_text(entry.get("state") or entry.get("status"))
+        processed = _extract_numeric(entry, _TASK_PROCESSED_KEYS)
+        errors = _extract_numeric(entry, _TASK_ERROR_KEYS)
+        idle_seconds = _extract_numeric(entry, _TASK_IDLE_KEYS)
+        idle_label = _format_age_label(idle_seconds, _extract_timestamp(entry, _TASK_TS_KEYS))
+        last_error = entry.get("last_error") or entry.get("error") or entry.get("error_message")
+        table.add_row(
+            name,
+            state_text,
+            _format_int_value(processed),
+            _format_int_value(errors),
+            idle_label,
+            _shorten_text(last_error),
+        )
+
+    return Panel(table, title="Supervisor: таски", border_style="green", box=box.ROUNDED)
+
+
+def build_supervisor_metrics_panel(diag: Dict[str, Any]) -> Panel:
+    totals_table = Table.grid(padding=(0, 1))
+    totals_table.add_column(style="bold cyan", justify="right", overflow="fold")
+    totals_table.add_column(justify="right", overflow="fold")
+    totals_table.add_column(style="dim", overflow="fold")
+
+    metrics_block = diag.get("metrics") if isinstance(diag.get("metrics"), dict) else None
+    metric_rows = (
+        ("Поставлено", "total_enqueued"),
+        ("Віпрацьовано", "total_processed"),
+        ("Відкинуто", "total_dropped"),
+        ("Сумарний depth", "queue_depth_total"),
+        ("Публікацій загалом", "publishes_total"),
+        ("Активні таски", "active_tasks"),
+        ("Помилки тасків", "task_errors"),
+    )
+    if metrics_block:
+        for label, key in metric_rows:
+            value = _format_int_value(_coerce_float(metrics_block.get(key)))
+            totals_table.add_row(label, value, SUPERVISOR_METRIC_HINTS.get(key, ""))
+    else:
+        totals_table.add_row("Агреговані лічильники", "—", "")
+
+    backpressure_events = _coerce_float(diag.get("backpressure_events"))
+    totals_table.add_row(
+        "Backpressure подій",
+        _format_int_value(backpressure_events),
+        SUPERVISOR_METRIC_HINTS.get("backpressure_events", ""),
+    )
+
+    publish_table = _build_publish_counts_table(diag)
+    special_panel = build_supervisor_special_channels_panel(diag)
+
+    group_items: List[Any] = [totals_table, Text("")]
+    if special_panel is not None:
+        group_items.extend([special_panel, Text("")])
+    group_items.append(publish_table)
+    body = Group(*group_items)
+    return Panel(body, title="Supervisor: метрики", border_style="cyan", box=box.ROUNDED)
+
+
+def _build_publish_counts_table(diag: Dict[str, Any]) -> Table:
+    table = Table(box=box.MINIMAL_DOUBLE_HEAD, expand=True)
+    table.add_column("Канал", style="bold", overflow="fold")
+    table.add_column("Публікацій", justify="right", overflow="fold")
+    publish_counts = diag.get("publish_counts") if isinstance(diag.get("publish_counts"), dict) else None
+    if publish_counts:
+        sorted_counts = sorted(publish_counts.items(), key=lambda item: item[1], reverse=True)
+        for name, count in sorted_counts[:8]:
+            table.add_row(str(name), _format_int_value(_coerce_float(count)))
+        if len(sorted_counts) > 8:
+            remainder = sum(value for _, value in sorted_counts[8:])
+            table.add_row(f"Інші ({len(sorted_counts) - 8})", _format_int_value(_coerce_float(remainder)))
+    else:
+        table.add_row("—", "—")
+    return table
+
+
+def build_supervisor_special_channels_panel(diag: Dict[str, Any]) -> Optional[Panel]:
+    if not SUPERVISOR_CHANNELS:
+        return None
+    publish_counts = diag.get("publish_counts") if isinstance(diag.get("publish_counts"), dict) else None
+    if not publish_counts:
+        return None
+    table = Table(box=box.SIMPLE_HEAD, expand=True)
+    table.add_column("Спеціальний канал", style="bold", overflow="fold")
+    table.add_column("Публікацій", justify="right", overflow="fold")
+    table.add_column("Опис", style="dim", overflow="fold")
+    has_rows = False
+    for channel in SUPERVISOR_CHANNELS:
+        count_value = _coerce_float(publish_counts.get(channel)) if publish_counts else None
+        if count_value is None:
+            count_value = 0.0
+        table.add_row(
+            str(channel),
+            _format_int_value(count_value),
+            SUPERVISOR_CHANNEL_HINTS.get(channel) or _resolve_channel_hint(channel),
+        )
+        has_rows = True
+    if not has_rows:
+        return None
+    return Panel(table, title="Спеціальні канали", border_style="cyan", box=box.ROUNDED)
+
+
+def build_supervisor_mode(state: ViewerState) -> Union[Layout, Panel]:
+    diag = state.supervisor_diag
+    if not diag:
+        hint = "Heartbeat поки не містить supervisor-контекст. Перевір, чи увімкнено async_supervisor."
+        return Panel(hint, title="Async supervisor", border_style="yellow", box=box.ROUNDED)
+
+    queues = _supervisor_queue_entries(diag)
+    tasks = _supervisor_task_entries(diag)
+
+    layout = Layout(name="supervisor_mode")
+    layout.split_column(
+        Layout(name="sup_summary_row", size=11, minimum_size=8),
+        Layout(name="sup_tables", ratio=1, minimum_size=8),
+    )
+    summary_row = Layout(name="sup_summary_layout")
+    summary_row.split_row(
+        Layout(name="sup_summary", ratio=1, minimum_size=8),
+        Layout(name="sup_metrics", ratio=1, minimum_size=8),
+    )
+    summary_row["sup_summary"].update(build_supervisor_summary_panel(state, diag, queues, tasks))
+    summary_row["sup_metrics"].update(build_supervisor_metrics_panel(diag))
+    layout["sup_summary_row"].update(summary_row)
+
+    tables = Layout(name="sup_tables_layout")
+    tables.split_row(
+        Layout(name="sup_queues", ratio=1, minimum_size=8),
+        Layout(name="sup_tasks", ratio=1, minimum_size=8),
+    )
+    tables["sup_queues"].update(build_supervisor_queues_panel(queues))
+    tables["sup_tasks"].update(build_supervisor_tasks_panel(tasks))
+    layout["sup_tables"].update(tables)
+    return layout
 
 
 def build_redis_panel(state: ViewerState) -> Panel:
@@ -1340,6 +1813,89 @@ def build_stream_targets_panel(state: ViewerState) -> Panel:
             )
 
     return Panel(table, title="Stream targets", border_style="magenta")
+
+
+def build_price_stream_panel(state: ViewerState) -> Panel:
+    data = state.price_stream or {}
+    symbols_state = data.get("symbols_state") if isinstance(data, dict) else None
+    updated_age = None
+    if state.price_stream_updated is not None:
+        updated_age = max(0.0, time.time() - state.price_stream_updated)
+    if not data or not isinstance(symbols_state, list):
+        hint = "Очікуємо price_stream у heartbeat…"
+        if updated_age is not None:
+            hint = f"Price stream не оновлювався {updated_age:.0f} с"
+        return Panel(hint, title="Live FXCM price", border_style="yellow", box=box.ROUNDED)
+
+    summary = Table.grid(padding=(0, 1))
+    summary.add_column(style="bold cyan", justify="right", overflow="fold")
+    summary.add_column(overflow="fold")
+
+    state_label = str(data.get("state", "?")).lower()
+    state_color = {
+        "ok": "green",
+        "stream": "green",
+        "waiting": "yellow",
+        "stale": "red",
+        "stopped": "red",
+    }.get(state_label, "cyan")
+    summary.add_row("State", Text(state_label or "?", style=f"bold {state_color}"))
+    silence = _coerce_float(data.get("tick_silence_seconds"))
+    if silence is None:
+        silence = state.tick_silence_seconds
+    summary.add_row("Tick silence", _format_diag_duration(silence))
+    summary.add_row("Channel", data.get("channel", "—"))
+    summary.add_row("Interval", _format_diag_duration(data.get("interval_seconds")))
+    summary.add_row("Queue depth", str(data.get("queue_depth", "—")))
+    summary.add_row("Thread", _format_bool(data.get("thread_alive")))
+    summary.add_row("Last snap", _format_diag_timestamp(data.get("last_snap_ts")))
+    summary.add_row("Last tick", _format_diag_timestamp(data.get("last_tick_ts")))
+    if updated_age is not None:
+        summary.add_row("Updated", _format_diag_duration(updated_age))
+
+    rows_table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    rows_table.add_column("Symbol", style="bold", overflow="fold")
+    rows_table.add_column("Mid", justify="right", overflow="fold")
+    rows_table.add_column("Bid", justify="right", overflow="fold")
+    rows_table.add_column("Ask", justify="right", overflow="fold")
+    rows_table.add_column("Tick age", justify="right", overflow="fold")
+
+    entries: List[Dict[str, Any]] = []
+    for entry in symbols_state:
+        if not isinstance(entry, dict):
+            continue
+        symbol = entry.get("symbol")
+        if not symbol:
+            continue
+        entries.append(
+            {
+                "symbol": symbol,
+                "mid": _coerce_float(entry.get("mid")),
+                "bid": _coerce_float(entry.get("bid")),
+                "ask": _coerce_float(entry.get("ask")),
+                "age": _coerce_float(entry.get("tick_age_seconds")),
+            }
+        )
+    entries.sort(key=lambda item: item.get("symbol") or "")
+
+    if not entries:
+        rows_table.add_row("—", "—", "—", "—", "—")
+    else:
+        for item in entries:
+            rows_table.add_row(
+                str(item["symbol"]),
+                _format_float(item.get("mid"), digits=5),
+                _format_float(item.get("bid"), digits=5),
+                _format_float(item.get("ask"), digits=5),
+                _format_diag_duration(item.get("age")),
+            )
+
+    extras: List[Any] = [summary, rows_table]
+    special_panel = build_supervisor_special_channels_panel(state.supervisor_diag)
+    if special_panel is not None:
+        extras.append(special_panel)
+    content = Group(*extras)
+    return Panel(content, title="Live FXCM price", border_style="green", box=box.ROUNDED)
 
 
 def build_ohlcv_panel(state: ViewerState) -> Panel:
@@ -1664,6 +2220,10 @@ def _render_mode_body(state: ViewerState) -> Union[Layout, Panel]:
         layout["redis"].update(build_redis_panel(state))
         layout["streams"].update(build_stream_targets_panel(state))
         return layout
+    if mode == DashboardMode.PRICE:
+        return build_price_stream_panel(state)
+    if mode == DashboardMode.SUPERVISOR:
+        return build_supervisor_mode(state)
     layout = Layout(name="alerts_mode")
     layout.split_column(
         Layout(name="alerts", ratio=1, minimum_size=5),

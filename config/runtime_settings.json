@@ -6,11 +6,14 @@
     },
     "stream": {
         "mode": 1,
+        "async_supervisor": true,
         "poll_seconds": 5,
         "fetch_interval_seconds": 5,
         "publish_interval_seconds": 5,
         "lookback_minutes": 5,
-        "config": "XAU/USD:m1,XAU/USD:m5, EUR/USD:m1,EUR/USD:m5"
+        "config": "XAU/USD:m1,XAU/USD:m5, EUR/USD:m1,EUR/USD:m5",
+        "price_snap_channel": "fxcm:price_tik",
+        "price_snap_interval_seconds": 3
     },
     "sample_request": {
         "symbol": "XAU/USD",

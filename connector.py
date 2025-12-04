@@ -10,20 +10,28 @@ POC:
     $ python connector.py
 """
 from __future__ import annotations
+
+import asyncio
 import datetime as dt
 import json
 import logging
 import os
+import queue
+import threading
 import time
+from concurrent.futures import TimeoutError as FutureTimeout
+from functools import partial
+from dataclasses import dataclass
 from logging import Logger
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
+from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union, cast
 
 import pandas as pd
 from dotenv import load_dotenv
 from prometheus_client import Counter, Gauge, start_http_server
+
 try:
-    from forexconnect import ForexConnect  # type: ignore[import]
+    from forexconnect import Common, ForexConnect  # type: ignore[import]
 except ImportError:  # pragma: no cover - SDK може бути не встановлено під час тестів
     class ForexConnect:  # type: ignore[override, no-redef]
         """Заглушка, щоб тести могли імпортувати модуль без SDK."""
@@ -57,7 +65,8 @@ except ImportError:  # pragma: no cover - SDK може бути не встан�
                 "ForexConnect SDK не встановлено. Використовуйте офіційний клієнт, "
                 "щоб запускати конектор проти реального FXCM."
             )
-        
+    Common = None  # type: ignore[assignment]
+
 from rich.logging import RichHandler
 
 from cache_utils import (
@@ -93,18 +102,77 @@ from fxcm_schema import (
     RedisBar,
 )
 
-try:
-    import redis
-except Exception:  # noqa: BLE001
-    redis = None  # type: ignore[assignment]
-
-
 # Налаштування логування
 log: Logger = logging.getLogger("fxcm_connector")
+_LOGGING_CONFIGURED = False
 
+
+def setup_logging() -> None:
+    """Налаштовуємо логування з RichHandler.
+
+    Робимо простий формат, щоб було читабельно у консолі під час відладки.
+    """
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(rich_tracebacks=True)],
+    )
+    _LOGGING_CONFIGURED = True
+
+
+# Конфігуруємо логування ще під час імпорту, щоб ранні log.debug не зникали.
+setup_logging()
+
+# Ініціалізація змінних Redis
+try:
+    import redis
+    log.debug("redis версія %s", redis.__version__)  # type: ignore[union-attr]
+except Exception:  # noqa: BLE001
+    redis = None  # type: ignore[assignment]
+    log.warning("redis не встановлено; деякі функції можуть бути недоступні.")
+
+# ── FXCM / ForexConnect imports ──
+
+try:
+    from forexconnect import fxcorepy # type: ignore[import]
+except Exception as exc:
+    fxcorepy = None
+    log.warning(
+        "fxcorepy/ForexConnect недоступні: %s; деякі функції "
+        "(тик-стрім, частина FXCM-логіки) будуть вимкнені.",
+        exc,
+    )
+else:
+    # Не завалюємося, якщо конкретного методу немає.
+    version = None
+
+    # 1) Якщо у майбутніх версіях зʼявиться getVersion — пробуємо його використати.
+    get_version = getattr(fxcorepy, "getVersion", None)
+    if callable(get_version):
+        try:
+            version = get_version()  # type: ignore[misc]
+        except Exception:
+            version = None
+
+    # 2) Інакше пробуємо взяти __version__ або просто лог без версії.
+    if version is None:
+        version = getattr(fxcorepy, "__version__", None)
+
+    if version:
+        log.info("fxcorepy імпортовано успішно, версія %s", version)
+    else:
+        log.info("fxcorepy імпортовано успішно, версію визначити не вдалося")
+
+
+# Константи конектора
 REDIS_CHANNEL = "fxcm:ohlcv"  # канал публікації OHLCV-барів
 REDIS_STATUS_CHANNEL = "fxcm:market_status"  # канал публікації статусу ринку
 BAR_INTERVAL_MS = 60_000  # 1 хвилина у мілісекундах
+PRICE_SNAPSHOT_QUEUE_MAXSIZE = 5_000
 _LAST_MARKET_STATUS: Optional[Tuple[str, Optional[int]]] = None  # останній статус ринку для приглушення спаму
 _LAST_MARKET_STATUS_TS: Optional[float] = None  # час останньої трансляції статусу
 _METRICS_SERVER_STARTED = False
@@ -115,6 +183,7 @@ _SESSION_TAG_SETTING = os.environ.get("FXCM_SESSION_TAG", "AUTO").strip() or "AU
 _AUTO_SESSION_TAG = _SESSION_TAG_SETTING.upper() == "AUTO"
 _DEFAULT_SESSION_TAG = "NY_METALS"
 
+# Prometheus-метрики
 PROM_BARS_PUBLISHED = Counter(
     "fxcm_ohlcv_bars_total",
     "Загальна кількість опублікованих OHLCV-барів",
@@ -162,6 +231,15 @@ PROM_PRICE_HISTORY_NOT_READY = Counter(
     "Скільки разів FXCM повернув 'PriceHistoryCommunicator is not ready'",
 )
 
+# Черги для взаємодії між потоками та асинхронними тасками 
+OHLCV_QUEUE_MAXSIZE = 200
+PRICE_QUEUE_MAXSIZE = 500
+HEARTBEAT_QUEUE_MAXSIZE = 200
+MARKET_STATUS_QUEUE_MAXSIZE = 50
+SUPERVISOR_SUBMIT_TIMEOUT_SECONDS = 2.0
+SUPERVISOR_RETRY_DELAY_SECONDS = 1.0
+SUPERVISOR_JOIN_TIMEOUT_SECONDS = 5.0
+
 
 class BackoffController:
     """Простий експоненційний backoff з логуванням."""
@@ -189,6 +267,14 @@ class RedisRetryableError(RuntimeError):
 
 class MarketTemporarilyClosed(RuntimeError):
     """Ринок закритий або FXCM тимчасово не готовий відповідати."""
+
+
+class SinkBackpressure(RuntimeError):
+    """Черга supervisor переповнена або подію не вдалося доставити."""
+
+
+class SinkSubmissionError(RuntimeError):
+    """Будь-яка інша помилка під час передачі події в supervisor."""
 
 
 def _login_fxcm_once(config: FXCMConfig) -> ForexConnect:
@@ -259,19 +345,6 @@ def _ensure_metrics_server(port: int) -> None:
     start_http_server(port)
     log.info("Prometheus-метрики доступні на порту %s.", port)
     _METRICS_SERVER_STARTED = True
-
-
-def setup_logging() -> None:
-    """Налаштовуємо логування з RichHandler.
-
-    Робимо простий формат, щоб було читабельно у консолі під час відладки.
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[RichHandler(rich_tracebacks=True)],
-    )
 
 def _tf_to_minutes(tf_label: str) -> int:
     label = tf_label.strip().lower()
@@ -735,28 +808,1072 @@ def _normalize_symbol(raw_symbol: str) -> str:
     return raw_symbol.replace("/", "").upper()
 
 
+class PriceTick(NamedTuple):
+    symbol: str
+    bid: float
+    ask: float
+    mid: float
+    tick_ts: float
+
+
+@dataclass
+class PriceTickSnap:
+    symbol: str
+    bid: float
+    ask: float
+    mid: float
+    tick_ts: float
+    snap_ts: float
+
+
+@dataclass
+class OhlcvBatch:
+    symbol: str
+    timeframe: str
+    data: pd.DataFrame
+    fetched_at: float
+    source: str = "stream"
+
+
+@dataclass
+class HeartbeatEvent:
+    state: str
+    last_bar_close_ms: Optional[int]
+    next_open: Optional[dt.datetime]
+    sleep_seconds: Optional[float]
+    context: Dict[str, Any]
+
+
+@dataclass
+class MarketStatusEvent:
+    state: str
+    next_open: Optional[dt.datetime]
+
+
+class AsyncStreamSupervisor:
+    """Асинхронно публікує OHLCV/heartbeat/diagnostics через окремий event loop."""
+
+    _SENTINEL = object()
+
+    def __init__(
+        self,
+        *,
+        redis_supplier: Callable[[], Optional[Any]],
+        redis_reconnector: Optional[Callable[[], Any]] = None,
+        data_gate: Optional[PublishDataGate] = None,
+        heartbeat_channel: Optional[str] = None,
+        price_channel: Optional[str] = None,
+        hmac_secret: Optional[str] = None,
+        hmac_algo: str = "sha256",
+    ) -> None:
+        self._redis_supplier = redis_supplier
+        self._redis_reconnector = redis_reconnector
+        self._data_gate = data_gate
+        self._heartbeat_channel = heartbeat_channel
+        self._price_channel = price_channel
+        self._hmac_secret = hmac_secret
+        self._hmac_algo = hmac_algo
+
+        self._loop = asyncio.new_event_loop()
+        self._loop_ready = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="FXCMAsyncSupervisor",
+            daemon=True,
+        )
+        self._started = False
+        self._stopping = False
+        self._tasks: List[asyncio.Task[Any]] = []
+        self._task_handles: Dict[str, Optional[asyncio.Task[Any]]] = {}
+        self._queue_stats: Dict[str, Dict[str, Any]] = {}
+        self._task_stats: Dict[str, Dict[str, Any]] = {}
+        self._last_error: Optional[str] = None
+        self._last_publish_ts: Dict[str, float] = {}
+        self._publish_counts: Dict[str, int] = {}
+        self._started_ts: Optional[float] = None
+        self._backpressure_flag = False
+        self._backpressure_events = 0
+        self._ohlcv_queue: Optional[asyncio.Queue[Any]] = None
+        self._heartbeat_queue: Optional[asyncio.Queue[Any]] = None
+        self._market_status_queue: Optional[asyncio.Queue[Any]] = None
+        self._price_queue: Optional[asyncio.Queue[Any]] = None
+
+        self._register_task("history_consumer")
+        self._register_task("heartbeat_consumer")
+        self._register_task("market_status_consumer")
+        if price_channel:
+            self._register_task("price_snapshot_consumer")
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._thread.start()
+        self._loop_ready.wait()
+        future = asyncio.run_coroutine_threadsafe(self._start_consumers(), self._loop)
+        future.result(timeout=SUPERVISOR_SUBMIT_TIMEOUT_SECONDS)
+        self._started = True
+        self._started_ts = time.time()
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        self._stopping = True
+        future = asyncio.run_coroutine_threadsafe(self._shutdown_async(), self._loop)
+        try:
+            future.result(timeout=SUPERVISOR_SUBMIT_TIMEOUT_SECONDS)
+        except FutureTimeout:
+            log.warning("Supervisor: завершення зайняло надто довго.")
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=SUPERVISOR_JOIN_TIMEOUT_SECONDS)
+        self._tasks.clear()
+        self._started = False
+
+    # ── Публічні sink-и ──
+
+    def submit_ohlcv_batch(self, batch: OhlcvBatch) -> None:
+        self._ensure_running()
+        if self._ohlcv_queue is None:
+            raise SinkSubmissionError("Supervisor queue ще ініціалізується")
+        self._submit_coroutine(self._enqueue(self._ohlcv_queue, batch, "ohlcv"))
+
+    def submit_heartbeat(self, event: HeartbeatEvent) -> None:
+        self._ensure_running()
+        if self._heartbeat_queue is None:
+            raise SinkSubmissionError("Supervisor queue ще ініціалізується")
+        self._submit_coroutine(self._enqueue(self._heartbeat_queue, event, "heartbeat"))
+
+    def submit_market_status(self, event: MarketStatusEvent) -> None:
+        self._ensure_running()
+        if self._market_status_queue is None:
+            raise SinkSubmissionError("Supervisor queue ще ініціалізується")
+        self._submit_coroutine(self._enqueue(self._market_status_queue, event, "market_status"))
+
+    def submit_price_snapshot(self, snap: PriceTickSnap) -> None:
+        if self._price_queue is None:
+            raise SinkSubmissionError("Price snapshot sink не увімкнено")
+        self._ensure_running()
+        self._submit_coroutine(self._enqueue(self._price_queue, snap, "price"))
+
+    # ── Внутрішня логіка ──
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        async def _bootstrap() -> None:
+            try:
+                await self._initialize_queues()
+            finally:
+                self._loop_ready.set()
+
+        self._loop.create_task(_bootstrap())
+        self._loop.run_forever()
+
+    async def _initialize_queues(self) -> None:
+        self._ohlcv_queue = asyncio.Queue(maxsize=OHLCV_QUEUE_MAXSIZE)
+        self._heartbeat_queue = asyncio.Queue(maxsize=HEARTBEAT_QUEUE_MAXSIZE)
+        self._market_status_queue = asyncio.Queue(maxsize=MARKET_STATUS_QUEUE_MAXSIZE)
+        if self._price_channel:
+            self._price_queue = asyncio.Queue(maxsize=PRICE_QUEUE_MAXSIZE)
+        else:
+            self._price_queue = None
+        self._register_queue("ohlcv", self._ohlcv_queue)
+        self._register_queue("heartbeat", self._heartbeat_queue)
+        self._register_queue("market_status", self._market_status_queue)
+        if self._price_queue is not None:
+            self._register_queue("price", self._price_queue)
+
+    async def _start_consumers(self) -> None:
+        history_task = asyncio.ensure_future(self._history_consumer())
+        heartbeat_task = asyncio.ensure_future(self._heartbeat_consumer())
+        market_task = asyncio.ensure_future(self._market_status_consumer())
+        tasks = [history_task, heartbeat_task, market_task]
+        task_map: Dict[str, Optional[asyncio.Task[Any]]] = {
+            "history_consumer": history_task,
+            "heartbeat_consumer": heartbeat_task,
+            "market_status_consumer": market_task,
+        }
+        if self._price_queue is not None:
+            price_task = asyncio.ensure_future(self._price_snapshot_consumer())
+            tasks.append(price_task)
+            task_map["price_snapshot_consumer"] = price_task
+        self._tasks = tasks
+        self._task_handles = task_map
+
+    async def _shutdown_async(self) -> None:
+        queues: List[asyncio.Queue[Any]] = []
+        if self._ohlcv_queue is not None:
+            queues.append(self._ohlcv_queue)
+        if self._heartbeat_queue is not None:
+            queues.append(self._heartbeat_queue)
+        if self._market_status_queue is not None:
+            queues.append(self._market_status_queue)
+        if self._price_queue is not None:
+            queues.append(self._price_queue)
+        for q in queues:
+            try:
+                q.put_nowait(self._SENTINEL)
+            except asyncio.QueueFull:
+                pass
+        joins = [q.join() for q in queues]
+        await asyncio.gather(*joins, return_exceptions=True)
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    def _ensure_running(self) -> None:
+        if not self._started or self._stopping:
+            raise SinkSubmissionError("Supervisor неактивний")
+
+    def _submit_coroutine(self, coro: Awaitable[None]) -> None:
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop) # type: ignore
+        try:
+            future.result(timeout=SUPERVISOR_SUBMIT_TIMEOUT_SECONDS)
+            self._backpressure_flag = False
+        except asyncio.QueueFull as exc:
+            self._backpressure_flag = True
+            self._backpressure_events += 1
+            raise SinkBackpressure("Supervisor: черга переповнена") from exc
+        except FutureTimeout as exc:
+            raise SinkSubmissionError("Supervisor: таймаут enqueue") from exc
+        except SinkBackpressure:
+            self._backpressure_flag = True
+            self._backpressure_events += 1
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise SinkSubmissionError("Supervisor: enqueue помилка") from exc
+
+    async def _enqueue(self, queue_obj: asyncio.Queue[Any], item: Any, queue_name: str) -> None:
+        try:
+            queue_obj.put_nowait(item)
+        except asyncio.QueueFull:
+            self._note_queue_drop(queue_name)
+            raise
+        self._note_queue_enqueue(queue_name)
+
+    async def _history_consumer(self) -> None:
+        assert self._ohlcv_queue is not None
+        while True:
+            batch = await self._ohlcv_queue.get()
+            sentinel = batch is self._SENTINEL
+            try:
+                if not sentinel:
+                    await self._publish_ohlcv_batch(cast(OhlcvBatch, batch))
+                    self._note_queue_processed("ohlcv")
+                    self._note_task_activity("history_consumer")
+            finally:
+                self._ohlcv_queue.task_done()
+            if sentinel:
+                break
+
+    async def _heartbeat_consumer(self) -> None:
+        assert self._heartbeat_queue is not None
+        while True:
+            event = await self._heartbeat_queue.get()
+            sentinel = event is self._SENTINEL
+            try:
+                if not sentinel:
+                    await self._publish_heartbeat_event(cast(HeartbeatEvent, event))
+                    self._note_queue_processed("heartbeat")
+                    self._note_task_activity("heartbeat_consumer")
+            finally:
+                self._heartbeat_queue.task_done()
+            if sentinel:
+                break
+
+    async def _market_status_consumer(self) -> None:
+        assert self._market_status_queue is not None
+        while True:
+            event = await self._market_status_queue.get()
+            sentinel = event is self._SENTINEL
+            try:
+                if not sentinel:
+                    await self._publish_market_status_event(cast(MarketStatusEvent, event))
+                    self._note_queue_processed("market_status")
+                    self._note_task_activity("market_status_consumer")
+            finally:
+                self._market_status_queue.task_done()
+            if sentinel:
+                break
+
+    async def _price_snapshot_consumer(self) -> None:
+        assert self._price_queue is not None  # для mypy/аналізу
+        while True:
+            snap = await self._price_queue.get()
+            sentinel = snap is self._SENTINEL
+            try:
+                if not sentinel:
+                    await self._publish_price_snapshot_event(cast(PriceTickSnap, snap))
+                    self._note_queue_processed("price")
+                    self._note_task_activity("price_snapshot_consumer")
+            finally:
+                self._price_queue.task_done()
+            if sentinel:
+                break
+
+    async def _publish_ohlcv_batch(self, batch: OhlcvBatch) -> None:
+        while not self._stopping:
+            client = await self._ensure_redis_client()
+            if client is None:
+                await asyncio.sleep(SUPERVISOR_RETRY_DELAY_SECONDS)
+                continue
+            try:
+                await self._run_blocking(
+                    publish_ohlcv_to_redis,
+                    batch.data,
+                    symbol=batch.symbol,
+                    timeframe=batch.timeframe,
+                    redis_client=client,
+                    data_gate=self._data_gate,
+                    hmac_secret=self._hmac_secret,
+                    hmac_algo=self._hmac_algo,
+                )
+                self._mark_publish("ohlcv")
+                return
+            except RedisRetryableError:
+                PROM_ERROR_COUNTER.labels(type="redis").inc()
+                await self._handle_redis_error()
+            except Exception as exc:  # noqa: BLE001
+                self._last_error = f"ohlcv_publish: {exc}"
+                log.exception("Supervisor: публікація OHLCV завершилась помилкою.")
+                return
+
+    async def _publish_heartbeat_event(self, event: HeartbeatEvent) -> None:
+        client = await self._ensure_redis_client()
+        try:
+            await self._run_blocking(
+                _publish_heartbeat,
+                client,
+                self._heartbeat_channel,
+                state=event.state,
+                last_bar_close_ms=event.last_bar_close_ms,
+                next_open=event.next_open,
+                sleep_seconds=event.sleep_seconds,
+                context=event.context,
+            )
+            self._mark_publish("heartbeat")
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"heartbeat: {exc}"
+            log.exception("Supervisor: публікація heartbeat завершилась помилкою.")
+
+    async def _publish_market_status_event(self, event: MarketStatusEvent) -> None:
+        client = await self._ensure_redis_client()
+        try:
+            await self._run_blocking(
+                _publish_market_status,
+                client,
+                event.state,
+                next_open=event.next_open,
+            )
+            self._mark_publish("market_status")
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"market_status: {exc}"
+            log.exception("Supervisor: публікація market_status завершилась помилкою.")
+
+    async def _publish_price_snapshot_event(self, snap: PriceTickSnap) -> None:
+        if self._price_channel is None:
+            return
+        while not self._stopping:
+            client = await self._ensure_redis_client()
+            if client is None:
+                await asyncio.sleep(SUPERVISOR_RETRY_DELAY_SECONDS)
+                continue
+            try:
+                await self._run_blocking(
+                    _publish_price_snapshot,
+                    client,
+                    channel=self._price_channel,
+                    snapshot=snap,
+                )
+                self._mark_publish("price")
+                return
+            except RedisRetryableError:
+                PROM_ERROR_COUNTER.labels(type="redis").inc()
+                await self._handle_redis_error()
+            except Exception as exc:  # noqa: BLE001
+                self._last_error = f"price_snapshot: {exc}"
+                log.exception("Supervisor: публікація price snapshot неуспішна.")
+                return
+
+    async def _ensure_redis_client(self) -> Optional[Any]:  # noqa: PLR6301 - метод класу
+        client = self._redis_supplier()
+        if client is not None:
+            return client
+        if self._redis_reconnector is None:
+            return None
+        try:
+            return await self._run_blocking(self._redis_reconnector)
+        except Exception:  # noqa: BLE001
+            log.exception("Supervisor: перепідключення Redis неуспішне.")
+            return None
+
+    async def _handle_redis_error(self) -> None:
+        if self._redis_reconnector is None:
+            await asyncio.sleep(SUPERVISOR_RETRY_DELAY_SECONDS)
+            return
+        try:
+            await self._run_blocking(self._redis_reconnector)
+        except Exception:  # noqa: BLE001
+            log.exception("Supervisor: redis_reconnector знову впав.")
+            await asyncio.sleep(SUPERVISOR_RETRY_DELAY_SECONDS)
+
+    async def _run_blocking(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+
+    def _register_queue(self, name: str, queue_obj: asyncio.Queue[Any]) -> None:
+        self._queue_stats[name] = {
+            "name": name,
+            "maxsize": queue_obj.maxsize,
+            "enqueued": 0,
+            "processed": 0,
+            "dropped": 0,
+            "last_enqueue_ts": None,
+            "last_processed_ts": None,
+        }
+
+    def _register_task(self, name: str) -> None:
+        self._task_stats[name] = {
+            "name": name,
+            "processed": 0,
+            "errors": 0,
+            "last_activity_ts": None,
+            "last_error": None,
+        }
+
+    def _note_queue_enqueue(self, name: str) -> None:
+        stats = self._queue_stats.get(name)
+        if not stats:
+            return
+        stats["enqueued"] += 1
+        stats["last_enqueue_ts"] = time.time()
+
+    def _note_queue_processed(self, name: str) -> None:
+        stats = self._queue_stats.get(name)
+        if not stats:
+            return
+        stats["processed"] += 1
+        stats["last_processed_ts"] = time.time()
+
+    def _note_queue_drop(self, name: str) -> None:
+        stats = self._queue_stats.get(name)
+        if not stats:
+            return
+        stats["dropped"] += 1
+        stats["last_processed_ts"] = time.time()
+
+    def _note_task_activity(self, name: str, *, error: Optional[str] = None) -> None:
+        stats = self._task_stats.get(name)
+        if not stats:
+            return
+        now = time.time()
+        stats["last_activity_ts"] = now
+        if error:
+            stats["errors"] += 1
+            stats["last_error"] = error
+            self._last_error = error
+        else:
+            stats["processed"] += 1
+
+    def _iter_queues(self) -> List[Tuple[str, asyncio.Queue[Any]]]:
+        entries: List[Tuple[str, asyncio.Queue[Any]]] = []
+        if self._ohlcv_queue is not None:
+            entries.append(("ohlcv", self._ohlcv_queue))
+        if self._heartbeat_queue is not None:
+            entries.append(("heartbeat", self._heartbeat_queue))
+        if self._market_status_queue is not None:
+            entries.append(("market_status", self._market_status_queue))
+        if self._price_queue is not None:
+            entries.append(("price", self._price_queue))
+        return entries
+
+    def _task_state_label(self, task: Optional[asyncio.Task[Any]]) -> str:
+        if task is None:
+            return "disabled"
+        if task.cancelled():
+            return "cancelled"
+        if task.done():
+            return "error" if task.exception() else "done"
+        return "running"
+
+    def _mark_publish(self, channel: str) -> None:
+        now = time.time()
+        self._last_publish_ts[channel] = now
+        self._publish_counts[channel] = self._publish_counts.get(channel, 0) + 1
+
+    async def _gather_diag_snapshot(self) -> Dict[str, Any]:
+        diag: Dict[str, Any] = {
+            "state": "stopping" if self._stopping else "running",
+            "loop_alive": self._loop.is_running(),
+            "started_at": self._started_ts,
+            "backpressure": self._backpressure_flag,
+            "last_error": self._last_error,
+            "queues": [],
+            "tasks": [],
+            "last_publish_ts": self._last_publish_ts.copy(),
+            "publish_counts": self._publish_counts.copy(),
+            "backpressure_events": self._backpressure_events,
+        }
+        now = time.time()
+        if self._started_ts is not None:
+            diag["uptime_seconds"] = max(0.0, now - self._started_ts)
+        total_enqueued = 0
+        total_processed = 0
+        total_dropped = 0
+        total_depth = 0
+        for name, queue_obj in self._iter_queues():
+            stats = self._queue_stats.get(name, {})
+            size = queue_obj.qsize()
+            total_depth += size
+            enqueued = int(stats.get("enqueued") or 0)
+            processed = int(stats.get("processed") or 0)
+            dropped = int(stats.get("dropped") or 0)
+            total_enqueued += enqueued
+            total_processed += processed
+            total_dropped += dropped
+            diag["queues"].append(
+                {
+                    "name": name,
+                    "size": size,
+                    "maxsize": queue_obj.maxsize,
+                    "enqueued": enqueued,
+                    "processed": processed,
+                    "dropped": dropped,
+                    "last_enqueue_ts": stats.get("last_enqueue_ts"),
+                    "last_processed_ts": stats.get("last_processed_ts"),
+                }
+            )
+        active_tasks = 0
+        total_errors = 0
+        for name, task in self._task_handles.items():
+            stats = self._task_stats.get(name, {})
+            last_activity = stats.get("last_activity_ts")
+            idle_seconds = None
+            if isinstance(last_activity, (int, float)):
+                idle_seconds = max(0.0, now - float(last_activity))
+            if task is not None and not task.done():
+                active_tasks += 1
+            total_errors += int(stats.get("errors") or 0)
+            diag["tasks"].append(
+                {
+                    "name": name,
+                    "state": self._task_state_label(task),
+                    "processed": stats.get("processed"),
+                    "errors": stats.get("errors"),
+                    "idle_seconds": idle_seconds,
+                    "last_error": stats.get("last_error"),
+                    "last_event_ts": last_activity,
+                }
+            )
+        diag["metrics"] = {
+            "total_enqueued": total_enqueued,
+            "total_processed": total_processed,
+            "total_dropped": total_dropped,
+            "queue_depth_total": total_depth,
+            "publishes_total": sum(self._publish_counts.values()),
+            "active_tasks": active_tasks,
+            "task_errors": total_errors,
+        }
+        return diag
+
+    def diagnostics_snapshot(self) -> Dict[str, Any]:
+        if not self._started:
+            return {}
+        try:
+            future = asyncio.run_coroutine_threadsafe(self._gather_diag_snapshot(), self._loop)
+            return future.result(timeout=SUPERVISOR_SUBMIT_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001
+            return {"state": "error"}
+
+class PriceSnapshotWorker:
+    """Агрегує FXCM-тикі та публікує снепшоти у Redis канал."""
+
+    def __init__(
+        self,
+        redis_supplier: Callable[[], Optional[Any]],
+        *,
+        channel: str,
+        interval_seconds: float,
+        symbols: Sequence[str],
+        snapshot_callback: Optional[Callable[[PriceTickSnap], None]] = None,
+    ) -> None:
+        self._redis_supplier = redis_supplier
+        self._channel = channel
+        self._interval = max(0.5, float(interval_seconds))
+        self._queue: "queue.Queue[PriceTick]" = queue.Queue(maxsize=PRICE_SNAPSHOT_QUEUE_MAXSIZE)
+        self._lock = threading.Lock()
+        self._last_ticks: Dict[str, PriceTick] = {}
+        self._last_snapshot_ts: Optional[float] = None
+        self._last_tick_ts: Optional[float] = None
+        self._symbols: Set[str] = {_normalize_symbol(sym) for sym in symbols if sym}
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._snapshot_callback = snapshot_callback
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="price-snapshot-worker", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def enqueue_tick(self, symbol: str, bid: float, ask: float, tick_ts: float) -> None:
+        symbol_norm = _normalize_symbol(symbol)
+        if self._symbols and symbol_norm not in self._symbols:
+            return
+        mid = (float(bid) + float(ask)) / 2.0
+        tick = PriceTick(symbol=symbol_norm, bid=float(bid), ask=float(ask), mid=mid, tick_ts=float(tick_ts))
+        try:
+            self._queue.put_nowait(tick)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:  # pragma: no cover - гонка між потоками
+                pass
+            try:
+                self._queue.put_nowait(tick)
+            except queue.Full:
+                log.debug("Черга price snapshot переповнена — тик %s відкинуто.", symbol_norm)
+
+    def flush(self) -> None:
+        """Примусово публікує останні відомі тики (використовується у тестах)."""
+
+        self._drain_queue()
+        self._publish_snapshot()
+
+    def snapshot_metadata(self) -> Dict[str, Any]:
+        with self._lock:
+            last_snap = self._last_snapshot_ts
+            last_tick = self._last_tick_ts
+            last_ticks = list(self._last_ticks.values())
+            thread_alive = self._thread is not None and self._thread.is_alive()
+        now = time.time()
+        silence = max(0.0, now - last_tick) if last_tick is not None else None
+        symbol_states: List[Dict[str, Any]] = []
+        max_age = silence
+        for tick in sorted(last_ticks, key=lambda item: item.symbol):
+            age = max(0.0, now - tick.tick_ts)
+            symbol_states.append(
+                {
+                    "symbol": tick.symbol,
+                    "bid": tick.bid,
+                    "ask": tick.ask,
+                    "mid": tick.mid,
+                    "tick_ts": tick.tick_ts,
+                    "tick_age_seconds": age,
+                }
+            )
+            if max_age is None or age > max_age:
+                max_age = age
+        silence = max_age
+        state = "ok"
+        if not thread_alive:
+            state = "stopped"
+        elif not last_ticks:
+            state = "waiting"
+        elif silence is not None and silence > self._interval * 3:
+            state = "stale"
+        metadata: Dict[str, Any] = {
+            "channel": self._channel,
+            "interval_seconds": self._interval,
+            "symbols": [tick["symbol"] for tick in symbol_states],
+            "symbols_state": symbol_states,
+            "last_snap_ts": last_snap,
+            "last_tick_ts": last_tick,
+            "tick_silence_seconds": silence,
+            "queue_depth": self._queue.qsize(),
+            "thread_alive": thread_alive,
+            "state": state,
+        }
+        return metadata
+
+    def _run(self) -> None:
+        next_publish = time.monotonic() + self._interval
+        while not self._stop.is_set():
+            self._drain_queue()
+            now = time.monotonic()
+            if now >= next_publish:
+                self._publish_snapshot()
+                next_publish = now + self._interval
+            self._stop.wait(0.2)
+        self._drain_queue()
+        self._publish_snapshot()
+
+    def _drain_queue(self) -> None:
+        while True:
+            try:
+                tick = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            with self._lock:
+                self._last_ticks[tick.symbol] = tick
+                self._last_tick_ts = tick.tick_ts
+
+    def _publish_snapshot(self) -> None:
+        with self._lock:
+            ticks = list(self._last_ticks.values())
+        if not ticks:
+            return
+        snap_ts = time.time()
+        callback = self._snapshot_callback
+        if callback is not None:
+            for tick in ticks:
+                callback(
+                    PriceTickSnap(
+                        symbol=tick.symbol,
+                        bid=tick.bid,
+                        ask=tick.ask,
+                        mid=tick.mid,
+                        tick_ts=tick.tick_ts,
+                        snap_ts=snap_ts,
+                    )
+                )
+            with self._lock:
+                self._last_snapshot_ts = snap_ts
+            return
+
+        redis_client = self._redis_supplier()
+        if redis_client is None:
+            return
+        try:
+            for tick in ticks:
+                payload = {
+                    "symbol": tick.symbol,
+                    "bid": tick.bid,
+                    "ask": tick.ask,
+                    "mid": tick.mid,
+                    "tick_ts": tick.tick_ts,
+                    "snap_ts": snap_ts,
+                }
+                message = json.dumps(payload, separators=(",", ":"))
+                redis_client.publish(self._channel, message)
+        except Exception as exc:  # noqa: BLE001
+            PROM_ERROR_COUNTER.labels(type="redis").inc()
+            log.debug("Публікація price snapshot неуспішна: %s", exc)
+            return
+        with self._lock:
+            self._last_snapshot_ts = snap_ts
+
+
+class FXCMOfferSubscription:
+    """Підписка на FXCM OfferTable для отримання живих котирувань."""
+
+    def __init__(
+        self,
+        fx: ForexConnect,
+        *,
+        symbols: Sequence[str],
+        on_tick: Callable[[str, float, float, float], None],
+    ) -> None:
+        self._fx = fx
+        self._symbols = {_normalize_symbol(sym) for sym in symbols if sym}
+        self._on_tick = on_tick
+        self._table: Optional[Any] = None
+        self._listener: Optional[Any] = None
+        self._fallback_listener: Optional[Any] = None
+        self._fallback_updates: List[Any] = []
+        self._active = False
+        if fxcorepy is None:
+            log.info("fxcorepy недоступний — tick-підписка пропущена.")
+            return
+        offers_table = self._obtain_offers_table(fx)
+        if offers_table is None:
+            log.error(
+                "Не вдалося отримати OFFERS table (table manager вимкнений або таблиці ще не завантажені)."
+            )
+            return
+        subscribed = self._subscribe_via_common(offers_table)
+        if not subscribed:
+            subscribed = self._subscribe_via_fxcorepy(offers_table)
+        if not subscribed:
+            log.error("FXCM OfferTable підписка недоступна (Common/fxcorepy listener відсутні).")
+            return
+        self._table = offers_table
+        self._active = True
+        log.info("FXCM OfferTable підписка активована для %d символів.", len(self._symbols) or -1)
+
+    def close(self) -> None:
+        if not self._active:
+            return
+        try:
+            if self._table is not None:
+                if self._listener is not None:
+                    unsubscribe = (
+                        getattr(Common, "unsubscribe_table_updates", None)
+                        if Common is not None
+                        else None
+                    )
+                    if callable(unsubscribe):
+                        # type: ignore[misc]
+                        unsubscribe(self._table, self._listener)  # type: ignore[misc]
+                    else:
+                        listener_unsubscribe = getattr(self._listener, "unsubscribe", None)
+                        if callable(listener_unsubscribe):
+                            try:
+                                listener_unsubscribe()
+                                log.debug(
+                                    "FXCM OfferTable listener відписано "
+                                    "fallback-методом listener.unsubscribe().",
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                log.debug(
+                                    "Fallback listener.unsubscribe() неуспішний: %s",
+                                    exc,
+                                )
+                        else:
+                            log.debug(
+                                "Common.unsubscribe_table_updates недоступний, "
+                                "а listener.unsubscribe() відсутній — відписка пропущена.",
+                            )
+                if self._fallback_listener is not None and self._fallback_updates:
+                    for update_type in list(self._fallback_updates):
+                        try:
+                            self._table.unsubscribe_update(update_type, self._fallback_listener)
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("Не вдалося відписатися від OFFERS (%s): %s", update_type, exc)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Помилка під час відписки OfferTable: %s", exc)
+        finally:
+            self._active = False
+            self._table = None
+            self._listener = None
+            self._fallback_listener = None
+            self._fallback_updates.clear()
+
+    def _subscribe_via_common(self, offers_table: Any) -> bool:
+        if Common is None:
+            return False
+        subscribe = getattr(Common, "subscribe_table_updates", None)
+        if not callable(subscribe):
+            return False
+        try:
+            self._listener = subscribe(
+                offers_table,
+                on_add_callback=self._handle_table_callback,
+                on_change_callback=self._handle_table_callback,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Common.subscribe_table_updates недоступний, пробуємо fxcorepy fallback: %s",
+                exc,
+            )
+            self._listener = None
+            return False
+
+    def _subscribe_via_fxcorepy(self, offers_table: Any) -> bool:
+        base_listener = getattr(fxcorepy, "AO2GTableListener", None)
+        if base_listener is None:
+            return False
+
+        class _OfferListener(base_listener):  # type: ignore[misc, valid-type]
+            def __init__(self, handler: Callable[[Any], None]) -> None:
+                super().__init__()
+                self._handler = handler
+
+            def on_added(self, _listener: Any, _row_id: Any, row_data: Any) -> None:  # noqa: D401
+                self._handler(row_data)
+
+            def on_changed(self, _listener: Any, _row_id: Any, row_data: Any) -> None:
+                self._handler(row_data)
+
+        try:
+            listener = _OfferListener(self._handle_row)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не вдалося створити fxcorepy AO2GTableListener: %s", exc)
+            return False
+        update_type = getattr(fxcorepy, "O2GTableUpdateType", None)
+        if update_type is None:
+            log.warning("fxcorepy.O2GTableUpdateType відсутній — fallback неможливий.")
+            return False
+        types_to_subscribe = []
+        for attr in ("INSERT", "UPDATE"):
+            update_value = getattr(update_type, attr, None)
+            if update_value is not None:
+                types_to_subscribe.append(update_value)
+        if not types_to_subscribe:
+            log.warning("fxcorepy.O2GTableUpdateType не містить INSERT/UPDATE — fallback неможливий.")
+            return False
+        try:
+            for update_value in types_to_subscribe:
+                offers_table.subscribe_update(update_value, listener)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("OFFERS subscribe через fxcorepy неуспішний: %s", exc)
+            return False
+        self._fallback_listener = listener
+        self._fallback_updates = list(types_to_subscribe)
+        log.info("FXCM OfferTable підписано через fxcorepy fallback (Common недоступний).")
+        return True
+
+
+    def _handle_table_callback(self, *args: Any, **kwargs: Any) -> None:
+        row_data: Any = None
+        if "row_data" in kwargs:
+            row_data = kwargs["row_data"]
+        elif args:
+            # Common може передавати (row_id, row_data) або лише row_data.
+            row_data = args[-1]
+        self._handle_row(row_data)
+
+    def _obtain_offers_table(self, fx: ForexConnect) -> Optional[Any]:
+        table_id = getattr(ForexConnect, "OFFERS", None)
+        get_table = getattr(fx, "get_table", None)
+        if callable(get_table) and table_id is not None:
+            try:
+                table = get_table(table_id)
+                if table is not None:
+                    return table
+            except Exception as exc:  # noqa: BLE001
+                log.debug("ForexConnect.get_table OFFERS повернув помилку: %s", exc)
+        manager = getattr(fx, "table_manager", None)
+        if manager is None:
+            return None
+        try:
+            # type: ignore - `manager` може бути `None` або не мати методу в середовищі без SDK; 
+            # головне пам’ятати, що таким чином ми свідомо вимикаємо mypy-перевірку на цьому виклику.
+            return manager.get_table(fxcorepy.O2GTableType.OFFERS) # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            log.debug("TableManager.get_table OFFERS неуспішний: %s", exc)
+            return None
+
+    def _handle_row(self, row_data: Any) -> None:
+        if row_data is None:
+            return
+        symbol_raw = self._read_field(row_data, ["Instrument", "Symbol", "instrument", "symbol", "OfferSymbol"])
+        symbol = _normalize_symbol(symbol_raw) if symbol_raw else None
+        if not symbol:
+            return
+        if self._symbols and symbol not in self._symbols:
+            return
+        bid = self._read_float(row_data, ["Bid", "bid", "BestBid"], ["getBid"])
+        ask = self._read_float(row_data, ["Ask", "ask", "BestAsk"], ["getAsk"])
+        if bid is None or ask is None:
+            return
+        tick_dt = self._read_time(row_data)
+        tick_ts = tick_dt.timestamp() if tick_dt else time.time()
+        try:
+            self._on_tick(symbol, bid, ask, tick_ts)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Tick callback викликав помилку для %s: %s", symbol, exc)
+
+    @staticmethod
+    def _read_field(row_data: Any, candidates: Sequence[str]) -> Optional[str]:
+        for name in candidates:
+            value = FXCMOfferSubscription._value_from_row(row_data, name)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        getter = getattr(row_data, "getInstrument", None)
+        if callable(getter):
+            try:
+                value = getter()
+                if value:
+                    text = str(value).strip()
+                    if text:
+                        return text
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
+    @staticmethod
+    def _read_float(row_data: Any, fields: Sequence[str], methods: Sequence[str]) -> Optional[float]:
+        for name in fields:
+            value = FXCMOfferSubscription._value_from_row(row_data, name)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        for method in methods:
+            getter = getattr(row_data, method, None)
+            if callable(getter):
+                try:
+                    value = getter()
+                    if value is not None:
+                        return float(value) # type: ignore
+                except Exception:  # noqa: BLE001
+                    continue
+        return None
+
+    @staticmethod
+    def _read_time(row_data: Any) -> Optional[dt.datetime]:
+        candidates = ["Time", "time", "QuoteTime", "LastUpdate", "lastUpdate"]
+        for name in candidates:
+            value = FXCMOfferSubscription._value_from_row(row_data, name)
+            dt_value = FXCMOfferSubscription._coerce_datetime(value)
+            if dt_value is not None:
+                return dt_value
+        getter = getattr(row_data, "getTime", None)
+        if callable(getter):
+            try:
+                return FXCMOfferSubscription._coerce_datetime(getter())
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
+    @staticmethod
+    def _coerce_datetime(value: Any) -> Optional[dt.datetime]:
+        if isinstance(value, dt.datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=dt.timezone.utc)
+            return value
+        if isinstance(value, (int, float)):
+            return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                if text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                return dt.datetime.fromisoformat(text)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _value_from_row(row_data: Any, name: str) -> Any:
+        if hasattr(row_data, name):
+            value = getattr(row_data, name)
+            if callable(value):
+                try:
+                    return value()
+                except Exception:  # noqa: BLE001
+                    return None
+            return value
+        return None
+
+
 class PublishDataGate:
     """Відкидає дублікати барів та трекає останні timestamp-и."""
 
     def __init__(self) -> None:
         self._last_open: Dict[Tuple[str, str], int] = {}
         self._last_close: Dict[Tuple[str, str], int] = {}
+        self._lock = threading.Lock()
 
     def _key(self, symbol: str, timeframe: str) -> Tuple[str, str]:
         return (_normalize_symbol(symbol), _map_timeframe_label(timeframe))
 
     def seed(self, *, symbol: str, timeframe: str, last_open: Optional[int] = None, last_close: Optional[int] = None) -> None:
         key = self._key(symbol, timeframe)
-        if last_open is not None:
-            self._last_open[key] = int(last_open)
-        if last_close is not None:
-            self._last_close[key] = int(last_close)
+        with self._lock:
+            if last_open is not None:
+                self._last_open[key] = int(last_open)
+            if last_close is not None:
+                self._last_close[key] = int(last_close)
 
     def filter_new_bars(self, df: pd.DataFrame, *, symbol: str, timeframe: str) -> pd.DataFrame:
         if df is None or df.empty:
             return df
         key = self._key(symbol, timeframe)
-        cutoff = self._last_open.get(key)
+        with self._lock:
+            cutoff = self._last_open.get(key)
         if cutoff is None:
             return df
         filtered = cast(pd.DataFrame, df.loc[df["open_time"] > cutoff])
@@ -777,24 +1894,29 @@ class PublishDataGate:
         key = self._key(symbol, timeframe)
         newest_open = int(df["open_time"].max())
         newest_close = int(df["close_time"].max())
-        self._last_open[key] = newest_open
-        self._last_close[key] = newest_close
+        with self._lock:
+            self._last_open[key] = newest_open
+            self._last_close[key] = newest_close
         self._update_staleness_metric_for_key(key)
 
     def staleness_seconds(self, *, symbol: str, timeframe: str) -> Optional[float]:
         key = self._key(symbol, timeframe)
-        last_close = self._last_close.get(key)
+        with self._lock:
+            last_close = self._last_close.get(key)
         if last_close is None:
             return None
         now = _now_utc().timestamp()
         return max(0.0, now - last_close / 1000.0)
 
     def update_staleness_metrics(self) -> None:
-        for key in list(self._last_close.keys()):
+        with self._lock:
+            keys = list(self._last_close.keys())
+        for key in keys:
             self._update_staleness_metric_for_key(key)
 
     def _update_staleness_metric_for_key(self, key: Tuple[str, str]) -> None:
-        last_close = self._last_close.get(key)
+        with self._lock:
+            last_close = self._last_close.get(key)
         if last_close is None:
             return
         now = _now_utc().timestamp()
@@ -1040,7 +2162,8 @@ def _normalize_history_to_ohlcv(
         PROM_DROPPED_BARS.labels(symbol=symbol_norm, tf=timeframe).inc(dropped)
         ohlcv = ohlcv.loc[valid_mask]
 
-    ohlcv = cast(pd.DataFrame, ohlcv.sort_values(by="open_time", ignore_index=True))
+    ohlcv = cast(pd.DataFrame, ohlcv.sort_values(by="open_time"))
+    ohlcv = cast(pd.DataFrame, ohlcv.reset_index(drop=True))
 
     return ohlcv
 
@@ -1207,6 +2330,30 @@ def publish_ohlcv_to_redis(
         raise RedisRetryableError("Не вдалося надіслати OHLCV у Redis") from exc
 
 
+def _publish_price_snapshot(
+    redis_client: Optional[Any],
+    *,
+    channel: str,
+    snapshot: PriceTickSnap,
+) -> None:
+    if redis_client is None:
+        raise RedisRetryableError("Redis недоступний для price snapshot")
+
+    payload = {
+        "symbol": snapshot.symbol,
+        "bid": snapshot.bid,
+        "ask": snapshot.ask,
+        "mid": snapshot.mid,
+        "tick_ts": snapshot.tick_ts,
+        "snap_ts": snapshot.snap_ts,
+    }
+    message = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    try:
+        redis_client.publish(channel, message)
+    except Exception as exc:  # noqa: BLE001
+        raise RedisRetryableError("Не вдалося надіслати price snapshot у Redis") from exc
+
+
 def _fetch_and_publish_recent(
     fx: ForexConnect,
     *,
@@ -1221,6 +2368,8 @@ def _fetch_and_publish_recent(
     hmac_secret: Optional[str] = None,
     hmac_algo: str = "sha256",
     session_stats: Optional[SessionStatsTracker] = None,
+    ohlcv_sink: Optional[Callable[[OhlcvBatch], None]] = None,
+    market_status_sink: Optional[Callable[[MarketStatusEvent], None]] = None,
 ) -> pd.DataFrame:
     """Витягує останні `lookback_minutes` і публікує лише нові бари.
 
@@ -1230,7 +2379,12 @@ def _fetch_and_publish_recent(
 
     end_dt = _now_utc()
     if not is_trading_time(end_dt):
-        _notify_market_closed(end_dt, redis_client)
+        next_open = _notify_market_closed(end_dt, redis_client if market_status_sink is None else None)
+        if market_status_sink is not None:
+            try:
+                market_status_sink(MarketStatusEvent(state="closed", next_open=next_open))
+            except Exception:  # noqa: BLE001
+                log.exception("Не вдалося передати market_status sink (closed).")
         raise MarketTemporarilyClosed("Ринок закритий")
 
     start_dt = end_dt - dt.timedelta(minutes=max(lookback_minutes, 1))
@@ -1241,7 +2395,12 @@ def _fetch_and_publish_recent(
     except Exception as exc:  # noqa: BLE001
         if _is_price_history_not_ready(exc):
             PROM_PRICE_HISTORY_NOT_READY.inc()
-            _notify_market_closed(end_dt, redis_client)
+            next_open = _notify_market_closed(end_dt, redis_client if market_status_sink is None else None)
+            if market_status_sink is not None:
+                try:
+                    market_status_sink(MarketStatusEvent(state="closed", next_open=next_open))
+                except Exception:  # noqa: BLE001
+                    log.exception("Не вдалося передати market_status sink (price history not ready).")
             log.debug(
                 "Стрім: FXCM PriceHistoryCommunicator не готовий для %s (%s).",
                 symbol,
@@ -1279,29 +2438,53 @@ def _fetch_and_publish_recent(
     if session_stats is not None:
         session_stats.ingest(symbol, timeframe_norm, df_to_publish)
 
-    if redis_client is None:
+    if redis_client is None and ohlcv_sink is None:
         if data_gate is not None:
             data_gate.record_publish(df_to_publish, symbol=symbol, timeframe=timeframe_norm)
         newest = int(df_to_publish["open_time"].max())
         last_open_time_ms[key] = newest
         return df_to_publish
 
-    publish_ok = publish_ohlcv_to_redis(
-        df_to_publish,
-        symbol=symbol,
-        timeframe=timeframe_norm,
-        redis_client=redis_client,
-        data_gate=data_gate,
-        min_publish_interval=min_publish_interval,
-        publish_rate_limit=publish_rate_limit,
-        hmac_secret=hmac_secret,
-        hmac_algo=hmac_algo,
-    )
+    publish_ok = True
+    if ohlcv_sink is not None:
+        batch = OhlcvBatch(
+            symbol=_normalize_symbol(symbol),
+            timeframe=timeframe_norm,
+            data=df_to_publish.copy(deep=False),
+            fetched_at=time.time(),
+            source="stream",
+        )
+        try:
+            ohlcv_sink(batch)
+        except Exception:  # noqa: BLE001
+            publish_ok = False
+            log.exception("Не вдалося передати OhlcvBatch у sink.")
+    else:
+        publish_ok = publish_ohlcv_to_redis(
+            df_to_publish,
+            symbol=symbol,
+            timeframe=timeframe_norm,
+            redis_client=redis_client,
+            data_gate=data_gate,
+            min_publish_interval=min_publish_interval,
+            publish_rate_limit=publish_rate_limit,
+            hmac_secret=hmac_secret,
+            hmac_algo=hmac_algo,
+        )
+        if not publish_ok:
+            return pd.DataFrame()
     if not publish_ok:
         return pd.DataFrame()
+
     newest = int(df_to_publish["open_time"].max())
     last_open_time_ms[key] = newest
-    _publish_market_status(redis_client, "open")
+    if market_status_sink is not None:
+        try:
+            market_status_sink(MarketStatusEvent(state="open", next_open=None))
+        except Exception:  # noqa: BLE001
+            log.exception("Не вдалося передати market_status sink (open).")
+    else:
+        _publish_market_status(redis_client, "open")
     return df_to_publish
 
 
@@ -1455,6 +2638,32 @@ def fetch_history_sample(
     return publish_ok
 
 
+def _attach_price_stream_context(context: Dict[str, Any], price_stream: Optional[PriceSnapshotWorker]) -> None:
+    if price_stream is None:
+        return
+    metadata = price_stream.snapshot_metadata()
+    if metadata:
+        context["price_stream"] = metadata
+        silence = metadata.get("tick_silence_seconds")
+        if silence is not None:
+            context.setdefault("tick_silence_seconds", silence)
+
+
+def _attach_supervisor_context(
+    context: Dict[str, Any],
+    supervisor: Optional["AsyncStreamSupervisor"],
+) -> None:
+    if supervisor is None:
+        return
+    try:
+        snapshot = supervisor.diagnostics_snapshot()
+    except Exception:  # noqa: BLE001 - діагностика не критична
+        return
+    if snapshot:
+        context["supervisor"] = snapshot
+        context["async_supervisor"] = snapshot
+
+
 def stream_fx_data(
     fx: ForexConnect,
     *,
@@ -1472,11 +2681,18 @@ def stream_fx_data(
     data_gate: Optional[PublishDataGate] = None,
     hmac_secret: Optional[str] = None,
     hmac_algo: str = "sha256",
+    price_stream: Optional[PriceSnapshotWorker] = None,
+    ohlcv_sink: Optional[Callable[[OhlcvBatch], None]] = None,
+    heartbeat_sink: Optional[Callable[[HeartbeatEvent], None]] = None,
+    market_status_sink: Optional[Callable[[MarketStatusEvent], None]] = None,
+    async_supervisor: Optional["AsyncStreamSupervisor"] = None,
+    fx_session_observer: Optional[Callable[[ForexConnect], None]] = None,
 ) -> None:
     """Безкінечний цикл стрімінгу OHLCV у Redis.
 
     `poll_seconds` контролює частоту звернення до FXCM, а
     `publish_interval_seconds` — мінімальний інтервал між публікаціями свічок у Redis.
+    Якщо `price_stream` задано, heartbeat збагачується метаданими про снепшоти тика.
     """
 
     if require_redis and redis_client is None:
@@ -1490,6 +2706,57 @@ def stream_fx_data(
 
     current_fx = fx
     current_redis = redis_client
+
+    def _notify_fx_session_observer(target_fx: ForexConnect) -> None:
+        if fx_session_observer is None:
+            return
+        try:
+            fx_session_observer(target_fx)
+        except Exception:  # noqa: BLE001
+            log.exception("Не вдалося оновити FXCM session observer після reconnect.")
+
+    _notify_fx_session_observer(current_fx)
+
+    def _emit_market_status_event(state: str, next_open: Optional[dt.datetime]) -> None:
+        event = MarketStatusEvent(state=state, next_open=next_open)
+        if market_status_sink is not None:
+            try:
+                market_status_sink(event)
+            except Exception:  # noqa: BLE001
+                log.exception("Не вдалося передати market_status sink.")
+        else:
+            _publish_market_status(current_redis, state, next_open=next_open)
+
+    def _emit_heartbeat_event(
+        *,
+        state: str,
+        last_bar_close_ms: Optional[int],
+        context: Dict[str, Any],
+        next_open: Optional[dt.datetime] = None,
+        sleep_seconds: Optional[int] = None,
+    ) -> None:
+        event = HeartbeatEvent(
+            state=state,
+            last_bar_close_ms=last_bar_close_ms,
+            next_open=next_open,
+            sleep_seconds=sleep_seconds,
+            context=context,
+        )
+        if heartbeat_sink is not None:
+            try:
+                heartbeat_sink(event)
+            except Exception:  # noqa: BLE001
+                log.exception("Не вдалося передати heartbeat у sink.")
+        else:
+            _publish_heartbeat(
+                current_redis,
+                heartbeat_channel,
+                state=state,
+                last_bar_close_ms=last_bar_close_ms,
+                next_open=next_open,
+                sleep_seconds=sleep_seconds,
+                context=context,
+            )
 
     last_published_close_ms: Optional[int] = None
     last_open_time_ms: Dict[Tuple[str, str], int] = {}
@@ -1505,6 +2772,20 @@ def stream_fx_data(
                 if last_published_close_ms is None or cached_close > last_published_close_ms:
                     last_published_close_ms = cached_close
     publish_rate_limit: Dict[Tuple[str, str], float] = {}
+    ohlcv_sink_effective = ohlcv_sink
+    if ohlcv_sink is not None and publish_interval_seconds > 0:
+        min_interval = float(publish_interval_seconds)
+
+        def _rate_limited_sink(batch: OhlcvBatch, *, _sink: Callable[[OhlcvBatch], None] = ohlcv_sink) -> None:
+            key = (batch.symbol, batch.timeframe)
+            last_ts = publish_rate_limit.get(key)
+            now_ts = time.monotonic()
+            if last_ts is not None and now_ts - last_ts < min_interval:
+                time.sleep(min_interval - (now_ts - last_ts))
+            publish_rate_limit[key] = time.monotonic()
+            _sink(batch)
+
+        ohlcv_sink_effective = _rate_limited_sink
     log.info(
         "Старт стрімінгу FXCM: %s, інтервал опитування %ss, вікно %s хв.",
         ", ".join(f"{sym} {tf}" for sym, tf in config),
@@ -1545,6 +2826,8 @@ def stream_fx_data(
                             hmac_secret=hmac_secret,
                             hmac_algo=hmac_algo,
                             session_stats=session_stats_tracker,
+                            ohlcv_sink=ohlcv_sink_effective,
+                            market_status_sink=market_status_sink,
                         )
                     except MarketTemporarilyClosed as exc:
                         log.info("Стрім: ринок недоступний (%s)", exc)
@@ -1559,6 +2842,7 @@ def stream_fx_data(
                             raise
                         _close_fxcm_session(current_fx, announce=False)
                         current_fx = fx_reconnector()
+                        _notify_fx_session_observer(current_fx)
                         restart_cycle = True
                         break
                     except RedisRetryableError as exc:
@@ -1595,7 +2879,12 @@ def stream_fx_data(
             elapsed = time.monotonic() - cycle_start
             if market_pause:
                 reference_time = closed_reference or _now_utc()
-                next_open = _notify_market_closed(reference_time, current_redis)
+                next_open = _notify_market_closed(
+                    reference_time,
+                    current_redis if market_status_sink is None else None,
+                )
+                if market_status_sink is not None:
+                    _emit_market_status_event("closed", next_open)
                 seconds_to_open = (
                     max(0.0, (next_open - _now_utc()).total_seconds()) if next_open else 0.0
                 )
@@ -1635,6 +2924,8 @@ def stream_fx_data(
                     "published_bars": cycle_published_bars,
                     "cache_enabled": cache_manager is not None,
                 }
+                _attach_price_stream_context(idle_context, price_stream)
+                _attach_supervisor_context(idle_context, async_supervisor)
                 if lag_seconds is not None:
                     idle_context["lag_seconds"] = lag_seconds
                 stats_snapshot = session_stats_tracker.snapshot()
@@ -1642,9 +2933,7 @@ def stream_fx_data(
                     next_open,
                     session_stats=stats_snapshot,
                 )
-                _publish_heartbeat(
-                    current_redis,
-                    heartbeat_channel,
+                _emit_heartbeat_event(
                     state="idle",
                     last_bar_close_ms=last_published_close_ms,
                     next_open=next_open,
@@ -1669,6 +2958,8 @@ def stream_fx_data(
                     "published_bars": cycle_published_bars,
                     "cache_enabled": cache_manager is not None,
                 }
+                _attach_price_stream_context(stream_context, price_stream)
+                _attach_supervisor_context(stream_context, async_supervisor)
                 if lag_seconds is not None:
                     stream_context["lag_seconds"] = lag_seconds
                 stats_snapshot = session_stats_tracker.snapshot()
@@ -1676,9 +2967,7 @@ def stream_fx_data(
                     None,
                     session_stats=stats_snapshot,
                 )
-                _publish_heartbeat(
-                    current_redis,
-                    heartbeat_channel,
+                _emit_heartbeat_event(
                     state="stream",
                     last_bar_close_ms=last_published_close_ms,
                     context=stream_context,
@@ -1758,6 +3047,9 @@ def main() -> None:
         )
 
     publish_gate = PublishDataGate()
+    price_worker: Optional[PriceSnapshotWorker] = None
+    offer_subscription: Optional[FXCMOfferSubscription] = None
+    supervisor: Optional[AsyncStreamSupervisor] = None
 
     stream_mode = config.stream_mode
     poll_seconds = config.poll_seconds
@@ -1904,22 +3196,89 @@ def main() -> None:
                     log.info(
                         "Redis недоступний — працюємо у file-only режимі (без публікацій)."
                     )
-            stream_fx_data(
-                fx_active,
-                redis_client=redis_holder["client"],
-                require_redis=config.redis_required,
-                poll_seconds=poll_seconds,
-                publish_interval_seconds=config.publish_interval_seconds,
-                lookback_minutes=lookback_minutes,
-                config=stream_config,
-                cache_manager=cache_manager,
-                fx_reconnector=reconnect_fxcm,
-                redis_reconnector=redis_reconnector,
-                heartbeat_channel=config.observability.heartbeat_channel,
-                data_gate=publish_gate,
-                hmac_secret=config.hmac_secret,
-                hmac_algo=config.hmac_algo,
+            if config.async_supervisor:
+                supervisor = AsyncStreamSupervisor(
+                    redis_supplier=lambda: redis_holder["client"],
+                    redis_reconnector=redis_reconnector,
+                    data_gate=publish_gate,
+                    heartbeat_channel=config.observability.heartbeat_channel,
+                    price_channel=config.price_stream.channel,
+                    hmac_secret=config.hmac_secret,
+                    hmac_algo=config.hmac_algo,
+                )
+                supervisor.start()
+            subscription_holder: Dict[str, Optional[FXCMOfferSubscription]] = {
+                "instance": None
+            }
+
+            price_worker = PriceSnapshotWorker(
+                lambda: redis_holder["client"],
+                channel=config.price_stream.channel,
+                interval_seconds=config.price_stream.interval_seconds,
+                symbols=[symbol for symbol, _ in stream_config],
+                snapshot_callback=(
+                    supervisor.submit_price_snapshot if supervisor is not None else None
+                ),
             )
+            price_worker.start()
+            log.info(
+                "Tick снепшоти: канал %s, інтервал %.1f с.",
+                config.price_stream.channel,
+                config.price_stream.interval_seconds,
+            )
+
+            def _refresh_price_subscription(target_fx: ForexConnect) -> None:
+                if price_worker is None:
+                    return
+                existing = subscription_holder["instance"]
+                if existing is not None:
+                    existing.close()
+                try:
+                    subscription_holder["instance"] = FXCMOfferSubscription(
+                        target_fx,
+                        symbols=[symbol for symbol, _ in stream_config],
+                        on_tick=price_worker.enqueue_tick,
+                    )
+                except Exception:
+                    subscription_holder["instance"] = None
+                    log.exception("Не вдалося підписатися на FXCM OfferTable.")
+            try:
+                stream_fx_data(
+                    fx_active,
+                    redis_client=redis_holder["client"],
+                    require_redis=config.redis_required,
+                    poll_seconds=poll_seconds,
+                    publish_interval_seconds=config.publish_interval_seconds,
+                    lookback_minutes=lookback_minutes,
+                    config=stream_config,
+                    cache_manager=cache_manager,
+                    fx_reconnector=reconnect_fxcm,
+                    redis_reconnector=redis_reconnector,
+                    heartbeat_channel=config.observability.heartbeat_channel,
+                    data_gate=publish_gate,
+                    hmac_secret=config.hmac_secret,
+                    hmac_algo=config.hmac_algo,
+                    price_stream=price_worker,
+                    ohlcv_sink=(
+                        supervisor.submit_ohlcv_batch if supervisor is not None else None
+                    ),
+                    heartbeat_sink=(
+                        supervisor.submit_heartbeat if supervisor is not None else None
+                    ),
+                    market_status_sink=(
+                        supervisor.submit_market_status if supervisor is not None else None
+                    ),
+                    async_supervisor=supervisor,
+                    fx_session_observer=_refresh_price_subscription,
+                )
+            finally:
+                offer_subscription = subscription_holder.get("instance")
+                if offer_subscription is not None:
+                    offer_subscription.close()
+                if price_worker is not None:
+                    price_worker.stop()
+                if supervisor is not None:
+                    supervisor.stop()
         else:
             published = fetch_history_sample(
                 fx_active,

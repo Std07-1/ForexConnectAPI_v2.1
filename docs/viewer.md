@@ -25,6 +25,8 @@ python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 | `2` | Сесії (SESSION). |
 | `3` | Алерти (ALERTS). |
 | `4` | Потоки OHLCV (STREAMS). |
+| `5` | Live FXCM price (PRICE). |
+| `6` | Async supervisor (SUPERVISOR). |
 
 Меню відображається внизу інтерфейсу (`MENU_TEXT`). Поточний режим також видно у блоку "Monitor mode" в summary.
 
@@ -37,7 +39,7 @@ python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 
 ### 1. Summary
 
-- **FXCM diagnostics:** все з `heartbeat.context` — режим, цикловий час, lag, Redis-стан, publish interval, цілі стріму.
+- **FXCM diagnostics:** все з `heartbeat.context` — режим, цикловий час, lag, Redis-стан, publish interval, цілі стріму та блок `price_stream` (канал `fxcm:price_tik`, інтервал, останній тик/снепшот, `tick_silence_seconds`).
 - **Recent incidents:** останні 24 переходи станів (`fxcm_pause`, `redis_disconnect`, `ohlcv_msg_idle`, тощо) з позначками ACTIVE/CLEAR.
 
 ### 2. Session
@@ -54,6 +56,21 @@ python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 
 - `build_stream_targets_panel`: стейлнесс/лаг по поточних стрім-таргетах, трендову спарк-лінію та час останнього оновлення.
 - `build_ohlcv_panel`: розкладка по символах/TF із lag, msg age, кількістю барів у повідомленні та історією.
+
+### 5. Live FXCM price
+
+- Панель `Live FXCM price` підтягує `price_stream` із heartbeat: стан воркера (`state`), канал, інтервал, queue depth, останні `snap_ts`/`tick_ts` і глобальний `tick_silence_seconds`.
+- Таблиця нижче показує mid/bid/ask та `tick_age` для кожного символу (XAUUSD, EURUSD тощо) — це допомагає миттєво побачити, коли FXCM перестав присилати живі тики.
+- Натисни `5`, щоб перемикатися до цього режиму або повернутися назад через меню внизу.
+
+### 6. Async supervisor
+
+- Новий режим для моніторингу `async_supervisor`: показує підсумковий стан (loop alive, uptime, backpressure, останній publish та помилку).
+- Панель «Supervisor: метрики» агрегує counters виробника: total enqueued/processed/dropped, сумарний queue depth, загальну кількість publish-ів, активні таски, помилки та кількість backpressure-подій; кожен рядок має підказку з коротким описом метрики.
+- Блок «Спеціальні канали» показує фіксовані sink-и (налаштовуються `viewer.supervisor_channels`) з власними підказками (`viewer.supervisor_channel_hints`), щоби контролювати критичні канали навіть коли вони не в топі.
+- Таблиця «Supervisor: черги» відображає глибину кожної sink-черги, місткість, відсоток заповнення, вік останнього enqueue та лічильники processed/dropped.
+- Таблиця «Supervisor: таски» показує стан кожного consumer-а (running/idle/error), кількість оброблених подій, помилки та час із моменту останньої активності.
+- Якщо heartbeat ще не містить `context.supervisor`, режим підказує ввімкнути `stream.async_supervisor`, щоб діагностика зʼявилася.
 
 ## Інциденти та алерти
 
@@ -83,6 +100,8 @@ Viewer відстежує кілька ключових ситуацій:
 | `ohlcv_lag_warn_seconds` / `ohlcv_lag_error_seconds` | Пороги лагу між останнім close та поточним часом. |
 | `tf_1m_idle_warn_seconds`, `tf_1m_idle_error_seconds` | Спеціальні пороги для конкретного TF (доступні також для `tf_5m`, і можна додавати власні). |
 | `timeline_matrix_rows`, `timeline_max_columns`, `timeline_history_max`, `timeline_focus_minutes` | Контролюють розмірність таймлайну. |
+| `supervisor_channels` | Масив назв sink-каналів, які треба завжди показувати в панелі Supervisor Metrics (наприклад `["ohlcv", "heartbeat", "price"]`). |
+| `supervisor_channel_hints` | (optional) словник `"channel": "опис"`, яким можна перевизначити підказки для спеціальних каналів. |
 
 фрагмент:
 

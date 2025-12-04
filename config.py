@@ -14,6 +14,7 @@ CACHE_DEFAULT_MAX_BARS = 3_000  # Максимальна кількість ба
 CACHE_DEFAULT_WARMUP_BARS = 1_000  # Кількість барів для "прогріву" кешу
 METRICS_DEFAULT_PORT = 9200
 HEARTBEAT_DEFAULT_CHANNEL = "fxcm:heartbeat"
+PRICE_SNAPSHOT_CHANNEL_DEFAULT = "fxcm:price_tik"
 CALENDAR_OVERRIDES_FILE = Path("config/calendar_overrides.json")
 RUNTIME_SETTINGS_FILE = Path("config/runtime_settings.json")
 
@@ -149,6 +150,12 @@ class ObservabilitySettings:
 
 
 @dataclass(frozen=True)
+class PriceStreamSettings:
+    channel: str
+    interval_seconds: float
+
+
+@dataclass(frozen=True)
 class CalendarSettings:
     holidays: List[str]
     daily_breaks: List[Any]
@@ -234,10 +241,12 @@ class FXCMConfig:
     redis: RedisSettings
     cache: CacheSettings
     stream_mode: bool
+    async_supervisor: bool
     poll_seconds: int
     publish_interval_seconds: int
     lookback_minutes: int
     stream_targets: List[Tuple[str, str]]
+    price_stream: PriceStreamSettings
     sample_request: SampleRequestSettings
     observability: ObservabilitySettings
     calendar: CalendarSettings
@@ -287,6 +296,7 @@ def load_config() -> FXCMConfig:
     stream_cfg_raw = runtime_settings.get("stream")
     stream_cfg = stream_cfg_raw if isinstance(stream_cfg_raw, dict) else {}
     stream_mode = _coerce_bool(stream_cfg.get("mode"), False)
+    async_supervisor = _coerce_bool(stream_cfg.get("async_supervisor"), False)
     base_poll_seconds = _coerce_int(stream_cfg.get("poll_seconds"), 5, min_value=1)
     if "fetch_interval_seconds" in stream_cfg:
         poll_seconds = _coerce_int(stream_cfg.get("fetch_interval_seconds"), base_poll_seconds, min_value=1)
@@ -299,6 +309,17 @@ def load_config() -> FXCMConfig:
     )
     lookback_minutes = _coerce_int(stream_cfg.get("lookback_minutes"), 5, min_value=1)
     stream_targets = _parse_stream_targets_config(stream_cfg.get("config"))
+    price_stream = PriceStreamSettings(
+        channel=str(
+            stream_cfg.get("price_snap_channel", PRICE_SNAPSHOT_CHANNEL_DEFAULT)
+        ).strip()
+        or PRICE_SNAPSHOT_CHANNEL_DEFAULT,
+        interval_seconds=_coerce_float(
+            stream_cfg.get("price_snap_interval_seconds"),
+            3.0,
+            min_value=0.5,
+        ),
+    )
 
     sample_cfg_raw = runtime_settings.get("sample_request")
     sample_cfg = sample_cfg_raw if isinstance(sample_cfg_raw, dict) else {}
@@ -362,10 +383,12 @@ def load_config() -> FXCMConfig:
         redis=redis_settings,
         cache=cache_settings,
         stream_mode=stream_mode,
+        async_supervisor=async_supervisor,
         poll_seconds=poll_seconds,
         publish_interval_seconds=publish_interval_seconds,
         lookback_minutes=lookback_minutes,
         stream_targets=stream_targets,
+        price_stream=price_stream,
         sample_request=sample_request,
         observability=observability,
         calendar=calendar_settings,

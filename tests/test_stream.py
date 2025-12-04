@@ -3,9 +3,11 @@ from __future__ import annotations
 import datetime as dt
 import json
 import tempfile
+import time
+import types
 import unittest
 from pathlib import Path
-from typing import Any, Dict, cast
+from typing import Any, Callable, Dict, Tuple, cast
 from unittest import mock
 
 import pandas as pd
@@ -14,7 +16,18 @@ import connector
 import sessions
 
 from config import SampleRequestSettings
-from connector import HistoryCache, PublishDataGate, publish_ohlcv_to_redis, stream_fx_data
+from connector import (
+    AsyncStreamSupervisor,
+    HeartbeatEvent,
+    MarketStatusEvent,
+    HistoryCache,
+    OhlcvBatch,
+    PriceSnapshotWorker,
+    PriceTickSnap,
+    PublishDataGate,
+    publish_ohlcv_to_redis,
+    stream_fx_data,
+)
 from fxcm_security import compute_payload_hmac
 
 
@@ -52,6 +65,16 @@ class FakeRedis:
     def publish(self, channel: str, message: str) -> int:
         self.messages.append((channel, message))
         return 1
+
+
+class DummySupervisor:
+    def __init__(self, payload: Dict[str, Any]) -> None:
+        self.payload = payload
+        self.calls = 0
+
+    def diagnostics_snapshot(self) -> Dict[str, Any]:
+        self.calls += 1
+        return self.payload
 
 
 def _make_sample_df(start: dt.datetime, count: int) -> pd.DataFrame:
@@ -249,6 +272,64 @@ class WarmupStreamTest(unittest.TestCase):
         self.assertIn("session", last_heartbeat["context"])
 
 
+class FetchRecentSinkTest(unittest.TestCase):
+    def test_fetch_recent_uses_sink_without_redis(self) -> None:
+        fixed_now = dt.datetime(2025, 5, 6, 10, 0, tzinfo=dt.timezone.utc)
+        fx = FakeForexConnect(_make_sample_df(fixed_now - dt.timedelta(minutes=4), 4))
+        captured: list[OhlcvBatch] = []
+        last_open: Dict[Tuple[str, str], int] = {}
+        gate = PublishDataGate()
+
+        with mock.patch("connector._now_utc", return_value=fixed_now), mock.patch(
+            "connector.is_trading_time", return_value=True
+        ):
+            df_result = connector._fetch_and_publish_recent(  # type: ignore[attr-defined]
+                cast(connector.ForexConnect, fx),
+                symbol="XAU/USD",
+                timeframe_raw="m1",
+                redis_client=None,
+                lookback_minutes=5,
+                last_open_time_ms=last_open,
+                data_gate=gate,
+                min_publish_interval=0,
+                publish_rate_limit={},
+                hmac_secret=None,
+                hmac_algo="sha256",
+                session_stats=None,
+                ohlcv_sink=captured.append,
+            )
+
+        self.assertTrue(captured)
+        batch = captured[-1]
+        self.assertEqual(batch.symbol, "XAUUSD")
+        self.assertFalse(df_result.empty)
+        pd.testing.assert_frame_equal(batch.data.reset_index(drop=True), df_result.reset_index(drop=True))
+        self.assertTrue(last_open)
+
+
+class PriceSnapshotWorkerTest(unittest.TestCase):
+    def test_flush_publishes_latest_tick(self) -> None:
+        redis_client = FakeRedis()
+        worker = PriceSnapshotWorker(
+            lambda: redis_client,
+            channel="fxcm:test:ticks",
+            interval_seconds=0.1,
+            symbols=["XAU/USD"],
+        )
+        worker.enqueue_tick("XAU/USD", 2010.1, 2010.3, tick_ts=1_700_000_000.0)
+        worker.enqueue_tick("XAU/USD", 2010.2, 2010.4, tick_ts=1_700_000_003.0)
+        worker.flush()
+        messages = [payload for channel, payload in redis_client.messages if channel == "fxcm:test:ticks"]
+        self.assertTrue(messages)
+        payload = json.loads(messages[-1])
+        self.assertEqual(payload["symbol"], "XAUUSD")
+        self.assertAlmostEqual(payload["bid"], 2010.2)
+        self.assertIn("snap_ts", payload)
+        metadata = worker.snapshot_metadata()
+        self.assertEqual(metadata["channel"], "fxcm:test:ticks")
+        self.assertTrue(metadata["symbols"])
+
+
 class HeartbeatContractTest(unittest.TestCase):
     def setUp(self) -> None:
         connector._LAST_MARKET_STATUS = None
@@ -333,6 +414,37 @@ class HeartbeatContractTest(unittest.TestCase):
         self.assertIn("avg", first_symbol)
         self.assertGreater(first_symbol["bars"], 0)
 
+    def test_stream_heartbeat_includes_supervisor_context(self) -> None:
+        fx = FakeForexConnect(_make_sample_df(self.fixed_now - dt.timedelta(minutes=10), 10))
+        redis_client = FakeRedis()
+        heartbeat_channel = "fxcm:test:heartbeat"
+        supervisor_payload = {"state": "running", "queues": [], "tasks": []}
+        supervisor = DummySupervisor(supervisor_payload)
+
+        with mock.patch("connector._now_utc", return_value=self.fixed_now), mock.patch(
+            "connector.is_trading_time", return_value=True
+        ):
+            stream_fx_data(
+                cast(connector.ForexConnect, fx),
+                redis_client=redis_client,
+                poll_seconds=0,
+                publish_interval_seconds=0,
+                lookback_minutes=5,
+                config=[("XAU/USD", "m1")],
+                cache_manager=None,
+                max_cycles=1,
+                heartbeat_channel=heartbeat_channel,
+                async_supervisor=cast(connector.AsyncStreamSupervisor, supervisor),
+            )
+
+        heartbeat_messages = self._extract_channel_messages(redis_client, heartbeat_channel)
+        self.assertTrue(heartbeat_messages)
+        ctx = heartbeat_messages[-1]["context"]
+        self.assertIn("supervisor", ctx)
+        self.assertEqual(ctx["supervisor"], supervisor_payload)
+        self.assertEqual(ctx.get("async_supervisor"), supervisor_payload)
+        self.assertGreaterEqual(supervisor.calls, 1)
+
     def test_idle_heartbeat_uses_cache_last_close(self) -> None:
         df = _make_sample_df(self.fixed_now - dt.timedelta(minutes=5), 5)
         normalized = connector._normalize_history_to_ohlcv(df, symbol="XAU/USD", timeframe="1m")
@@ -373,6 +485,44 @@ class HeartbeatContractTest(unittest.TestCase):
         self.assertEqual(ctx.get("mode"), "idle")
         self.assertIn("lag_seconds", ctx)
         self.assertIn("session", ctx)
+
+    def test_price_stream_metadata_present_in_stream_context(self) -> None:
+        fx = FakeForexConnect(_make_sample_df(self.fixed_now - dt.timedelta(minutes=5), 5))
+        redis_client = FakeRedis()
+        heartbeat_channel = "fxcm:test:heartbeat"
+
+        class DummyPriceStream:
+            def snapshot_metadata(self) -> dict[str, Any]:
+                return {"channel": "fxcm:test:ticks", "symbols": ["XAUUSD"], "interval_seconds": 1.0}
+
+        dummy_stream = DummyPriceStream()
+
+        with mock.patch("connector._now_utc", return_value=self.fixed_now), mock.patch(
+            "connector.is_trading_time", return_value=True
+        ), mock.patch("connector.resolve_session", return_value=_make_session_match(self.fixed_now)):
+            stream_fx_data(
+                cast(connector.ForexConnect, fx),
+                redis_client=redis_client,
+                poll_seconds=0,
+                publish_interval_seconds=0,
+                lookback_minutes=5,
+                config=[("XAU/USD", "m1")],
+                cache_manager=None,
+                max_cycles=1,
+                heartbeat_channel=heartbeat_channel,
+                price_stream=dummy_stream,  # type: ignore[arg-type]
+            )
+
+        heartbeat_messages = [
+            json.loads(payload)
+            for channel, payload in redis_client.messages
+            if channel == heartbeat_channel
+        ]
+        self.assertTrue(heartbeat_messages)
+        last_msg = heartbeat_messages[-1]
+        ctx = last_msg["context"]
+        self.assertIn("price_stream", ctx)
+        self.assertEqual(ctx["price_stream"]["channel"], "fxcm:test:ticks")
 
 
 class ReconnectLogicTest(unittest.TestCase):
@@ -439,6 +589,210 @@ class ReconnectLogicTest(unittest.TestCase):
         self.assertEqual(reconnect_calls["count"], 1)
         self.assertFalse(flaky_redis.messages)
         self.assertGreater(len(replacement_redis.messages), 0)
+
+    def test_fx_session_observer_invoked_on_reconnect(self) -> None:
+        fx_initial = FakeForexConnect(_make_sample_df(self.fixed_now - dt.timedelta(minutes=5), 3))
+        fx_replacement = FakeForexConnect(_make_sample_df(self.fixed_now - dt.timedelta(minutes=5), 3))
+        redis_client = FakeRedis()
+        observer_calls: list[connector.ForexConnect] = []
+
+        def observer(client: connector.ForexConnect) -> None:
+            observer_calls.append(client)
+
+        fx_reconnector = mock.Mock(return_value=cast(connector.ForexConnect, fx_replacement))
+
+        side_effects = [connector.FXCMRetryableError("fx down"), pd.DataFrame()]
+
+        with mock.patch("connector._fetch_and_publish_recent", side_effect=side_effects), mock.patch(
+            "connector._now_utc", return_value=self.fixed_now
+        ), mock.patch("connector.is_trading_time", return_value=True):
+            stream_fx_data(
+                cast(connector.ForexConnect, fx_initial),
+                redis_client=redis_client,
+                poll_seconds=0,
+                publish_interval_seconds=0,
+                lookback_minutes=5,
+                config=[("XAU/USD", "m1")],
+                cache_manager=None,
+                max_cycles=1,
+                fx_reconnector=fx_reconnector,
+                fx_session_observer=observer,
+            )
+
+        self.assertEqual(fx_reconnector.call_count, 1)
+        self.assertGreaterEqual(len(observer_calls), 2)
+        self.assertIs(observer_calls[0], fx_initial)
+        self.assertIs(observer_calls[-1], fx_replacement)
+
+
+class AsyncSupervisorTest(unittest.TestCase):
+    def setUp(self) -> None:
+        connector._LAST_MARKET_STATUS = None
+        connector._LAST_MARKET_STATUS_TS = None
+        self.redis = FakeRedis()
+        self.gate = PublishDataGate()
+        self.supervisor = AsyncStreamSupervisor(
+            redis_supplier=lambda: self.redis,
+            data_gate=self.gate,
+            heartbeat_channel="fxcm:test:heartbeat",
+            price_channel="fxcm:test:ticks",
+        )
+        self.supervisor.start()
+
+    def tearDown(self) -> None:
+        self.supervisor.stop()
+
+    @staticmethod
+    def _wait_for(predicate: Callable[[], bool], timeout: float = 2.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_supervisor_publishes_ohlcv_batches(self) -> None:
+        fixed_now = dt.datetime(2025, 5, 6, 12, 0, tzinfo=dt.timezone.utc)
+        df = _make_sample_df(fixed_now - dt.timedelta(minutes=3), 3)
+        normalized = connector._normalize_history_to_ohlcv(df, "XAU/USD", "1m")
+        batch = OhlcvBatch(
+            symbol="XAUUSD",
+            timeframe="1m",
+            data=normalized,
+            fetched_at=time.time(),
+            source="test",
+        )
+
+        self.supervisor.submit_ohlcv_batch(batch)
+
+        self.assertTrue(
+            self._wait_for(
+                lambda: any(channel == connector.REDIS_CHANNEL for channel, _ in self.redis.messages)
+            )
+        )
+        payloads = [
+            json.loads(payload)
+            for channel, payload in self.redis.messages
+            if channel == connector.REDIS_CHANNEL
+        ]
+        self.assertTrue(payloads)
+        last = payloads[-1]
+        self.assertEqual(last["symbol"], "XAUUSD")
+        self.assertEqual(len(last["bars"]), len(normalized))
+
+    def test_supervisor_publishes_heartbeat_and_status(self) -> None:
+        heartbeat = HeartbeatEvent(
+            state="stream",
+            last_bar_close_ms=111,
+            next_open=None,
+            sleep_seconds=None,
+            context={"channel": "fxcm:test:heartbeat"},
+        )
+        self.supervisor.submit_heartbeat(heartbeat)
+        status_event = MarketStatusEvent(state="open", next_open=None)
+        self.supervisor.submit_market_status(status_event)
+
+        self.assertTrue(
+            self._wait_for(
+                lambda: any(channel == "fxcm:test:heartbeat" for channel, _ in self.redis.messages)
+            )
+        )
+        self.assertTrue(
+            self._wait_for(
+                lambda: any(channel == connector.REDIS_STATUS_CHANNEL for channel, _ in self.redis.messages)
+            )
+        )
+
+    def test_supervisor_publishes_price_snapshots(self) -> None:
+        snap = PriceTickSnap(
+            symbol="XAUUSD",
+            bid=2010.1,
+            ask=2010.3,
+            mid=2010.2,
+            tick_ts=1_700_000_000.0,
+            snap_ts=1_700_000_003.0,
+        )
+        self.supervisor.submit_price_snapshot(snap)
+        self.assertTrue(
+            self._wait_for(
+                lambda: any(channel == "fxcm:test:ticks" for channel, _ in self.redis.messages)
+            )
+        )
+
+    def test_diagnostics_snapshot_exposes_metrics(self) -> None:
+        diag = self.supervisor.diagnostics_snapshot()
+
+        self.assertTrue(diag)
+        self.assertIn("publish_counts", diag)
+        self.assertEqual(diag.get("backpressure_events"), 0)
+        metrics = diag.get("metrics")
+        self.assertIsInstance(metrics, dict)
+        self.assertIn("publishes_total", metrics)
+        self.assertIn("queue_depth_total", metrics)
+
+
+class OfferSubscriptionFallbackTest(unittest.TestCase):
+    def test_fallback_listener_used_when_common_missing(self) -> None:
+        class DummyListenerBase:
+            def __init__(self) -> None:
+                pass
+
+        dummy_fxcorepy = types.SimpleNamespace(
+            O2GTableType=types.SimpleNamespace(OFFERS="OFFERS"),
+            O2GTableUpdateType=types.SimpleNamespace(INSERT="insert", UPDATE="update"),
+            AO2GTableListener=DummyListenerBase,
+        )
+
+        class DummyOffersTable:
+            def __init__(self) -> None:
+                self.subscriptions: list[tuple[Any, Any]] = []
+
+            def subscribe_update(self, update_type: Any, listener: Any) -> None:
+                self.subscriptions.append((update_type, listener))
+
+            def unsubscribe_update(self, update_type: Any, listener: Any) -> None:
+                self.subscriptions.remove((update_type, listener))
+
+        class DummyManager:
+            def __init__(self, table: DummyOffersTable) -> None:
+                self._table = table
+
+            def get_table(self, _table_id: Any) -> DummyOffersTable:
+                return self._table
+
+        class DummyFx:
+            def __init__(self, table: DummyOffersTable) -> None:
+                self.table_manager = DummyManager(table)
+
+        offers_table = DummyOffersTable()
+        fx = DummyFx(offers_table)
+        old_common = connector.Common
+        old_fxcorepy = connector.fxcorepy
+        had_offers_attr = hasattr(connector.ForexConnect, "OFFERS")
+        old_offers_attr = getattr(connector.ForexConnect, "OFFERS", None)
+        try:
+            connector.Common = None
+            connector.fxcorepy = dummy_fxcorepy
+            connector.ForexConnect.OFFERS = "OFFERS"
+            subscription = connector.FXCMOfferSubscription(  # type: ignore[arg-type]
+                fx,
+                symbols=["XAU/USD"],
+                on_tick=lambda *_: None,
+            )
+            self.assertTrue(subscription._active)
+            self.assertEqual(len(offers_table.subscriptions), 2)
+            subscription.close()
+            self.assertFalse(offers_table.subscriptions)
+        finally:
+            connector.Common = old_common
+            connector.fxcorepy = old_fxcorepy
+            if had_offers_attr:
+                connector.ForexConnect.OFFERS = old_offers_attr
+            else:
+                try:
+                    delattr(connector.ForexConnect, "OFFERS")
+                except AttributeError:
+                    pass
 
 
 class FileOnlyModeTest(unittest.TestCase):

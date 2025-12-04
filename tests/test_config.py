@@ -90,6 +90,21 @@ class BackoffConfigTest(unittest.TestCase):
         self.assertEqual(cfg_override.poll_seconds, 3)
         self.assertEqual(cfg_override.publish_interval_seconds, 9)
 
+    def test_price_stream_settings_defaults_and_override(self) -> None:
+        cfg_default = self._load_with_payload({})
+        self.assertEqual(cfg_default.price_stream.channel, config.PRICE_SNAPSHOT_CHANNEL_DEFAULT)
+        self.assertAlmostEqual(cfg_default.price_stream.interval_seconds, 3.0)
+
+        runtime_payload = {
+            "stream": {
+                "price_snap_channel": "fxcm:test:price",
+                "price_snap_interval_seconds": 1.25,
+            }
+        }
+        cfg_override = self._load_with_payload(runtime_payload)
+        self.assertEqual(cfg_override.price_stream.channel, "fxcm:test:price")
+        self.assertAlmostEqual(cfg_override.price_stream.interval_seconds, 1.25)
+
     def test_redis_required_flag_respects_env_override(self) -> None:
         cfg_default = self._load_with_payload({})
         self.assertTrue(cfg_default.redis_required)

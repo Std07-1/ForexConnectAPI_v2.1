@@ -3,6 +3,9 @@
 import time
 
 import pytest
+from rich.console import Console
+from rich.layout import Layout
+from rich.panel import Panel
 
 from tools import debug_viewer as dv
 
@@ -135,4 +138,136 @@ def test_incident_feed_tracks_issue_transitions() -> None:
 
     assert len(state.incident_feed) >= 2
     assert state.incident_feed[0]["active"] is False
+
+
+def test_note_heartbeat_tracks_supervisor_context() -> None:
+    state = dv.ViewerState()
+    diag = {
+        "state": "running",
+        "queues": [{"name": "ohlcv", "size": 2, "maxsize": 10, "processed": 5}],
+    }
+    heartbeat = {
+        "state": "stream",
+        "context": {"supervisor": diag},
+    }
+
+    state.note_heartbeat(heartbeat)
+
+    assert state.supervisor_diag == diag
+    assert state.supervisor_updated is not None
+
+
+def test_build_supervisor_mode_without_context() -> None:
+    state = dv.ViewerState()
+
+    result = dv.build_supervisor_mode(state)
+
+    assert isinstance(result, Panel)
+    renderable = getattr(result, "renderable", "")
+    assert "supervisor-контекст" in str(renderable)
+
+
+def test_build_supervisor_mode_with_context_returns_layout() -> None:
+    state = dv.ViewerState()
+    state.supervisor_updated = time.time()
+    state.supervisor_diag = {
+        "state": "running",
+        "loop_alive": True,
+        "queues": [
+            {
+                "name": "ohlcv",
+                "size": 3,
+                "maxsize": 10,
+                "processed": 120,
+                "last_enqueue_ts": time.time() - 1,
+            }
+        ],
+        "tasks": [
+            {
+                "name": "history_consumer",
+                "state": "running",
+                "processed": 200,
+                "idle_seconds": 0.5,
+            }
+        ],
+        "metrics": {
+            "total_enqueued": 10,
+            "total_processed": 9,
+            "total_dropped": 1,
+            "queue_depth_total": 3,
+            "publishes_total": 4,
+            "active_tasks": 1,
+            "task_errors": 0,
+        },
+        "publish_counts": {"ohlcv": 4},
+        "backpressure_events": 0,
+    }
+
+    result = dv.build_supervisor_mode(state)
+
+    assert isinstance(result, Layout)
+
+
+def test_build_supervisor_metrics_panel_renders_publish_totals(monkeypatch: pytest.MonkeyPatch) -> None:
+    diag = {
+        "metrics": {
+            "total_enqueued": 12,
+            "total_processed": 10,
+            "total_dropped": 2,
+            "queue_depth_total": 5,
+            "publishes_total": 20,
+            "active_tasks": 2,
+            "task_errors": 1,
+        },
+        "publish_counts": {"ohlcv": 15, "heartbeat": 5, "market_status": 2, "custom_sink": 1},
+        "backpressure_events": 3,
+    }
+    monkeypatch.setattr(dv, "SUPERVISOR_CHANNELS", ("ohlcv", "custom_sink"))
+    monkeypatch.setattr(dv, "SUPERVISOR_CHANNEL_HINTS", {"ohlcv": "Головний sink", "custom_sink": "Кастом"})
+
+    panel = dv.build_supervisor_metrics_panel(diag)
+
+    assert isinstance(panel, Panel)
+    console = Console(record=True, width=120)
+    console.print(panel)
+    render_str = console.export_text()
+    assert "Публікацій загалом" in render_str
+    assert "ohlcv" in render_str
+    assert "custom_sink" in render_str
+    assert "Кастом" in render_str
+
+
+def test_build_price_stream_panel_embeds_special_channels(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = dv.ViewerState()
+    now = time.time()
+    state.price_stream_updated = now
+    state.price_stream = {
+        "state": "ok",
+        "channel": "fxcm:price_tik",
+        "interval_seconds": 3.0,
+        "symbols_state": [
+            {
+                "symbol": "XAUUSD",
+                "mid": 4209.3,
+                "bid": 4209.1,
+                "ask": 4209.5,
+                "tick_age_seconds": 1.0,
+            }
+        ],
+    }
+    diag = {
+        "publish_counts": {"ohlcv": 12, "heartbeat": 4},
+    }
+    state.supervisor_diag = diag
+    state.supervisor_updated = now
+    monkeypatch.setattr(dv, "SUPERVISOR_CHANNELS", ("ohlcv",))
+    monkeypatch.setattr(dv, "SUPERVISOR_CHANNEL_HINTS", {"ohlcv": "Головний sink"})
+
+    panel = dv.build_price_stream_panel(state)
+
+    console = Console(record=True, width=120)
+    console.print(panel)
+    render_str = console.export_text()
+    assert "Спеціальні канали" in render_str
+    assert "ohlcv" in render_str
 

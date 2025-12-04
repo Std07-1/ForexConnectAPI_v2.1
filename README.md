@@ -19,6 +19,13 @@
 - `fxcm:ohlcv` — основні дані (із опційним HMAC-підписом `sig`).
 - `fxcm:market_status` — події `open/closed` з `next_open_utc`, `next_open_ms`, `next_open_in_seconds` та блоком `session` (таймзона, години роботи, перерви).
 - `fxcm:heartbeat` (налаштовується) — технічний стан процесу з розширеним `context` (канал, Redis-стан, лаг, стрім-таргети, причина паузи, тривалість циклу тощо).
+- `fxcm:price_tik` — снепшоти останнього bid/ask/mid по кожному символу зі штампами `tick_ts` (останній тик) та `snap_ts` (час формування пакета).
+
+  Формат повідомлення:
+
+  ```json
+  {"symbol":"XAUUSD","bid":2045.1,"ask":2045.3,"mid":2045.2,"tick_ts":1701600000.0,"snap_ts":1701600003.0}
+  ```
 
 Локальний файловий кеш (`cache/` або зовнішня директорія) мінімізує холодний старт, а Prometheus-метрики дають спостережність.
 
@@ -160,7 +167,9 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
     "fetch_interval_seconds": 5,
     "publish_interval_seconds": 5,
     "lookback_minutes": 5,
-    "config": "XAU/USD:m1,XAU/USD:m5, EUR/USD:m1,EUR/USD:m5"
+    "config": "XAU/USD:m1,XAU/USD:m5, EUR/USD:m1,EUR/USD:m5",
+    "price_snap_channel": "fxcm:price_tik",
+    "price_snap_interval_seconds": 3
   },
   "sample_request": {
     "symbol": "XAU/USD",
@@ -205,6 +214,7 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 
 - `stream.mode=0` → один warmup-прохід; `1` → нескінченний стрім.
 - `stream.config` приймає рядок або масив `{ "symbol": ..., "tf": ... }`.
+- `stream.price_snap_channel` задає Redis-канал для тик-снепшотів, а `stream.price_snap_interval_seconds` — інтервал між пакетами (3–5 с). Ці значення читає `PriceSnapshotWorker`, що агрегує OfferTable-тикі.
 - `cache.dir` можна винести у `/var/lib/fxcm_connector/<env>_cache` для продакшну.
 - `viewer.*` задає канали Redis та таймінги алертів для `tools/debug_viewer.py` (щоб не плодити ENV). Деталі: `docs/viewer.md`.
 - `backoff.*` контролюють експоненційні паузи для FXCM/Redis.
@@ -280,6 +290,7 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
   - `ai_one_fxcm_ohlcv_lag_seconds{symbol,tf}` — лаги, які бачить `tools/debug_viewer.py` під час читання Redis (див. `docs/viewer.md`).
   - `ai_one_fxcm_ohlcv_msg_age_seconds{symbol,tf}` — скільки триває тиша в каналі барів.
   - `ai_one_fxcm_ohlcv_gaps_total{symbol,tf}` — кількість інцидентів idle/lag із боку viewer.
+  - `context.price_stream` у heartbeat відображає стан каналу `fxcm:price_tik`: канал, інтервал публікації, перелік активних символів та `tick_silence_seconds` (час від останнього тика).
 
   ### 9.1 Контракти heartbeat та market-status
 
@@ -307,6 +318,14 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
       ],
       "published_bars": 2,
       "cache_enabled": true,
+      "price_stream": {
+        "channel": "fxcm:price_tik",
+        "symbols": ["XAUUSD", "EURUSD"],
+        "interval_seconds": 3.0,
+        "last_snap_ts": 1764541732000.0,
+        "last_tick_ts": 1764541731000.0,
+        "tick_silence_seconds": 0.9
+      },
       "session": {
         "tag": "LDN_METALS",
         "timezone": "Europe/London",
