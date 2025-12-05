@@ -1567,6 +1567,18 @@ def _calc_lag_seconds(last_close_ms: Optional[int]) -> Optional[float]:
     return max(0.0, now - last_close_ms / 1000.0)
 
 
+def _resolve_idle_sleep_seconds(
+    poll_seconds: int,
+    cadence_sleep_seconds: Optional[float],
+) -> float:
+    """Гарантує мінімальний idle-сон навіть при нульовому cadence."""
+
+    base_sleep = max(1.0, float(poll_seconds))
+    if cadence_sleep_seconds is None or cadence_sleep_seconds <= 0.0:
+        return base_sleep
+    return max(base_sleep, cadence_sleep_seconds)
+
+
 def _session_stats_snapshot() -> Optional[Dict[str, Any]]:
     if _SESSION_STATS_TRACKER is None:
         return None
@@ -3974,9 +3986,7 @@ def stream_fx_data(
                     next_open,
                     session_stats=stats_snapshot,
                 )
-                planned_sleep = (
-                    cadence_sleep_seconds if cadence_sleep_seconds is not None else float(poll_seconds)
-                )
+                planned_sleep = _resolve_idle_sleep_seconds(poll_seconds, cadence_sleep_seconds)
                 _emit_heartbeat_event(
                     state="idle",
                     last_bar_close_ms=last_published_close_ms,

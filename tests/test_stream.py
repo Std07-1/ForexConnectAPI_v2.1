@@ -1620,5 +1620,13 @@ class StatusSnapshotTest(unittest.TestCase):
         self.assertEqual(session.get("state"), "closed")
 
 
+class IdleSleepHelperTest(unittest.TestCase):
+    def test_idle_sleep_not_less_than_poll(self) -> None:
+        self.assertEqual(connector._resolve_idle_sleep_seconds(5, None), 5.0)
+        self.assertEqual(connector._resolve_idle_sleep_seconds(5, 0.0), 5.0)
+        self.assertEqual(connector._resolve_idle_sleep_seconds(5, -2.0), 5.0)
+        self.assertEqual(connector._resolve_idle_sleep_seconds(5, 7.5), 7.5)
+
+
 if __name__ == "__main__":
     unittest.main()
