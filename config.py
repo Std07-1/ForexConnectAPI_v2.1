@@ -14,6 +14,7 @@ CACHE_DEFAULT_MAX_BARS = 3_000  # Максимальна кількість ба
 CACHE_DEFAULT_WARMUP_BARS = 1_000  # Кількість барів для "прогріву" кешу
 METRICS_DEFAULT_PORT = 9200
 HEARTBEAT_DEFAULT_CHANNEL = "fxcm:heartbeat"
+STATUS_CHANNEL_DEFAULT = "fxcm:status"
 PRICE_SNAPSHOT_CHANNEL_DEFAULT = "fxcm:price_tik"
 CALENDAR_OVERRIDES_FILE = Path("config/calendar_overrides.json")
 RUNTIME_SETTINGS_FILE = Path("config/runtime_settings.json")
@@ -165,6 +166,7 @@ class ObservabilitySettings:
     metrics_enabled: bool
     metrics_port: int
     heartbeat_channel: str
+    status_channel: str
 
 
 @dataclass(frozen=True)
@@ -491,6 +493,15 @@ def load_config() -> FXCMConfig:
         hours=_coerce_int(sample_cfg.get("hours"), 24, min_value=1),
     )
 
+    status_channel_env = os.environ.get("FXCM_STATUS_CHANNEL")
+    status_channel: Optional[str]
+    if isinstance(status_channel_env, str) and status_channel_env.strip():
+        status_channel = status_channel_env.strip()
+    else:
+        status_cfg_raw = stream_cfg.get("status_channel")
+        status_channel = str(status_cfg_raw).strip() if isinstance(status_cfg_raw, str) else None
+    status_channel = status_channel or STATUS_CHANNEL_DEFAULT
+
     observability = ObservabilitySettings(
         metrics_enabled=_get_bool_env("FXCM_METRICS_ENABLED", True),
         metrics_port=_get_int_env(
@@ -502,6 +513,7 @@ def load_config() -> FXCMConfig:
             "FXCM_HEARTBEAT_CHANNEL",
             HEARTBEAT_DEFAULT_CHANNEL,
         ).strip(),
+        status_channel=status_channel,
     )
 
     calendar_settings = _load_calendar_settings()

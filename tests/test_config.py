@@ -105,6 +105,17 @@ class BackoffConfigTest(unittest.TestCase):
         self.assertEqual(cfg_override.price_stream.channel, "fxcm:test:price")
         self.assertAlmostEqual(cfg_override.price_stream.interval_seconds, 1.25)
 
+    def test_status_channel_defaults_and_override(self) -> None:
+        cfg_default = self._load_with_payload({})
+        self.assertEqual(cfg_default.observability.status_channel, config.STATUS_CHANNEL_DEFAULT)
+
+        runtime_payload = {"stream": {"status_channel": "fxcm:test:status"}}
+        cfg_runtime = self._load_with_payload(runtime_payload)
+        self.assertEqual(cfg_runtime.observability.status_channel, "fxcm:test:status")
+
+        cfg_env = self._load_with_payload({}, {"FXCM_STATUS_CHANNEL": "fxcm:env:status"})
+        self.assertEqual(cfg_env.observability.status_channel, "fxcm:env:status")
+
     def test_tick_cadence_defaults_and_override(self) -> None:
         cfg_default = self._load_with_payload({})
         self.assertAlmostEqual(cfg_default.tick_cadence.live_threshold_seconds, 30.0)

@@ -27,6 +27,7 @@ python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 | `4` | Потоки OHLCV (STREAMS). |
 | `5` | Live FXCM price (PRICE). |
 | `6` | Async supervisor (SUPERVISOR). |
+| `7` | History/backoff (HISTORY). |
 
 Меню відображається внизу інтерфейсу (`MENU_TEXT`). Поточний режим також видно у блоку "Monitor mode" в summary.
 
@@ -60,6 +61,8 @@ python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 ### 5. Live FXCM price
 
 - Панель `Live FXCM price` підтягує `price_stream` із heartbeat: стан воркера (`state`), канал, інтервал, queue depth, останні `snap_ts`/`tick_ts` і глобальний `tick_silence_seconds`.
+- Блок `Adaptive cadence` (Stage 3.3) витягує `context.tick_cadence`: показує поточний стан тиків (`prices`), стан history-полера (`history`), причину зміни cadence, множник, фактичний `tick_silence_seconds`, мінімальний `next wakeup` і таблицю cadence/next poll для кожного таймфрейму.
+- Рядок `Viewer snapshots` рахує, скільки публікацій `fxcm:price_tik` встиг побачити сам viewer від моменту запуску. Це значення також підтягується як fallback для блоку «Спеціальні канали», тому `price` видно навіть без supervisor publish_counts.
 - Таблиця нижче показує mid/bid/ask та `tick_age` для кожного символу (XAUUSD, EURUSD тощо) — це допомагає миттєво побачити, коли FXCM перестав присилати живі тики.
 - Натисни `5`, щоб перемикатися до цього режиму або повернутися назад через меню внизу.
 
@@ -71,6 +74,13 @@ python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 - Таблиця «Supervisor: черги» відображає глибину кожної sink-черги, місткість, відсоток заповнення, вік останнього enqueue та лічильники processed/dropped.
 - Таблиця «Supervisor: таски» показує стан кожного consumer-а (running/idle/error), кількість оброблених подій, помилки та час із моменту останньої активності.
 - Якщо heartbeat ще не містить `context.supervisor`, режим підказує ввімкнути `stream.async_supervisor`, щоб діагностика зʼявилася.
+
+### 7. History quota / Backoff
+
+- Режим HISTORY (клавіша `7`, Stage 3.1/3.2) ділиться на дві панелі: «Backoff diag» та «History quota».
+- «Backoff diag» читає `context.diag.backoff` із heartbeat і для кожного ключа (наприклад, `fxcm_history`, `redis_stream`) показує стан active/idle, `remaining_seconds`, `sleep_seconds`, лічильник збоїв і останню помилку з timestamp. Це прямий моніторинг Fxcm/Redis backoff-контролерів, тож можна побачити, хто саме притримує стрім.
+- «History quota» відображає `context.history`: бюджети `calls_60s/3600s`, кольоровий `throttle_state`, `next_slot_seconds`, останню причину deny та резерви для `history_priority_targets`. Окрема таблиця показує список пріоритетних таргетів і лічильник `skipped_polls` по символах/TF, що допомагає перевірити fairness та резерв Stage 3.1.
+- Якщо будь-який блок ще не прийшов у heartbeat, панель показує жовтий хінт із часом останнього оновлення, щоби швидко діагностувати відсутність телеметрії.
 
 ## Інциденти та алерти
 
@@ -105,24 +115,41 @@ Viewer відстежує кілька ключових ситуацій:
 
 фрагмент:
 
-'''
-   "viewer": {
-     "heartbeat_channel": "fxcm:heartbeat",
-     "market_status_channel": "fxcm:market_status",
-     "ohlcv_channel": "fxcm:ohlcv",
-     "redis_health_interval_seconds": 30,
-     "lag_spike_threshold_seconds": 60,
-     "heartbeat_alert_seconds": 45,
-     "ohlcv_msg_idle_warn_seconds": 90,
-     "ohlcv_msg_idle_error_seconds": 180,
-     "ohlcv_lag_warn_seconds": 45,
-     "ohlcv_lag_error_seconds": 120,
-     "timeline_matrix_rows": 10,
-     "timeline_max_columns": 120,
-     "timeline_history_max": 5000,
-     "timeline_focus_minutes": 30
-   }
-'''
+```json
+  "viewer": {
+    "heartbeat_channel": "fxcm:heartbeat",
+    "market_status_channel": "fxcm:market_status",
+    "ohlcv_channel": "fxcm:ohlcv",
+    "redis_health_interval": 8,
+    "lag_spike_threshold": 180,
+    "heartbeat_alert_seconds": 45,
+    "ohlcv_msg_idle_warn_seconds": 90,
+    "ohlcv_msg_idle_error_seconds": 180,
+    "ohlcv_lag_warn_seconds": 45,
+    "ohlcv_lag_error_seconds": 120,
+    "timeline_matrix_rows": 10,
+    "timeline_max_columns": 120,
+    "timeline_history_max": 2400,
+    "timeline_focus_minutes": 30,
+    "supervisor_channels": ["ohlcv", "heartbeat", "price"],
+    "supervisor_channel_hints": {
+      "price": "fxcm:price_tik pipeline"
+    }
+  }
+```
+
+## Публічний статус-канал `fxcm:status`
+
+Конектор відтепер транслює окремий канал `fxcm:status` з агрегованим станом (`process`, `market`, `price`, `ohlcv`, `session`, `note`). Він призначений для сторонніх таблиць/дашбордів і дублюється кожного разу, коли оновлюється heartbeat або market_status. Viewer НЕ підписується на цей канал, аби не дублювати інформацію: усі діагностичні панелі й далі читають сирі `heartbeat`, `market_status`, `ohlcv`. Якщо потрібен публічний зріз, клієнт може просто показати:
+
+- `process`: stream/idle/sleep/error;
+- `market`: open/closed/unknown;
+- `price`: ok/stale/down (по снепшотам `fxcm:price_tik`);
+- `ohlcv`: ok/delayed/down (за лагом барів);
+- `session`: людське ім'я + таймери `seconds_to_close`/`seconds_to_next_open`;
+- `note`: короткий текст (`ok`, `idle: calendar_closed`, `backoff FXCM 30s`, ...).
+
+Канал можна перейменувати через `FXCM_STATUS_CHANNEL` або `stream.status_channel`, але він завжди залишається «публічним» SPI для консюмерів, тоді як всі інші канали (`fxcm:heartbeat`, `fxcm:market_status`, `fxcm:ohlcv`) залишаються внутрішніми для AiOne/SMC та viewer.
 
 ### TF-специфічні пороги
 

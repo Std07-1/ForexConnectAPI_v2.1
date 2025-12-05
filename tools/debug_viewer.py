@@ -31,7 +31,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from dotenv import load_dotenv
 from rich import box
@@ -341,6 +341,8 @@ class ViewerState:
     incident_feed: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=24))
     price_stream: Dict[str, Any] = field(default_factory=dict)
     price_stream_updated: Optional[float] = None
+    price_snapshot_total: int = 0
+    price_last_snap_ts: Optional[float] = None
     tick_silence_seconds: Optional[float] = None
     supervisor_diag: Dict[str, Any] = field(default_factory=dict)
     supervisor_updated: Optional[float] = None
@@ -348,6 +350,8 @@ class ViewerState:
     history_quota_updated: Optional[float] = None
     backoff_diag: Dict[str, Any] = field(default_factory=dict)
     backoff_diag_updated: Optional[float] = None
+    tick_cadence: Dict[str, Any] = field(default_factory=dict)
+    tick_cadence_updated: Optional[float] = None
 
     def note_heartbeat(self, payload: Dict[str, Any]) -> None:
         self.last_heartbeat = payload
@@ -364,10 +368,17 @@ class ViewerState:
         self.tick_silence_seconds = _coerce_float(context.get("tick_silence_seconds"))
         price_ctx = context.get("price_stream")
         if isinstance(price_ctx, dict):
-            self.price_stream = price_ctx
-            self.price_stream_updated = now_ts
+            self._update_price_stream(price_ctx, now_ts)
         else:
             self.price_stream = {}
+            self.price_stream_updated = None
+        tick_cadence_ctx = context.get("tick_cadence")
+        if isinstance(tick_cadence_ctx, dict):
+            self.tick_cadence = tick_cadence_ctx
+            self.tick_cadence_updated = now_ts
+        else:
+            self.tick_cadence = {}
+            self.tick_cadence_updated = None
         supervisor_ctx = None
         for key in ("supervisor", "async_supervisor"):
             candidate = context.get(key)
@@ -659,6 +670,31 @@ class ViewerState:
         if self.last_heartbeat_ts is None:
             return None
         return max(0.0, time.time() - self.last_heartbeat_ts)
+
+    def _update_price_stream(self, payload: Dict[str, Any], now_ts: float) -> None:
+        self.price_stream = payload
+        self.price_stream_updated = now_ts
+        last_snap_ts = _coerce_float(payload.get("last_snap_ts"))
+        if last_snap_ts is None:
+            return
+        if self.price_last_snap_ts is None:
+            self.price_last_snap_ts = last_snap_ts
+            return
+        if last_snap_ts <= self.price_last_snap_ts:
+            self.price_last_snap_ts = last_snap_ts
+            return
+        symbols_state = payload.get("symbols_state")
+        symbols_count = 0
+        if isinstance(symbols_state, list):
+            symbols_count = len([entry for entry in symbols_state if isinstance(entry, dict)])
+        if symbols_count <= 0:
+            symbols = payload.get("symbols")
+            if isinstance(symbols, list):
+                symbols_count = len(symbols)
+        if symbols_count <= 0:
+            symbols_count = _coerce_int(payload.get("symbols_count"), 1, min_value=1) or 1
+        self.price_snapshot_total += symbols_count
+        self.price_last_snap_ts = last_snap_ts
 
 
 def _iso_to_epoch(value: Optional[str]) -> float:
@@ -1722,12 +1758,15 @@ def _build_publish_counts_table(diag: Dict[str, Any]) -> Table:
     return table
 
 
-def build_supervisor_special_channels_panel(diag: Dict[str, Any]) -> Optional[Panel]:
-    if not SUPERVISOR_CHANNELS:
+def build_supervisor_special_channels_panel(
+    diag: Dict[str, Any],
+    fallback_counts: Optional[Mapping[str, float]] = None,
+) -> Optional[Panel]:
+    if not SUPERVISOR_CHANNELS or not diag:
         return None
-    publish_counts = diag.get("publish_counts") if isinstance(diag.get("publish_counts"), dict) else None
-    if not publish_counts:
-        return None
+    publish_counts_raw = diag.get("publish_counts")
+    publish_counts = publish_counts_raw if isinstance(publish_counts_raw, dict) else {}
+    fallback_counts = fallback_counts or {}
     table = Table(box=box.SIMPLE_HEAD, expand=True)
     table.add_column("Спеціальний канал", style="bold", overflow="fold")
     table.add_column("Публікацій", justify="right", overflow="fold")
@@ -1735,6 +1774,8 @@ def build_supervisor_special_channels_panel(diag: Dict[str, Any]) -> Optional[Pa
     has_rows = False
     for channel in SUPERVISOR_CHANNELS:
         count_value = _coerce_float(publish_counts.get(channel)) if publish_counts else None
+        if count_value is None and fallback_counts:
+            count_value = _coerce_float(fallback_counts.get(channel))
         if count_value is None:
             count_value = 0.0
         table.add_row(
@@ -2006,6 +2047,88 @@ def build_backoff_panel(state: ViewerState) -> Panel:
     return Panel(Group(*extras), title="Backoff diag", border_style="magenta", box=box.ROUNDED)
 
 
+def build_tick_cadence_panel(state: ViewerState) -> Optional[Panel]:
+    data = state.tick_cadence or {}
+    updated_age = None
+    if state.tick_cadence_updated is not None:
+        updated_age = max(0.0, time.time() - state.tick_cadence_updated)
+    if not data:
+        return None
+
+    summary = Table.grid(padding=(0, 1))
+    summary.add_column(style="bold cyan", justify="right", overflow="fold")
+    summary.add_column(overflow="fold")
+
+    price_state = str(data.get("state", "?"))
+    price_color = {
+        "ok": "green",
+        "lag": "yellow",
+        "stale": "red",
+    }.get(price_state.lower(), "cyan")
+    summary.add_row("Prices", Text(price_state, style=f"bold {price_color}"))
+
+    history_state = str(data.get("history_state", "?"))
+    history_color = {
+        "active": "green",
+        "paused": "yellow",
+    }.get(history_state.lower(), "cyan")
+    summary.add_row("History", Text(history_state, style=f"bold {history_color}"))
+
+    reason = data.get("reason")
+    if reason:
+        summary.add_row("Reason", str(reason))
+
+    multiplier = _coerce_float(data.get("multiplier"))
+    summary.add_row("Multiplier", _format_float(multiplier, digits=2))
+
+    silence = _coerce_float(data.get("tick_silence_seconds"))
+    if silence is None:
+        silence = state.tick_silence_seconds
+    summary.add_row("Tick silence", _format_diag_duration(silence))
+
+    next_map = data.get("next_poll_in_seconds") if isinstance(data.get("next_poll_in_seconds"), Mapping) else {}
+    next_values: List[float] = []
+    if isinstance(next_map, Mapping):
+        for value in next_map.values():
+            parsed = _coerce_float(value)
+            if parsed is not None:
+                next_values.append(max(0.0, parsed))
+    if next_values:
+        summary.add_row("Next wakeup", _format_diag_duration(min(next_values)))
+
+    if updated_age is not None:
+        summary.add_row("Updated", _format_diag_duration(updated_age))
+
+    cadence_map = data.get("cadence_seconds") if isinstance(data.get("cadence_seconds"), Mapping) else {}
+    tf_keys: List[str] = []
+    if isinstance(cadence_map, Mapping):
+        tf_keys.extend(str(key) for key in cadence_map.keys())
+    if isinstance(next_map, Mapping):
+        tf_keys.extend(str(key) for key in next_map.keys())
+    tf_unique = sorted(set(filter(None, tf_keys)))
+
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("TF", style="bold", overflow="fold")
+    table.add_column("Cadence (s)", justify="right", overflow="fold")
+    table.add_column("Next poll (s)", justify="right", overflow="fold")
+
+    if not tf_unique:
+        table.add_row("—", "—", "—")
+    else:
+        cadence_values = cadence_map if isinstance(cadence_map, Mapping) else {}
+        for tf in tf_unique:
+            cadence_value = _coerce_float(cadence_values.get(tf)) if cadence_values else None
+            next_value = _coerce_float(next_map.get(tf)) if isinstance(next_map, Mapping) else None
+            table.add_row(
+                tf,
+                _format_diag_duration(cadence_value),
+                _format_diag_duration(next_value),
+            )
+
+    body = Group(summary, table)
+    return Panel(body, title="Adaptive cadence", border_style="cyan", box=box.ROUNDED)
+
+
 def build_price_stream_panel(state: ViewerState) -> Panel:
     data = state.price_stream or {}
     symbols_state = data.get("symbols_state") if isinstance(data, dict) else None
@@ -2041,6 +2164,7 @@ def build_price_stream_panel(state: ViewerState) -> Panel:
     summary.add_row("Thread", _format_bool(data.get("thread_alive")))
     summary.add_row("Last snap", _format_diag_timestamp(data.get("last_snap_ts")))
     summary.add_row("Last tick", _format_diag_timestamp(data.get("last_tick_ts")))
+    summary.add_row("Viewer snapshots", _format_int_value(float(state.price_snapshot_total)))
     if updated_age is not None:
         summary.add_row("Updated", _format_diag_duration(updated_age))
 
@@ -2081,8 +2205,13 @@ def build_price_stream_panel(state: ViewerState) -> Panel:
                 _format_diag_duration(item.get("age")),
             )
 
-    extras: List[Any] = [summary, rows_table]
-    special_panel = build_supervisor_special_channels_panel(state.supervisor_diag)
+    extras: List[Any] = [summary]
+    cadence_panel = build_tick_cadence_panel(state)
+    if cadence_panel is not None:
+        extras.append(cadence_panel)
+    extras.append(rows_table)
+    fallback_counts: Optional[Mapping[str, float]] = {"price": float(state.price_snapshot_total)}
+    special_panel = build_supervisor_special_channels_panel(state.supervisor_diag, fallback_counts=fallback_counts)
     if special_panel is not None:
         extras.append(special_panel)
     content = Group(*extras)

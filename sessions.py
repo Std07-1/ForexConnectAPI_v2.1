@@ -401,8 +401,6 @@ def is_trading_time(ts: dt.datetime) -> bool:
 
     weekday_open = local_open_dt.weekday()
     time_open = local_open_dt.time()
-    if weekday_open == 5:
-        return False
     if weekday_open == 6 and time_open < _WEEKLY_OPEN_TIME:
         return False
 

@@ -2,7 +2,7 @@
 
 > Легковаговий стрімер OHLCV барів із FXCM (ForexConnect API) до Redis з валідацією HMAC, файловим кешем та продакшн-орієнтованим моніторингом.
 
-**Версія 2.2 · 03 грудня 2025**
+**Версія 2.3 · 05 грудня 2025**
 
 - Redis-повідомлення `fxcm:ohlcv` підписуються HMAC і перевіряються `fxcm_ingestor` перед записом у UnifiedStore.
 - Idle-heartbeat підтягує останній close з кешу, тож UI бачить лаг і `next_open` навіть коли ринок спить.
@@ -12,6 +12,14 @@
 
 ---
 
+## Що нового (Stage 3 · грудень 2025)
+
+Stage 3 закрито повністю: усі три підпроекти пройшли рев'ю, мають тести й описані контракти.
+
+- **Stage 3.1 — HistoryQuota / неблокуючий throttle.** Квоти на `get_history` тепер запобігають бурстам без зупинки стріму: ковзні вікна, `history_priority_targets`, мінімальні інтервали по TF та резерв пріоритетів конфігуруються у `runtime_settings.json`, а телеметрія (`context.history`, viewer HIST-панель) показує `throttle_state`, причини deny й `skipped_polls`.
+- **Stage 3.2 — Backoff для FXCM / Redis.** FxcmBackoffController і Redis-backoff сповільнюють лише проблемні підсистеми: history-полер чекає без блокування heartbeat, supervisor паузить publish-и при помилках Redis, а стан видно у `diag.backoff` і viewer Backoff-панелі. Тести покривають state/ceil та інтеграцію в стрім.
+- **Stage 3.3 — Tick-driven cadence + auto-sleep.** TickCadenceController підлаштовує `poll_seconds` і `sleep_seconds` під реальну тикову активність: режими live/idle, множники та причини (`reason`) передаються в heartbeat (`context.tick_cadence`) і виводяться у viewer (Adaptive cadence у PRICE/SUPR). HistoryQuota працює поверх адаптивного cadence, а fairness-планувальник гарантує, що жоден TF чи символ не голодує навіть під високим навантаженням, тож latency <200 мс/бар зберігається без ручних втручань.
+
 ## 1. Призначення
 
 Конектор логіниться в FXCM через ForexConnect, витягує OHLCV-бари, нормалізує їх до AiOne_t-схеми та транслює у Redis:
@@ -20,6 +28,7 @@
 - `fxcm:market_status` — події `open/closed` з `next_open_utc`, `next_open_ms`, `next_open_in_seconds` та блоком `session` (таймзона, години роботи, перерви).
 - `fxcm:heartbeat` (налаштовується) — технічний стан процесу з розширеним `context` (канал, Redis-стан, лаг, стрім-таргети, причина паузи, тривалість циклу тощо).
 - `fxcm:price_tik` — снепшоти останнього bid/ask/mid по кожному символу зі штампами `tick_ts` (останній тик) та `snap_ts` (час формування пакета).
+- `fxcm:status` — публічний агрегований стан для зовнішніх систем (process / market / price / ohlcv / session / note), щоб консюмери бачили готовність конектора без знання heartbeat.
 
   Формат повідомлення:
 
@@ -28,6 +37,54 @@
   ```
 
 Локальний файловий кеш (`cache/` або зовнішня директорія) мінімізує холодний старт, а Prometheus-метрики дають спостережність.
+
+### 1.1 Контракти каналів (зведено)
+
+| Канал | Producer | Частота | Основні поля |
+| --- | --- | --- | --- |
+| `fxcm:ohlcv` | `connector.publish_ohlcv_to_redis` | За кожен цикл per `stream.config` | `symbol`, `tf`, `bars` (масив `open_time/close_time/open/high/low/close/volume` у мс, float), опційно `sig` (HMAC). |
+| `fxcm:market_status` | `_publish_market_status` | При зміні стану або раз на ≤30 c | `type="market_status"`, `state=open|closed`,`ts`,`next_open_{utc,ms,in_seconds}`,`session` (тег, таймзона, вікна, статистика). |
+| `fxcm:heartbeat` | `_publish_heartbeat` / AsyncSupervisor | Кожен цикл + idle/ warmup | `type="heartbeat"`, `state`, `last_bar_close_ms`, `sleep_seconds`, `context` (Redis, `stream_targets`, `lag_seconds`, `context.history`, `context.tick_cadence`, `context.diag.backoff`, `session`). |
+| `fxcm:price_tik` | `PriceSnapshotWorker` | Кожні `stream.price_snap_interval_seconds` сек | `symbol`, `bid`, `ask`, `mid`, `tick_ts`, `snap_ts`; канал вказаний у `stream.price_snap_channel`. |
+| `fxcm:status` | `_publish_public_status` | Разом із heartbeat/market_status (~5–10 с) | `ts`, `process`, `market`, `price`, `ohlcv`, `session`, `note`; призначений для зовнішніх споживачів (див. §1.2). |
+
+> Детальні JSON-приклади для heartbeat/market-status див. §9.1, а інгістор очікує рівно ці ключі під час HMAC-перевірки.
+
+### 1.2 Публічний статус-канал `fxcm:status`
+
+Для зовнішніх систем тепер достатньо трьох підписок: `fxcm:ohlcv` (бари), `fxcm:price_tik` (жива ціна) і `fxcm:status` (агрегований стан). Канал `fxcm:status` оновлюється разом із heartbeat/market_status приблизно щоп'ять секунд і містить лише «людські» поля, без внутрішніх діагностичних дрібниць:
+
+```json
+{
+  "ts": 1764867000.0,
+  "process": "stream",
+  "market": "open",
+  "price": "ok",
+  "ohlcv": "ok",
+  "session": {
+    "name": "Tokyo",
+    "tag": "TOKYO",
+    "state": "open",
+    "current_open_utc": "2025-12-05T00:00:00Z",
+    "current_close_utc": "2025-12-05T09:00:00Z",
+    "next_open_utc": "2025-12-05T09:00:00Z",
+    "seconds_to_close": 5400,
+    "seconds_to_next_open": 5400
+  },
+  "note": "ok"
+}
+```
+
+- `process`: `stream` (активний стрім), `idle` (ринок тихий), `sleep` (авто-сон поза сесією), `error` (критична помилка).
+- `market`: `open`, `closed`, `unknown` (якщо ще не отримали FXCM статус).
+- `price`: `ok`, `stale` (тиків давно не було), `down` (price feed відсутній).
+- `ohlcv`: `ok`, `delayed` (лаг >60 с), `down` (барів немає або процес у паузі).
+- `session`: структурований зріз активної сесії (людська назва, тег, відкриття/закриття, таймери до подій).
+- `note`: короткий текст для людей: `ok`, `idle: calendar_closed`, `backoff FXCM 30s`, `price stale` тощо.
+
+Канал можна перевизначити через `FXCM_STATUS_CHANNEL` або `stream.status_channel` у `runtime_settings.json`; дефолт — `fxcm:status`. Усі інші розширені поля (`heartbeat.context`, `diag.backoff`, `history`) залишаються внутрішнім контрактом AiOne/SMC і не потрібні стороннім споживачам.
+
+> **Обов'язкове ознайомлення:** перед підпискою сторонніх систем прочитай `docs/fxcm_status.md`. Файл містить повний опис полів, допустимі стани та приклади споживачів, тож інтеграція без нього вважається порушенням контракту каналу `fxcm:status`.
 
 ## 2. Можливості
 
@@ -111,6 +168,7 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 | `FXCM_METRICS_ENABLED` | `1` | Вмикає Prometheus-server. |
 | `FXCM_METRICS_PORT` | `9200` | Порт `/metrics`. |
 | `FXCM_HEARTBEAT_CHANNEL` | `fxcm:heartbeat` | Куди шлеться heartbeat. |
+| `FXCM_STATUS_CHANNEL` | `fxcm:status` | Канал публічного статусу (process/market/price/ohlcv/session). |
 | `FXCM_SESSION_TAG` | `AUTO` | Якщо `AUTO` — тег визначається за `session_windows`; можна вказати фіксований (наприклад, `LDN_METALS`). |
 | `FXCM_HMAC_SECRET` | – | Секрет для `sig`. Якщо задано — `fxcm_ingestor` вимагає підпис. |
 | `FXCM_HMAC_ALGO` | `sha256` | Алгоритм (`sha256`, `sha512`, ...). |
@@ -171,6 +229,7 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
     "config": "XAU/USD:m1,XAU/USD:m5, EUR/USD:m1,EUR/USD:m5",
     "price_snap_channel": "fxcm:price_tik",
     "price_snap_interval_seconds": 3,
+    "status_channel": "fxcm:status",
     "history_max_calls_per_min": 360,
     "history_max_calls_per_hour": 7200,
     "history_min_interval_seconds_m1": 2,
@@ -260,6 +319,18 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 - `history_load_thresholds` тепер джерело правди для порогів завантаження (`min_interval`, `warn`, `reserve`, `critical`).
 - Значення автоматично обрізаються до `[0,1]`, тож став пороги у порядку зростання, щоб уникати неочікуваної поведінки (`min_interval ≤ warn ≤ reserve ≤ critical ≤ 1`).
 - У heartbeat (`context.history`) відображаються `last_denied_reason`, `skipped_polls` і `throttle_state`, що допомагає тестувати різні конфіги в реальному часі.
+
+#### 6.2.2 Stage 3.2 — Backoff FXCM / Redis
+
+- `stream.history_backoff` та `stream.redis_backoff` — конфіг для `FxcmBackoffController` та supervisor-паблішера (експоненційні паузи з `base_seconds`, `max_seconds`, `multiplier`, `jitter`). При фейлі history `_fetch_and_publish_recent` просто пропускає ітерацію до `next_history_allowed_ts`, тож heartbeat/price_stream не зупиняються; при збоях Redis supervisor ставить `redis_paused_until`, але таски лишаються живими.
+- Heartbeat `context.diag.backoff.<key>` показує `active`, `sleep_seconds`, `fail_count`, `last_error_type/ts`, а viewer (PRICE/HISTORY режими) рендерить Backoff-панель з тими самими даними. Це дає прозору діагностику для FXCM/Redis без копання в логи.
+- Юніт- та інтеграційні тести (`tests/test_stream.py`, `tests/test_config.py`) накривають cap на `max_seconds`, reset після `success()`, а також перевіряють, що heartbeat не мовчить під час backoff.
+
+#### 6.2.3 Stage 3.3 — Tick-driven cadence та auto-sleep
+
+- `TickCadenceTuning` / `TickCadenceController` керують `poll_seconds` і `sleep_seconds` history-циклу на базі `tick_silence_seconds`, стану ринку й акумульованих лагів. Режими live/idle змінюють множники, а `next_wakeup_in_seconds()` повертає планований інтервал для кожного TF.
+- Heartbeat містить блок `context.tick_cadence` (state, history_state, multiplier, reason, cadence/next_poll per TF), який читає viewer: у PRICE-режимі додано панель Adaptive cadence, а supervisor-режим дублює той самий зріз поруч із async-метриками. `price_stream` також відстежує `Viewer snapshots`, щоб бачити активність `fxcm:price_tik` навіть коли supervisor не звітує publish_counts.
+- Автотести покривають контролер (подовження циклу при тиші, пришвидшення при live) і UI (viewer панелі), тож ми гарантуємо latency <200 мс/бар без ручного втручання.
 
 ## 7. Робочі режими
 
@@ -573,4 +644,4 @@ ruff check .
 
 ### Telegram: `@Std07_1`
 
-### Оновлено: 03.12.2025
+### Оновлено: 05.12.2025

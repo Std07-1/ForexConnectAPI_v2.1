@@ -1,5 +1,14 @@
 # План переходу на двопотокову async-архітектуру
 
+## Статус на 05.12.2025
+
+- ✅ **Stage 1** (tick stream) та **Stage 2** (async supervisor) у проді з листопада 2025.
+- ✅ **Stage 3.1** — HistoryQuota із неблокуючим throttle й телеметрією у heartbeat/HIST-панелі viewer.
+- ✅ **Stage 3.2** — FxcmBackoffController + Redis-backoff: деградації ізолюються, стани видно у `diag.backoff` та Backoff-панелі viewer.
+- ✅ **Stage 3.3** — Tick-driven cadence + авто-sleep завершено: `TickCadenceController` керує poll/sleep, а viewer (режим PRICE) показує Adaptive cadence.
+
+Документ нижче лишається джерелом правди щодо архітектури, але всі етапи Stage 3 вже проходять acceptance й живуть у головній гілці.
+
 ## 1. Цілі та обмеження
 
 - **Залишити стабільний OHLCV-стрім 1m/5m.** Поточний `_fetch_and_publish_recent` залишається джерелом правди для Redis `fxcm:ohlcv`.
@@ -98,7 +107,7 @@ Heartbeat/diagnostics повинні логувати поточний стан 
 
 > Висновок: Stage 2 виконано; асинхронний шар стабільний і може вважатися основою для подальшої оптимізації.
 
-### Stage 3 — Оптимізація `get_history`, backoff та tick-driven керування
+### Stage 3 — Оптимізація `get_history`, backoff та tick-driven керування (✅ завершено 05.12.2025)
 
 **Мета Stage 3:** тримати latency < 200 мс/бар без глушіння стріму та UI. Будь-який контроль навантаження має бути неблокуючим: замість пауз у FXCM-thread ми даємо сигнал через телеметрію, щоб оператор бачив, що бюджет вичерпано, а воркер продовжує обслуговувати heartbeat. Кожен підетап завершується acceptance checklist і чіткими сценаріями застосування.
 
@@ -318,6 +327,13 @@ async def history_consumer(ohlcv_queue, redis_client, gate) -> None:
 - У payload обов'язково `tick_ts` (час останнього bid/ask) й `snap_ts` (час формування пакета).
 - Для кожного символу публікується лише останній стан, щоб не роздувати канал.
 - `publish_price_snapshots` має бути ідпотентним і захищеним від відсутніх символів (ігнорує порожні payloads).
+
+## 5. Результат міграції
+
+- Stage 1–3 повністю змерджені в `main` і використовуються у бойовому FXCM-конекторі з грудня 2025.
+- Async-supervisor забезпечує backpressure/backoff без впливу на heartbeat; HistoryQuota гарантує неблокуючий throttle, а TickCadenceController підтримує cadence <200 мс/бар.
+- Debug viewer і heartbeat транслюють усю необхідну телеметрію (`history`, `diag.backoff`, `tick_cadence`, `price_stream`), тож оператори бачать причини будь-яких затримок.
+- Тестовий контур (pytest) покриває ключові контролери Stage 3, а acceptance списки виконано — міграцію можна вважати завершеною.
 
 ---
 

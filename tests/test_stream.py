@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import tempfile
@@ -7,7 +8,7 @@ import time
 import types
 import unittest
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple, cast
+from typing import Any, Callable, Dict, Optional, Tuple, cast
 from unittest import mock
 
 import pandas as pd
@@ -15,7 +16,7 @@ import pandas as pd
 import connector
 import sessions
 
-from config import SampleRequestSettings
+from config import SampleRequestSettings, TickCadenceTuning
 from connector import (
     AsyncStreamSupervisor,
     HeartbeatEvent,
@@ -75,6 +76,47 @@ class DummySupervisor:
     def diagnostics_snapshot(self) -> Dict[str, Any]:
         self.calls += 1
         return self.payload
+
+
+class StaticPriceStream:
+    def __init__(self, metadata: Dict[str, Any]) -> None:
+        self._metadata = metadata
+
+    def snapshot_metadata(self) -> Dict[str, Any]:
+        return dict(self._metadata)
+
+
+class CycleAwareCadence:
+    """Емулятор TickCadence, що дозволяє кожен таймфрейм лише раз за цикл."""
+
+    def __init__(self) -> None:
+        self._seen: Dict[str, int] = {}
+
+    def update_state(
+        self,
+        *,
+        tick_metadata: Optional[Dict[str, Any]],
+        market_open: bool,
+        now_monotonic: Optional[float] = None,
+    ) -> None:
+        self._seen.clear()
+
+    def should_poll(self, timeframe: str, now: Optional[float] = None) -> Tuple[bool, float]:
+        tf = timeframe
+        count = self._seen.get(tf, 0)
+        self._seen[tf] = count + 1
+        if count == 0:
+            return True, 0.0
+        return False, 5.0
+
+    def next_wakeup_in_seconds(self, now_monotonic: Optional[float] = None) -> Optional[float]:
+        return None
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "state": "ok",
+            "history_state": "active",
+        }
 
 
 def _make_sample_df(start: dt.datetime, count: int) -> pd.DataFrame:
@@ -374,6 +416,224 @@ class PriceSnapshotWorkerTest(unittest.TestCase):
         metadata = worker.snapshot_metadata()
         self.assertEqual(metadata["channel"], "fxcm:test:ticks")
         self.assertTrue(metadata["symbols"])
+
+
+class TickCadenceControllerTest(unittest.TestCase):
+    def _build_controller(self) -> connector.TickCadenceController:
+        tuning = TickCadenceTuning(
+            live_threshold_seconds=10,
+            idle_threshold_seconds=60,
+            live_multiplier=1.0,
+            idle_multiplier=3.0,
+        )
+        return connector.TickCadenceController(
+            tuning=tuning,
+            base_poll_seconds=3.0,
+            timeframes=["m1", "m5"],
+        )
+
+    def test_live_state_allows_fast_poll(self) -> None:
+        controller = self._build_controller()
+        controller.update_state(
+            tick_metadata={"tick_silence_seconds": 2.0},
+            market_open=True,
+            now_monotonic=0.0,
+        )
+        snapshot = controller.snapshot()
+        self.assertEqual(snapshot["state"], "ok")
+        allowed_first, _ = controller.should_poll("m1", now=0.0)
+        self.assertTrue(allowed_first)
+        allowed_second, wait_second = controller.should_poll("m1", now=1.0)
+        self.assertFalse(allowed_second)
+        self.assertGreater(wait_second, 0.0)
+
+    def test_idle_state_pauses_history_until_ticks_return(self) -> None:
+        controller = self._build_controller()
+        controller.update_state(
+            tick_metadata={"tick_silence_seconds": 120.0},
+            market_open=True,
+            now_monotonic=5.0,
+        )
+        snapshot = controller.snapshot()
+        self.assertEqual(snapshot["history_state"], "paused")
+        allowed_idle, _ = controller.should_poll("m1", now=5.0)
+        self.assertFalse(allowed_idle)
+
+        controller.update_state(
+            tick_metadata={"tick_silence_seconds": 1.0},
+            market_open=True,
+            now_monotonic=6.0,
+        )
+        snapshot_live = controller.snapshot()
+        self.assertEqual(snapshot_live["history_state"], "active")
+        resumed_allowed, _ = controller.should_poll("m1", now=6.0)
+        self.assertTrue(resumed_allowed)
+
+    def test_cadence_respects_bounds(self) -> None:
+        tuning = TickCadenceTuning(
+            live_threshold_seconds=5,
+            idle_threshold_seconds=10,
+            live_multiplier=0.1,
+            idle_multiplier=10.0,
+        )
+        controller = connector.TickCadenceController(
+            tuning=tuning,
+            base_poll_seconds=1.0,
+            timeframes=["m1"],
+        )
+        controller.update_state(
+            tick_metadata={"tick_silence_seconds": 1.0},
+            market_open=True,
+            now_monotonic=0.0,
+        )
+        snap_live = controller.snapshot()
+        min_bound = connector.TickCadenceController.MIN_CADENCE_SECONDS
+        self.assertGreaterEqual(snap_live["cadence_seconds"]["1m"], min_bound)
+
+        controller.update_state(
+            tick_metadata={"tick_silence_seconds": 60.0},
+            market_open=True,
+            now_monotonic=10.0,
+        )
+        snap_idle = controller.snapshot()
+        max_bound = connector.TickCadenceController.MAX_CADENCE_SECONDS
+        self.assertLessEqual(snap_idle["cadence_seconds"]["1m"], max_bound)
+
+
+class TickCadenceAutosleepTest(unittest.TestCase):
+    def setUp(self) -> None:
+        connector._LAST_MARKET_STATUS = None
+        self.fixed_now = dt.datetime(2025, 5, 6, 10, 0, tzinfo=dt.timezone.utc)
+        self.stream_config = [("XAU/USD", "m1")]
+
+    def _build_cadence(
+        self,
+        *,
+        live_multiplier: float,
+        idle_multiplier: float,
+    ) -> connector.TickCadenceController:
+        tuning = TickCadenceTuning(
+            live_threshold_seconds=5.0,
+            idle_threshold_seconds=30.0,
+            live_multiplier=live_multiplier,
+            idle_multiplier=idle_multiplier,
+        )
+        return connector.TickCadenceController(
+            tuning=tuning,
+            base_poll_seconds=3.0,
+            timeframes=[tf for _, tf in self.stream_config],
+        )
+
+    def test_idle_ticks_extend_sleep_interval(self) -> None:
+        fx = FakeForexConnect(_make_sample_df(self.fixed_now - dt.timedelta(minutes=5), 5))
+        heartbeat_events: list[HeartbeatEvent] = []
+        tick_cadence = self._build_cadence(live_multiplier=1.0, idle_multiplier=4.0)
+        price_stream = StaticPriceStream({"tick_silence_seconds": 300.0})
+
+        with mock.patch("connector._now_utc", return_value=self.fixed_now), mock.patch(
+            "connector.is_trading_time",
+            return_value=True,
+        ), mock.patch("connector._fetch_and_publish_recent") as mock_fetch:
+            mock_fetch.return_value = pd.DataFrame()
+            stream_fx_data(
+                cast(connector.ForexConnect, fx),
+                redis_client=None,
+                require_redis=False,
+                poll_seconds=3,
+                publish_interval_seconds=0,
+                lookback_minutes=5,
+                config=self.stream_config,
+                cache_manager=None,
+                max_cycles=1,
+                heartbeat_sink=heartbeat_events.append,
+                price_stream=price_stream,
+                tick_cadence=tick_cadence,
+            )
+
+        mock_fetch.assert_not_called()
+        self.assertTrue(heartbeat_events)
+        event = heartbeat_events[-1]
+        self.assertEqual(event.state, "stream")
+        self.assertIsNotNone(event.sleep_seconds)
+        assert event.sleep_seconds is not None
+        self.assertGreater(event.sleep_seconds, 0.0)
+        self.assertEqual(event.context.get("history_state"), "paused")
+
+    def test_live_ticks_reduce_sleep_interval(self) -> None:
+        fx = FakeForexConnect(_make_sample_df(self.fixed_now - dt.timedelta(minutes=5), 5))
+        heartbeat_events: list[HeartbeatEvent] = []
+        tick_cadence = self._build_cadence(live_multiplier=0.5, idle_multiplier=2.0)
+        price_stream = StaticPriceStream({"tick_silence_seconds": 0.5})
+
+        with mock.patch("connector._now_utc", return_value=self.fixed_now), mock.patch(
+            "connector.is_trading_time",
+            return_value=True,
+        ), mock.patch("connector._fetch_and_publish_recent") as mock_fetch:
+            mock_fetch.return_value = pd.DataFrame()
+            stream_fx_data(
+                cast(connector.ForexConnect, fx),
+                redis_client=None,
+                require_redis=False,
+                poll_seconds=4,
+                publish_interval_seconds=0,
+                lookback_minutes=5,
+                config=self.stream_config,
+                cache_manager=None,
+                max_cycles=1,
+                heartbeat_sink=heartbeat_events.append,
+                price_stream=price_stream,
+                tick_cadence=tick_cadence,
+            )
+
+        mock_fetch.assert_called()
+        self.assertTrue(heartbeat_events)
+        event = heartbeat_events[-1]
+        self.assertEqual(event.state, "stream")
+        self.assertIsNotNone(event.sleep_seconds)
+        assert event.sleep_seconds is not None
+        self.assertLess(event.sleep_seconds, 4.0)
+        self.assertEqual(event.context.get("history_state"), "active")
+
+
+class TickCadenceFairnessTest(unittest.TestCase):
+    def setUp(self) -> None:
+        connector._LAST_MARKET_STATUS = None
+        self.fixed_now = dt.datetime(2025, 5, 6, 10, 0, tzinfo=dt.timezone.utc)
+
+    def test_cadence_slot_applies_to_all_symbols_with_same_tf(self) -> None:
+        fx = FakeForexConnect(_make_sample_df(self.fixed_now - dt.timedelta(minutes=5), 5))
+        cadence = CycleAwareCadence()
+        stub_df = pd.DataFrame(
+            {
+                "open_time": [1764958800000],
+                "close_time": [1764958860000],
+                "high": [1.0],
+                "low": [1.0],
+                "close": [1.0],
+            }
+        )
+
+        with mock.patch("connector._now_utc", return_value=self.fixed_now), mock.patch(
+            "connector.is_trading_time",
+            return_value=True,
+        ), mock.patch("connector._fetch_and_publish_recent") as mock_fetch:
+            mock_fetch.return_value = stub_df
+            stream_fx_data(
+                cast(connector.ForexConnect, fx),
+                redis_client=None,
+                require_redis=False,
+                poll_seconds=0,
+                publish_interval_seconds=0,
+                lookback_minutes=5,
+                config=[("XAU/USD", "m1"), ("EUR/USD", "m1")],
+                cache_manager=None,
+                max_cycles=1,
+                tick_cadence=cadence,
+            )
+
+        self.assertEqual(mock_fetch.call_count, 2)
+        symbols = [kwargs["symbol"] for _args, kwargs in mock_fetch.call_args_list]
+        self.assertEqual(symbols, ["XAU/USD", "EUR/USD"])
 
 
 class HeartbeatContractTest(unittest.TestCase):
@@ -935,6 +1195,50 @@ class AsyncSupervisorTest(unittest.TestCase):
             )
         )
 
+    def test_heartbeat_queue_drops_when_full(self) -> None:
+        self.supervisor.stop()
+        self.redis = FakeRedis()
+        self.gate = PublishDataGate()
+        with mock.patch.object(connector, "HEARTBEAT_QUEUE_MAXSIZE", 1):
+            supervisor = AsyncStreamSupervisor(
+                redis_supplier=lambda: self.redis,
+                data_gate=self.gate,
+                heartbeat_channel="fxcm:test:heartbeat",
+                price_channel="fxcm:test:ticks",
+            )
+            supervisor.start()
+        self.supervisor = supervisor
+
+        publish_counter = {"count": 0}
+
+        async def slow_publish(self_obj: AsyncStreamSupervisor, event: HeartbeatEvent) -> None:
+            publish_counter["count"] += 1
+            await asyncio.sleep(0.2)
+
+        heartbeat = HeartbeatEvent(
+            state="idle",
+            last_bar_close_ms=222,
+            next_open=None,
+            sleep_seconds=5.0,
+            context={"channel": "fxcm:test:heartbeat"},
+        )
+
+        diag: Dict[str, Any] = {}
+        with mock.patch.object(AsyncStreamSupervisor, "_publish_heartbeat_event", slow_publish):
+            try:
+                supervisor.submit_heartbeat(heartbeat)
+                supervisor.submit_heartbeat(heartbeat)
+                supervisor.submit_heartbeat(heartbeat)
+                self.assertTrue(self._wait_for(lambda: publish_counter["count"] >= 1))
+                diag = supervisor.diagnostics_snapshot()
+            finally:
+                supervisor.stop()
+
+        heartbeat_diag = next((entry for entry in diag.get("queues", []) if entry["name"] == "heartbeat"), None)
+        self.assertIsNotNone(heartbeat_diag)
+        self.assertGreaterEqual(heartbeat_diag.get("dropped", 0), 1)
+        self.assertEqual(diag.get("backpressure_events"), 0)
+
     def test_supervisor_publishes_price_snapshots(self) -> None:
         snap = PriceTickSnap(
             symbol="XAUUSD",
@@ -1206,6 +1510,14 @@ class CalendarOverrideTest(unittest.TestCase):
         self.assertFalse(sessions.is_trading_time(maintenance_dt))
         self.assertTrue(sessions.is_trading_time(after_reopen))
 
+    def test_is_trading_time_handles_ahead_timezone_weekend(self) -> None:
+        sessions.override_calendar(
+            weekly_open="00:00@Asia/Tokyo",
+            weekly_close="21:55@America/New_York",
+        )
+        friday_evening = dt.datetime(2025, 12, 5, 15, 0, tzinfo=dt.timezone.utc)
+        self.assertTrue(sessions.is_trading_time(friday_evening))
+
 
     def test_override_calendar_with_extra_holiday(self) -> None:
         sessions.override_calendar(holidays=["2030-01-02"], replace_holidays=True)
@@ -1235,6 +1547,77 @@ class CalendarOverrideTest(unittest.TestCase):
                 tmp_path.unlink()
             except FileNotFoundError:
                 pass
+
+
+class StatusSnapshotTest(unittest.TestCase):
+    def setUp(self) -> None:
+        connector._LAST_STATUS_SNAPSHOT = None
+        connector._LAST_SESSION_CONTEXT = None
+        connector._CURRENT_MARKET_STATE = "open"
+
+    def test_status_snapshot_from_heartbeat_reflects_ok_states(self) -> None:
+        fake_now = dt.datetime(2025, 12, 5, 6, 0, tzinfo=dt.timezone.utc)
+        payload = {
+            "type": "heartbeat",
+            "state": "stream",
+            "ts": fake_now.isoformat(),
+            "last_bar_close_ms": int(fake_now.timestamp() * 1000),
+            "context": {
+                "lag_seconds": 5,
+                "price_stream": {"tick_silence_seconds": 1.0, "state": "ok"},
+                "session": {
+                    "tag": "TOKYO",
+                    "session_open_utc": "2025-12-05T00:00:00+00:00",
+                    "session_close_utc": "2025-12-05T09:00:00+00:00",
+                    "next_open_utc": "2025-12-05T09:00:00+00:00",
+                    "next_open_seconds": 5400,
+                },
+                "stream_targets": [
+                    {"symbol": "XAU/USD", "tf": "m1", "staleness_seconds": 5},
+                ],
+            },
+        }
+        with mock.patch("connector._now_utc", return_value=fake_now):
+            snapshot = connector._build_status_snapshot_from_heartbeat(payload)
+        assert snapshot is not None
+        self.assertEqual(snapshot["process"], "stream")
+        self.assertEqual(snapshot["market"], "open")
+        self.assertEqual(snapshot["price"], "ok")
+        self.assertEqual(snapshot["ohlcv"], "ok")
+        self.assertIn("session", snapshot)
+        self.assertEqual(snapshot["note"], "ok")
+
+    def test_status_snapshot_from_market_updates_existing_snapshot(self) -> None:
+        connector._LAST_STATUS_SNAPSHOT = {
+            "ts": 1.0,
+            "process": "stream",
+            "market": "open",
+            "price": "ok",
+            "ohlcv": "ok",
+            "note": "ok",
+        }
+        fake_now = dt.datetime(2025, 12, 5, 20, 0, tzinfo=dt.timezone.utc)
+        payload = {
+            "state": "closed",
+            "session": {
+                "tag": "LDN_METALS",
+                "session_open_utc": "2025-12-05T08:30:00+00:00",
+                "session_close_utc": "2025-12-05T14:30:00+00:00",
+                "next_open_utc": "2025-12-06T00:00:00+00:00",
+                "next_open_seconds": 14400,
+            },
+        }
+        with mock.patch("connector._now_utc", return_value=fake_now):
+            snapshot = connector._build_status_snapshot_from_market(payload)
+        assert snapshot is not None
+        self.assertEqual(snapshot["market"], "closed")
+        self.assertEqual(snapshot["process"], "idle")
+        self.assertEqual(snapshot["note"], "market closed")
+        self.assertIn("session", snapshot)
+        session = snapshot["session"]
+        self.assertIsInstance(session, dict)
+        self.assertEqual(session.get("tag"), "LDN_METALS")
+        self.assertEqual(session.get("state"), "closed")
 
 
 if __name__ == "__main__":

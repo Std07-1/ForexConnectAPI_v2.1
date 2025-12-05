@@ -255,6 +255,14 @@ def test_build_price_stream_panel_embeds_special_channels(monkeypatch: pytest.Mo
             }
         ],
     }
+    state.tick_cadence = {
+        "state": "ok",
+        "history_state": "active",
+        "cadence_seconds": {"1m": 3.0},
+        "next_poll_in_seconds": {"1m": 1.5},
+        "multiplier": 1.0,
+    }
+    state.tick_cadence_updated = now
     diag = {
         "publish_counts": {"ohlcv": 12, "heartbeat": 4},
     }
@@ -270,4 +278,97 @@ def test_build_price_stream_panel_embeds_special_channels(monkeypatch: pytest.Mo
     render_str = console.export_text()
     assert "Спеціальні канали" in render_str
     assert "ohlcv" in render_str
+    assert "Adaptive cadence" in render_str
+    assert "Viewer snapshots" in render_str
+
+
+def test_special_channels_panel_shows_price_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    diag = {"publish_counts": {}}
+    monkeypatch.setattr(dv, "SUPERVISOR_CHANNELS", ("price",))
+    monkeypatch.setattr(dv, "SUPERVISOR_CHANNEL_HINTS", {"price": "Снепшоти"})
+
+    panel = dv.build_supervisor_special_channels_panel(diag)
+
+    assert isinstance(panel, Panel)
+    console = Console(record=True, width=120)
+    console.print(panel)
+    render_str = console.export_text()
+    assert "price" in render_str
+    assert "Снепшоти" in render_str
+    assert "0" in render_str
+
+
+def test_supervisor_special_channels_panel_uses_fallback_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    diag = {"publish_counts": {}}
+    monkeypatch.setattr(dv, "SUPERVISOR_CHANNELS", ("price",))
+    monkeypatch.setattr(dv, "SUPERVISOR_CHANNEL_HINTS", {"price": "Снепшоти"})
+
+    panel = dv.build_supervisor_special_channels_panel(diag, fallback_counts={"price": 7})
+
+    console = Console(record=True, width=120)
+    console.print(panel)
+    render_str = console.export_text()
+    assert "7" in render_str
+
+
+def test_note_heartbeat_tracks_tick_cadence() -> None:
+    state = dv.ViewerState()
+    cadence = {"state": "ok", "cadence_seconds": {"1m": 3.0}}
+    heartbeat = {"state": "stream", "context": {"tick_cadence": cadence}}
+
+    state.note_heartbeat(heartbeat)
+
+    assert state.tick_cadence == cadence
+    assert state.tick_cadence_updated is not None
+
+
+def test_note_heartbeat_counts_price_snapshots() -> None:
+    state = dv.ViewerState()
+    first = {
+        "state": "stream",
+        "context": {
+            "price_stream": {
+                "last_snap_ts": 100.0,
+                "symbols_state": [{"symbol": "XAUUSD"}]
+            }
+        },
+    }
+    second = {
+        "state": "stream",
+        "context": {
+            "price_stream": {
+                "last_snap_ts": 105.0,
+                "symbols_state": [{"symbol": "XAUUSD"}, {"symbol": "EURUSD"}],
+            }
+        },
+    }
+
+    state.note_heartbeat(first)
+    state.note_heartbeat(second)
+
+    assert state.price_snapshot_total == 2
+
+
+def test_build_tick_cadence_panel_renders_snapshot() -> None:
+    state = dv.ViewerState()
+    state.tick_cadence_updated = time.time()
+    state.tick_cadence = {
+        "state": "lag",
+        "history_state": "paused",
+        "reason": "tick_idle",
+        "tick_silence_seconds": 45.0,
+        "multiplier": 2.5,
+        "cadence_seconds": {"1m": 6.0, "5m": 12.0},
+        "next_poll_in_seconds": {"1m": 5.0},
+    }
+
+    panel = dv.build_tick_cadence_panel(state)
+
+    assert isinstance(panel, Panel)
+    console = Console(record=True, width=120)
+    console.print(panel)
+    render_str = console.export_text()
+    assert "Adaptive cadence" in render_str
+    assert "1m" in render_str
+    assert "6.0" in render_str
 

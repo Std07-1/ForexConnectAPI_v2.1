@@ -87,6 +87,7 @@ from config import (
     FXCMConfig,
     RedisSettings,
     SampleRequestSettings,
+    TickCadenceTuning,
     load_config,
 )
 from sessions import (
@@ -175,10 +176,19 @@ else:
 # Константи конектора
 REDIS_CHANNEL = "fxcm:ohlcv"  # канал публікації OHLCV-барів
 REDIS_STATUS_CHANNEL = "fxcm:market_status"  # канал публікації статусу ринку
+STATUS_CHANNEL_DEFAULT = "fxcm:status"
+STATUS_PRICE_STALE_SECONDS = 15.0
+STATUS_PRICE_DOWN_SECONDS = 60.0
+STATUS_OHLCV_DELAYED_SECONDS = 60.0
+STATUS_OHLCV_DOWN_SECONDS = 180.0
 BAR_INTERVAL_MS = 60_000  # 1 хвилина у мілісекундах
 PRICE_SNAPSHOT_QUEUE_MAXSIZE = 5_000
 _LAST_MARKET_STATUS: Optional[Tuple[str, Optional[int]]] = None  # останній статус ринку для приглушення спаму
 _LAST_MARKET_STATUS_TS: Optional[float] = None  # час останньої трансляції статусу
+_STATUS_CHANNEL = STATUS_CHANNEL_DEFAULT
+_LAST_STATUS_SNAPSHOT: Optional[Dict[str, Any]] = None
+_LAST_SESSION_CONTEXT: Optional[Dict[str, Any]] = None
+_CURRENT_MARKET_STATE = "unknown"
 _METRICS_SERVER_STARTED = False
 IDLE_LOG_INTERVAL_SECONDS = 300.0  # мінімальний інтервал між повідомленнями про паузу торгів
 MARKET_STATUS_REFRESH_SECONDS = 30.0  # як часто повторно транслювати незмінний статус
@@ -524,6 +534,174 @@ class HistoryQuota:
         if max_ratio >= self._warn_threshold or recent_quota_deny:
             return "warn"
         return "ok"
+
+
+class TickCadenceController:
+    """Керує адаптивною частотою опитування history на основі тикової активності."""
+
+    MIN_CADENCE_SECONDS = 2.0
+    MAX_CADENCE_SECONDS = 20.0
+
+    def __init__(
+        self,
+        *,
+        tuning: TickCadenceTuning,
+        base_poll_seconds: float,
+        timeframes: Sequence[str],
+    ) -> None:
+        self._tuning = tuning
+        self._base_poll = max(0.5, float(base_poll_seconds))
+        tf_keys = {_map_timeframe_label(tf) for tf in timeframes if tf}
+        if not tf_keys:
+            tf_keys = {"1m"}
+        self._tf_bases: Dict[str, float] = {}
+        for tf in tf_keys:
+            base = self._base_poll * max(1.0, _tf_to_minutes(tf) / 1.0)
+            self._tf_bases[tf] = self._clamp(base)
+        self._cadence_by_tf: Dict[str, float] = dict(self._tf_bases)
+        self._next_due_by_tf: Dict[str, float] = {}
+        self._prices_state = "ok"
+        self._history_active = True
+        self._tick_silence: Optional[float] = None
+        self._last_reason = "live_ticks"
+        self._current_multiplier = tuning.live_multiplier
+        self._last_update_monotonic = time.monotonic()
+
+    def update_state(
+        self,
+        *,
+        tick_metadata: Optional[Dict[str, Any]],
+        market_open: bool,
+        now_monotonic: Optional[float] = None,
+    ) -> None:
+        if now_monotonic is None:
+            now_monotonic = time.monotonic()
+        silence = self._extract_silence(tick_metadata)
+        self._tick_silence = silence
+        previous_history_state = self._history_active
+
+        if not market_open:
+            prices_state = "stale"
+            history_active = False
+            reason = "calendar_closed"
+        elif silence is None:
+            prices_state = "lag"
+            history_active = True
+            reason = "no_ticks"
+        elif silence <= self._tuning.live_threshold_seconds:
+            prices_state = "ok"
+            history_active = True
+            reason = "live_ticks"
+        elif silence >= self._tuning.idle_threshold_seconds:
+            prices_state = "stale"
+            history_active = False
+            reason = "tick_idle"
+        else:
+            prices_state = "lag"
+            history_active = True
+            reason = "tick_lag"
+
+        self._prices_state = prices_state
+        self._history_active = history_active
+        self._last_reason = reason
+        self._current_multiplier = self._resolve_multiplier(prices_state)
+        self._last_update_monotonic = now_monotonic
+        self._recompute_cadence(now_monotonic)
+
+        if history_active and not previous_history_state:
+            for tf in self._tf_bases:
+                self._next_due_by_tf[tf] = now_monotonic
+
+    def history_state_label(self) -> str:
+        return "active" if self._history_active else "paused"
+
+    def should_poll(self, timeframe: str, now: Optional[float] = None) -> Tuple[bool, float]:
+        tf = _map_timeframe_label(timeframe)
+        cadence = self._cadence_by_tf.get(tf, self._clamp(self._base_poll))
+        if now is None:
+            now = time.monotonic()
+        if not self._history_active:
+            self._next_due_by_tf[tf] = now + cadence
+            return False, cadence
+        next_due = self._next_due_by_tf.get(tf)
+        if next_due is None or now >= next_due:
+            self._next_due_by_tf[tf] = now + cadence
+            return True, 0.0
+        return False, max(0.0, next_due - now)
+
+    def next_wakeup_in_seconds(self, now_monotonic: Optional[float] = None) -> Optional[float]:
+        if now_monotonic is None:
+            now_monotonic = time.monotonic()
+        if not self._next_due_by_tf:
+            return None
+        waits = [
+            max(0.0, due - now_monotonic)
+            for due in self._next_due_by_tf.values()
+        ]
+        if not waits:
+            return None
+        return min(waits)
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = time.monotonic()
+        next_poll = {
+            tf: max(0.0, due - now)
+            for tf, due in self._next_due_by_tf.items()
+        }
+        return {
+            "state": self._prices_state,
+            "history_state": self.history_state_label(),
+            "tick_silence_seconds": self._tick_silence,
+            "cadence_seconds": {
+                tf: round(value, 3)
+                for tf, value in sorted(self._cadence_by_tf.items())
+            },
+            "next_poll_in_seconds": {
+                tf: round(value, 3)
+                for tf, value in sorted(next_poll.items())
+            },
+            "multiplier": round(self._current_multiplier, 3),
+            "reason": self._last_reason,
+        }
+
+    def _recompute_cadence(self, now: float) -> None:
+        for tf, base in self._tf_bases.items():
+            new_value = self._clamp(base * self._current_multiplier)
+            previous = self._cadence_by_tf.get(tf)
+            self._cadence_by_tf[tf] = new_value
+            if previous is None:
+                continue
+            next_due = self._next_due_by_tf.get(tf)
+            if next_due is None or next_due <= now:
+                self._next_due_by_tf[tf] = now
+                continue
+            if new_value < previous and next_due - now > new_value:
+                self._next_due_by_tf[tf] = now + new_value
+
+    def _resolve_multiplier(self, prices_state: str) -> float:
+        if prices_state == "ok":
+            return self._tuning.live_multiplier
+        if prices_state == "lag":
+            return (self._tuning.live_multiplier + self._tuning.idle_multiplier) / 2.0
+        return self._tuning.idle_multiplier
+
+    def _extract_silence(self, metadata: Optional[Dict[str, Any]]) -> Optional[float]:
+        if not metadata:
+            return None
+        silence = metadata.get("tick_silence_seconds")
+        if silence is None:
+            return None
+        try:
+            value = float(silence)
+        except (TypeError, ValueError):
+            return None
+        if value < 0:
+            return None
+        return value
+
+    @classmethod
+    def _clamp(cls, value: float) -> float:
+        return min(cls.MAX_CADENCE_SECONDS, max(cls.MIN_CADENCE_SECONDS, value))
 
 
 class FxcmBackoffController:
@@ -1068,17 +1246,276 @@ def _publish_market_status(
     payload["session"] = _build_session_context(next_open, session_stats=_session_stats_snapshot())
 
     message = json.dumps(payload, separators=(",", ":"))
+    status_snapshot = _build_status_snapshot_from_market(payload)
+    success = False
     try:
         redis_client.publish(REDIS_STATUS_CHANNEL, message)
         _LAST_MARKET_STATUS = status_key
         _LAST_MARKET_STATUS_TS = now_monotonic
         log.info("Статус ринку → %s", state)
         PROM_MARKET_STATUS.set(1 if state == "open" else 0)
-        return True
+        success = True
     except Exception as exc:  # noqa: BLE001
         log.exception("Не вдалося надіслати market_status у Redis: %s", exc)
         PROM_ERROR_COUNTER.labels(type="redis").inc()
-        return False
+    finally:
+        _publish_public_status(redis_client, status_snapshot)
+    return success
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _humanize_session_name(tag: str) -> str:
+    if not tag:
+        return "Session"
+    cleaned = tag.replace("_", " ").replace("-", " ").strip()
+    return cleaned.title() or "Session"
+
+
+def _parse_iso8601(value: Any) -> Optional[dt.datetime]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc)
+        except (OverflowError, ValueError):
+            return None
+    if isinstance(value, str):
+        candidate = value.replace("Z", "+00:00")
+        try:
+            parsed = dt.datetime.fromisoformat(candidate)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    return None
+
+
+def _build_status_session_block(session_ctx: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    global _LAST_SESSION_CONTEXT
+    source: Optional[Dict[str, Any]]
+    if isinstance(session_ctx, Mapping):
+        source = dict(session_ctx)
+        _LAST_SESSION_CONTEXT = source
+    else:
+        source = dict(_LAST_SESSION_CONTEXT) if _LAST_SESSION_CONTEXT is not None else None
+    if source is None:
+        return None
+
+    tag = str(source.get("tag") or "UNKNOWN")
+    name = str(source.get("name") or _humanize_session_name(tag))
+    open_dt = _parse_iso8601(source.get("session_open_utc") or source.get("current_open_utc"))
+    close_dt = _parse_iso8601(source.get("session_close_utc") or source.get("current_close_utc"))
+    next_open_dt: Optional[dt.datetime]
+    next_open_dt = _parse_iso8601(source.get("next_open_utc"))
+    if next_open_dt is None and source.get("next_open_ms") is not None:
+        next_open_dt = _parse_iso8601(float(source["next_open_ms"]) / 1000.0)
+    now = _now_utc()
+    if open_dt is None and close_dt is not None:
+        open_dt = close_dt - dt.timedelta(hours=1)
+    if close_dt is None and open_dt is not None:
+        close_dt = open_dt + dt.timedelta(hours=1)
+    session_state = "unknown"
+    if open_dt is not None and close_dt is not None:
+        if open_dt <= now < close_dt:
+            session_state = "open"
+        elif now < open_dt:
+            session_state = "preopen"
+        else:
+            session_state = "closed"
+    seconds_to_close: Optional[float]
+    seconds_to_close = max(0.0, (close_dt - now).total_seconds()) if close_dt else None
+    seconds_to_next_open = source.get("next_open_seconds")
+    if seconds_to_next_open is None and next_open_dt is not None:
+        seconds_to_next_open = max(0.0, (next_open_dt - now).total_seconds())
+
+    payload: Dict[str, Any] = {
+        "name": name,
+        "tag": tag,
+        "state": session_state,
+        "current_open_utc": open_dt.replace(microsecond=0).isoformat() if open_dt else None,
+        "current_close_utc": close_dt.replace(microsecond=0).isoformat() if close_dt else None,
+        "next_open_utc": next_open_dt.replace(microsecond=0).isoformat() if next_open_dt else None,
+        "seconds_to_close": seconds_to_close,
+        "seconds_to_next_open": seconds_to_next_open,
+    }
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _derive_process_status(raw_state: str, context: Mapping[str, Any]) -> str:
+    normalized = (raw_state or "").lower()
+    if normalized in {"stream", "warmup", "warmup_cache"}:
+        return "stream"
+    if normalized == "idle":
+        idle_reason = str(context.get("idle_reason") or "").lower()
+        if "sleep" in idle_reason:
+            return "sleep"
+        return "idle"
+    if normalized == "error":
+        return "error"
+    return "stream"
+
+
+def _derive_price_status(context: Mapping[str, Any]) -> str:
+    meta = context.get("price_stream") if isinstance(context, Mapping) else None
+    silence = None
+    state_label = ""
+    if isinstance(meta, Mapping):
+        silence = _float_or_none(meta.get("tick_silence_seconds"))
+        state_label = str(meta.get("state") or "").lower()
+    if silence is None:
+        silence = _float_or_none(context.get("tick_silence_seconds"))
+    if state_label in {"stopped", "error"}:
+        return "down"
+    if state_label == "stale":
+        return "stale"
+    if silence is None:
+        return "ok" if isinstance(meta, Mapping) else "down"
+    if silence >= STATUS_PRICE_DOWN_SECONDS:
+        return "down"
+    if silence >= STATUS_PRICE_STALE_SECONDS:
+        return "stale"
+    return "ok"
+
+
+def _derive_ohlcv_status(
+    context: Mapping[str, Any],
+    process_state: str,
+    last_bar_close_ms: Optional[int],
+) -> str:
+    if process_state in {"idle", "sleep"}:
+        return "down"
+    lag_seconds = _float_or_none(context.get("lag_seconds"))
+    if lag_seconds is None and last_bar_close_ms is not None:
+        lag_seconds = _calc_lag_seconds(last_bar_close_ms)
+    if lag_seconds is None:
+        targets = context.get("stream_targets")
+        if isinstance(targets, list):
+            lag_candidates: List[float] = []
+            for entry in targets:
+                if isinstance(entry, Mapping):
+                    value = _float_or_none(entry.get("staleness_seconds"))
+                    if value is not None:
+                        lag_candidates.append(value)
+            if lag_candidates:
+                lag_seconds = max(lag_candidates)
+    if lag_seconds is None:
+        return "ok"
+    if lag_seconds >= STATUS_OHLCV_DOWN_SECONDS:
+        return "down"
+    if lag_seconds >= STATUS_OHLCV_DELAYED_SECONDS:
+        return "delayed"
+    return "ok"
+
+
+def _derive_status_note(
+    process_state: str,
+    price_state: str,
+    ohlcv_state: str,
+    context: Mapping[str, Any],
+) -> str:
+    if process_state == "idle":
+        reason = str(context.get("idle_reason") or "market_closed")
+        return f"idle: {reason}"
+    if process_state == "sleep":
+        reason = str(context.get("idle_reason") or "autosleep")
+        return f"sleep: {reason}"
+    history_backoff = _float_or_none(context.get("history_backoff_seconds"))
+    if history_backoff:
+        return f"backoff FXCM {int(math.ceil(history_backoff))}s"
+    redis_backoff = _float_or_none(context.get("redis_backoff_seconds"))
+    if redis_backoff:
+        return f"backoff Redis {int(math.ceil(redis_backoff))}s"
+    if ohlcv_state == "delayed":
+        lag_value = _float_or_none(context.get("lag_seconds"))
+        if lag_value is not None:
+            return f"lag {int(math.ceil(lag_value))}s"
+        return "ohlcv delayed"
+    if ohlcv_state == "down":
+        return "ohlcv down"
+    if price_state == "stale":
+        return "price stale"
+    if price_state == "down":
+        return "price down"
+    return "ok"
+
+
+def _build_status_snapshot_from_heartbeat(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    context_obj = payload.get("context")
+    context = context_obj if isinstance(context_obj, Mapping) else {}
+    process_state = _derive_process_status(payload.get("state", ""), context)
+    price_state = _derive_price_status(context)
+    ohlcv_state = _derive_ohlcv_status(context, process_state, payload.get("last_bar_close_ms"))
+    session_block = _build_status_session_block(context.get("session"))
+    note = _derive_status_note(process_state, price_state, ohlcv_state, context)
+    status_payload: Dict[str, Any] = {
+        "ts": time.time(),
+        "process": process_state,
+        "market": _CURRENT_MARKET_STATE,
+        "price": price_state,
+        "ohlcv": ohlcv_state,
+        "note": note,
+    }
+    if session_block is not None:
+        status_payload["session"] = session_block
+    return status_payload
+
+
+def _build_status_snapshot_from_market(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    global _CURRENT_MARKET_STATE
+    state = str(payload.get("state") or "unknown").lower() or "unknown"
+    _CURRENT_MARKET_STATE = state
+    session_block = _build_status_session_block(payload.get("session"))
+    base = dict(_LAST_STATUS_SNAPSHOT) if _LAST_STATUS_SNAPSHOT else None
+    now_ts = time.time()
+    if base is None:
+        snapshot: Dict[str, Any] = {
+            "ts": now_ts,
+            "process": "stream" if state == "open" else "idle",
+            "market": state,
+            "price": "ok" if state == "open" else "down",
+            "ohlcv": "ok" if state == "open" else "down",
+            "note": "ok" if state == "open" else "market closed",
+        }
+    else:
+        snapshot = dict(base)
+        snapshot["ts"] = now_ts
+        snapshot["market"] = state
+        if state != "open" and snapshot.get("process") == "stream":
+            snapshot["process"] = "idle"
+        if state != "open":
+            snapshot["note"] = "market closed"
+    if session_block is not None:
+        snapshot["session"] = session_block
+    elif "session" in snapshot:
+        snapshot.pop("session")
+    return snapshot
+
+
+def _publish_public_status(redis_client: Optional[Any], snapshot: Optional[Dict[str, Any]]) -> None:
+    global _LAST_STATUS_SNAPSHOT
+    if snapshot is None:
+        return
+    copy_payload = dict(snapshot)
+    session_block = copy_payload.get("session")
+    if isinstance(session_block, dict):
+        copy_payload["session"] = dict(session_block)
+    _LAST_STATUS_SNAPSHOT = copy_payload
+    if redis_client is None or not _STATUS_CHANNEL:
+        return
+    message = json.dumps(copy_payload, separators=(",", ":"), ensure_ascii=False)
+    try:
+        redis_client.publish(_STATUS_CHANNEL, message)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Не вдалося надіслати статус у Redis: %s", exc)
 
 
 def _publish_heartbeat(
@@ -1091,9 +1528,6 @@ def _publish_heartbeat(
     sleep_seconds: Optional[float] = None,
     context: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    if redis_client is None or not channel:
-        return False
-
     payload: Dict[str, Any] = {
         "type": "heartbeat",
         "state": state,
@@ -1109,14 +1543,21 @@ def _publish_heartbeat(
         payload["context"] = context
 
     message = json.dumps(payload, separators=(",", ":"))
+    status_snapshot = _build_status_snapshot_from_heartbeat(payload)
+    if redis_client is None or not channel:
+        _publish_public_status(redis_client, status_snapshot)
+        return False
+    success = False
     try:
         redis_client.publish(channel, message)
         PROM_HEARTBEAT_TS.set(_now_utc().timestamp())
-        return True
+        success = True
     except Exception as exc:  # noqa: BLE001
         PROM_ERROR_COUNTER.labels(type="redis").inc()
         log.debug("Heartbeat publish неуспішний: %s", exc)
-        return False
+    finally:
+        _publish_public_status(redis_client, status_snapshot)
+    return success
 
 
 def _calc_lag_seconds(last_close_ms: Optional[int]) -> Optional[float]:
@@ -1326,7 +1767,9 @@ class AsyncStreamSupervisor:
         self._ensure_running()
         if self._heartbeat_queue is None:
             raise SinkSubmissionError("Supervisor queue ще ініціалізується")
-        self._submit_coroutine(self._enqueue(self._heartbeat_queue, event, "heartbeat"))
+        self._submit_coroutine(
+            self._enqueue(self._heartbeat_queue, event, "heartbeat", drop_oldest=True)
+        )
 
     def submit_market_status(self, event: MarketStatusEvent) -> None:
         self._ensure_running()
@@ -1385,21 +1828,10 @@ class AsyncStreamSupervisor:
         self._task_handles = task_map
 
     async def _shutdown_async(self) -> None:
-        queues: List[asyncio.Queue[Any]] = []
-        if self._ohlcv_queue is not None:
-            queues.append(self._ohlcv_queue)
-        if self._heartbeat_queue is not None:
-            queues.append(self._heartbeat_queue)
-        if self._market_status_queue is not None:
-            queues.append(self._market_status_queue)
-        if self._price_queue is not None:
-            queues.append(self._price_queue)
-        for q in queues:
-            try:
-                q.put_nowait(self._SENTINEL)
-            except asyncio.QueueFull:
-                pass
-        joins = [q.join() for q in queues]
+        queue_entries = self._iter_queues()
+        for _name, queue_obj in queue_entries:
+            await queue_obj.put(self._SENTINEL)
+        joins = [queue_obj.join() for _name, queue_obj in queue_entries]
         await asyncio.gather(*joins, return_exceptions=True)
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -1426,13 +1858,44 @@ class AsyncStreamSupervisor:
         except Exception as exc:  # noqa: BLE001
             raise SinkSubmissionError("Supervisor: enqueue помилка") from exc
 
-    async def _enqueue(self, queue_obj: asyncio.Queue[Any], item: Any, queue_name: str) -> None:
+    async def _enqueue(
+        self,
+        queue_obj: asyncio.Queue[Any],
+        item: Any,
+        queue_name: str,
+        *,
+        drop_oldest: bool = False,
+    ) -> None:
+        inserted = False
         try:
             queue_obj.put_nowait(item)
+            inserted = True
         except asyncio.QueueFull:
-            self._note_queue_drop(queue_name)
-            raise
-        self._note_queue_enqueue(queue_name)
+            if drop_oldest:
+                dropped = False
+                try:
+                    queue_obj.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                else:
+                    queue_obj.task_done()
+                    dropped = True
+                    self._note_queue_drop(queue_name)
+                if dropped:
+                    try:
+                        queue_obj.put_nowait(item)
+                        inserted = True
+                    except asyncio.QueueFull:
+                        self._note_queue_drop(queue_name)
+                        raise
+                else:
+                    self._note_queue_drop(queue_name)
+                    raise
+            else:
+                self._note_queue_drop(queue_name)
+                raise
+        if inserted:
+            self._note_queue_enqueue(queue_name)
 
     async def _history_consumer(self) -> None:
         assert self._ohlcv_queue is not None
@@ -3054,15 +3517,28 @@ def fetch_history_sample(
     return publish_ok
 
 
-def _attach_price_stream_context(context: Dict[str, Any], price_stream: Optional[PriceSnapshotWorker]) -> None:
+def _attach_price_stream_context(
+    context: Dict[str, Any],
+    price_stream: Optional[PriceSnapshotWorker],
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    cadence_snapshot: Optional[Dict[str, Any]] = None,
+) -> None:
     if price_stream is None:
         return
-    metadata = price_stream.snapshot_metadata()
-    if metadata:
-        context["price_stream"] = metadata
-        silence = metadata.get("tick_silence_seconds")
-        if silence is not None:
-            context.setdefault("tick_silence_seconds", silence)
+    if metadata is None:
+        metadata = price_stream.snapshot_metadata()
+    else:
+        metadata = dict(metadata)
+    if not metadata:
+        return
+    if cadence_snapshot:
+        metadata = dict(metadata)
+        metadata["adaptive_cadence"] = cadence_snapshot
+    context["price_stream"] = metadata
+    silence = metadata.get("tick_silence_seconds")
+    if silence is not None:
+        context.setdefault("tick_silence_seconds", silence)
 
 
 def _attach_supervisor_context(
@@ -3129,6 +3605,7 @@ def stream_fx_data(
     fx_session_observer: Optional[Callable[[ForexConnect], None]] = None,
     history_backoff: Optional[FxcmBackoffController] = None,
     redis_backoff: Optional[FxcmBackoffController] = None,
+    tick_cadence: Optional[TickCadenceController] = None,
 ) -> None:
     """Безкінечний цикл стрімінгу OHLCV у Redis.
 
@@ -3183,7 +3660,7 @@ def stream_fx_data(
         last_bar_close_ms: Optional[int],
         context: Dict[str, Any],
         next_open: Optional[dt.datetime] = None,
-        sleep_seconds: Optional[int] = None,
+        sleep_seconds: Optional[float] = None,
     ) -> None:
         event = HeartbeatEvent(
             state=state,
@@ -3275,20 +3752,38 @@ def stream_fx_data(
             idle_reason: Optional[str] = None
             cycle_published_bars = 0
             now = _now_utc()
+            market_open = is_trading_time(now)
+            price_stream_metadata = price_stream.snapshot_metadata() if price_stream is not None else None
+            cadence_snapshot: Optional[Dict[str, Any]] = None
+            if tick_cadence is not None:
+                tick_cadence.update_state(
+                    tick_metadata=price_stream_metadata,
+                    market_open=market_open,
+                    now_monotonic=cycle_start,
+                )
+                cadence_snapshot = tick_cadence.snapshot()
             history_backoff_remaining = history_backoff.remaining() if history_backoff is not None else 0.0
             history_paused_by_backoff = history_backoff_remaining > 0.0
             redis_backoff_remaining = redis_backoff.remaining() if redis_backoff is not None else 0.0
-            if not is_trading_time(now):
+            if not market_open:
                 market_pause = True
                 closed_reference = now
                 idle_reason = "calendar_closed"
             else:
                 history_call_attempted = False
+                cadence_allowances: Dict[str, bool] = {}
                 if history_paused_by_backoff:
                     idle_reason = "fxcm_backoff"
                 else:
                     for symbol, tf_raw in config:
                         tf_norm = _map_timeframe_label(tf_raw)
+                        if tick_cadence is not None:
+                            allow_cadence = cadence_allowances.get(tf_norm)
+                            if allow_cadence is None:
+                                allow_cadence, _ = tick_cadence.should_poll(tf_norm)
+                                cadence_allowances[tf_norm] = allow_cadence
+                            if not allow_cadence:
+                                continue
                         call_started_ts: Optional[float] = None
                         deny_reason = ""
                         if history_quota is not None:
@@ -3401,6 +3896,9 @@ def stream_fx_data(
                 gate.update_staleness_metrics()
                 continue
 
+            cadence_sleep_seconds: Optional[float] = None
+            if tick_cadence is not None:
+                cadence_sleep_seconds = tick_cadence.next_wakeup_in_seconds()
             elapsed = time.monotonic() - cycle_start
             if market_pause:
                 reference_time = closed_reference or _now_utc()
@@ -3449,7 +3947,15 @@ def stream_fx_data(
                     "published_bars": cycle_published_bars,
                     "cache_enabled": cache_manager is not None,
                 }
-                _attach_price_stream_context(idle_context, price_stream)
+                if cadence_snapshot:
+                    idle_context["tick_cadence"] = cadence_snapshot
+                    idle_context["history_state"] = cadence_snapshot.get("history_state")
+                _attach_price_stream_context(
+                    idle_context,
+                    price_stream,
+                    metadata=price_stream_metadata,
+                    cadence_snapshot=cadence_snapshot,
+                )
                 _attach_supervisor_context(idle_context, async_supervisor)
                 _attach_history_quota_context(idle_context, history_quota)
                 if history_paused_by_backoff and history_backoff_remaining > 0.0:
@@ -3468,15 +3974,18 @@ def stream_fx_data(
                     next_open,
                     session_stats=stats_snapshot,
                 )
+                planned_sleep = (
+                    cadence_sleep_seconds if cadence_sleep_seconds is not None else float(poll_seconds)
+                )
                 _emit_heartbeat_event(
                     state="idle",
                     last_bar_close_ms=last_published_close_ms,
                     next_open=next_open,
-                    sleep_seconds=poll_seconds,
+                    sleep_seconds=planned_sleep,
                     context=idle_context,
                 )
                 gate.update_staleness_metrics()
-                sleep_for = max(0.0, float(poll_seconds))
+                sleep_for = max(0.0, planned_sleep)
             else:
                 lag_seconds = _calc_lag_seconds(last_published_close_ms)
                 stream_context: Dict[str, Any] = {
@@ -3493,7 +4002,15 @@ def stream_fx_data(
                     "published_bars": cycle_published_bars,
                     "cache_enabled": cache_manager is not None,
                 }
-                _attach_price_stream_context(stream_context, price_stream)
+                if cadence_snapshot:
+                    stream_context["tick_cadence"] = cadence_snapshot
+                    stream_context["history_state"] = cadence_snapshot.get("history_state")
+                _attach_price_stream_context(
+                    stream_context,
+                    price_stream,
+                    metadata=price_stream_metadata,
+                    cadence_snapshot=cadence_snapshot,
+                )
                 _attach_supervisor_context(stream_context, async_supervisor)
                 _attach_history_quota_context(stream_context, history_quota)
                 if history_paused_by_backoff and history_backoff_remaining > 0.0:
@@ -3512,15 +4029,20 @@ def stream_fx_data(
                     None,
                     session_stats=stats_snapshot,
                 )
+                base_sleep = max(0.0, poll_seconds - elapsed)
+                sleep_for = (
+                    cadence_sleep_seconds if cadence_sleep_seconds is not None else base_sleep
+                )
+                sleep_for = max(0.0, sleep_for)
                 _emit_heartbeat_event(
                     state="stream",
                     last_bar_close_ms=last_published_close_ms,
+                    sleep_seconds=sleep_for,
                     context=stream_context,
                 )
                 last_idle_log_ts = None
                 last_idle_next_open = None
                 gate.update_staleness_metrics()
-                sleep_for = max(0.0, poll_seconds - elapsed)
 
             if not market_pause:
                 if history_backoff_remaining > 0.0:
@@ -3558,6 +4080,9 @@ def main() -> None:
     except ValueError as exc:
         log.error("%s", exc)
         return
+
+    global _STATUS_CHANNEL
+    _STATUS_CHANNEL = config.observability.status_channel or STATUS_CHANNEL_DEFAULT
 
     log.info(
         "Креденшали зчитано. Спроба логіну через %s (%s).",
@@ -3601,6 +4126,7 @@ def main() -> None:
     price_worker: Optional[PriceSnapshotWorker] = None
     offer_subscription: Optional[FXCMOfferSubscription] = None
     supervisor: Optional[AsyncStreamSupervisor] = None
+    tick_cadence_controller: Optional[TickCadenceController] = None
 
     stream_mode = config.stream_mode
     poll_seconds = config.poll_seconds
@@ -3767,6 +4293,12 @@ def main() -> None:
                 config.price_stream.interval_seconds,
             )
 
+            tick_cadence_controller = TickCadenceController(
+                tuning=config.tick_cadence,
+                base_poll_seconds=poll_seconds,
+                timeframes=[tf for _, tf in stream_config],
+            )
+
             min_interval_map: Dict[str, float] = {}
             if config.history_min_interval_seconds_m1 is not None:
                 min_interval_map["1m"] = float(config.history_min_interval_seconds_m1)
@@ -3848,6 +4380,7 @@ def main() -> None:
                     fx_session_observer=_refresh_price_subscription,
                     history_backoff=history_backoff_ctrl,
                     redis_backoff=redis_backoff_ctrl,
+                    tick_cadence=tick_cadence_controller,
                 )
             finally:
                 offer_subscription = subscription_holder.get("instance")
