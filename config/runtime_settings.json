@@ -14,6 +14,12 @@
         "config": "XAU/USD:m1,XAU/USD:m5, EUR/USD:m1,EUR/USD:m5",
         "price_snap_channel": "fxcm:price_tik",
         "price_snap_interval_seconds": 3,
+        "tick_cadence": {
+            "live_threshold_seconds": 45,
+            "idle_threshold_seconds": 180,
+            "live_multiplier": 1.1,
+            "idle_multiplier": 3.0
+        },
         "history_max_calls_per_min": 360,
         "history_max_calls_per_hour": 7200,
         "history_min_interval_seconds_m1": 2,

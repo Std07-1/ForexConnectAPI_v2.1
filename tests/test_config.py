@@ -105,6 +105,29 @@ class BackoffConfigTest(unittest.TestCase):
         self.assertEqual(cfg_override.price_stream.channel, "fxcm:test:price")
         self.assertAlmostEqual(cfg_override.price_stream.interval_seconds, 1.25)
 
+    def test_tick_cadence_defaults_and_override(self) -> None:
+        cfg_default = self._load_with_payload({})
+        self.assertAlmostEqual(cfg_default.tick_cadence.live_threshold_seconds, 30.0)
+        self.assertAlmostEqual(cfg_default.tick_cadence.idle_threshold_seconds, 120.0)
+        self.assertAlmostEqual(cfg_default.tick_cadence.live_multiplier, 1.0)
+        self.assertAlmostEqual(cfg_default.tick_cadence.idle_multiplier, 2.5)
+
+        runtime_payload = {
+            "stream": {
+                "tick_cadence": {
+                    "live_threshold_seconds": 60,
+                    "idle_threshold_seconds": 240,
+                    "live_multiplier": 1.4,
+                    "idle_multiplier": 3.2,
+                }
+            }
+        }
+        cfg_override = self._load_with_payload(runtime_payload)
+        self.assertAlmostEqual(cfg_override.tick_cadence.live_threshold_seconds, 60.0)
+        self.assertAlmostEqual(cfg_override.tick_cadence.idle_threshold_seconds, 240.0)
+        self.assertAlmostEqual(cfg_override.tick_cadence.live_multiplier, 1.4)
+        self.assertAlmostEqual(cfg_override.tick_cadence.idle_multiplier, 3.2)
+
     def test_history_quota_settings_defaults_and_override(self) -> None:
         cfg_default = self._load_with_payload({})
         self.assertEqual(cfg_default.history_max_calls_per_min, 120)

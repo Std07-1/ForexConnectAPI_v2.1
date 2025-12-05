@@ -174,6 +174,14 @@ class PriceStreamSettings:
 
 
 @dataclass(frozen=True)
+class TickCadenceTuning:
+    live_threshold_seconds: float
+    idle_threshold_seconds: float
+    live_multiplier: float
+    idle_multiplier: float
+
+
+@dataclass(frozen=True)
 class CalendarSettings:
     holidays: List[str]
     daily_breaks: List[Any]
@@ -226,6 +234,43 @@ def _parse_backoff_tuning(value: Any, fallback: BackoffTuning) -> BackoffTuning:
         max_seconds=max_seconds,
         multiplier=multiplier,
         jitter=jitter,
+    )
+
+
+def _parse_tick_cadence_tuning(
+    raw: Optional[Mapping[str, Any]], default: TickCadenceTuning
+) -> TickCadenceTuning:
+    if raw is None:
+        return default
+    if not isinstance(raw, Mapping):
+        raise ValueError("tick_cadence має бути словником")
+
+    live_threshold = _coerce_float(
+        raw.get("live_threshold_seconds"),
+        default.live_threshold_seconds,
+        min_value=1.0,
+    )
+    idle_threshold = _coerce_float(
+        raw.get("idle_threshold_seconds"),
+        default.idle_threshold_seconds,
+        min_value=1.0,
+    )
+    live_multiplier = _coerce_float(
+        raw.get("live_multiplier"),
+        default.live_multiplier,
+        min_value=0.5,
+    )
+    idle_multiplier = _coerce_float(
+        raw.get("idle_multiplier"),
+        default.idle_multiplier,
+        min_value=1.0,
+    )
+
+    return TickCadenceTuning(
+        live_threshold_seconds=live_threshold,
+        idle_threshold_seconds=idle_threshold,
+        live_multiplier=live_multiplier,
+        idle_multiplier=idle_multiplier,
     )
 
 
@@ -296,6 +341,7 @@ class FXCMConfig:
     lookback_minutes: int
     stream_targets: List[Tuple[str, str]]
     price_stream: PriceStreamSettings
+    tick_cadence: TickCadenceTuning
     history_max_calls_per_min: int
     history_max_calls_per_hour: int
     history_min_interval_seconds_m1: Optional[float]
@@ -377,6 +423,16 @@ def load_config() -> FXCMConfig:
             stream_cfg.get("price_snap_interval_seconds"),
             3.0,
             min_value=0.5,
+        ),
+    )
+
+    tick_cadence = _parse_tick_cadence_tuning(
+        stream_cfg.get("tick_cadence"),
+        TickCadenceTuning(
+            live_threshold_seconds=30.0,
+            idle_threshold_seconds=120.0,
+            live_multiplier=1.0,
+            idle_multiplier=2.5,
         ),
     )
 
@@ -495,6 +551,7 @@ def load_config() -> FXCMConfig:
         lookback_minutes=lookback_minutes,
         stream_targets=stream_targets,
         price_stream=price_stream,
+        tick_cadence=tick_cadence,
         history_max_calls_per_min=history_max_calls_per_min,
         history_max_calls_per_hour=history_max_calls_per_hour,
         history_min_interval_seconds_m1=history_min_interval_seconds_m1,
