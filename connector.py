@@ -196,6 +196,20 @@ _SESSION_STATS_TRACKER: Optional[SessionStatsTracker] = None
 _SESSION_TAG_SETTING = os.environ.get("FXCM_SESSION_TAG", "AUTO").strip() or "AUTO"
 _AUTO_SESSION_TAG = _SESSION_TAG_SETTING.upper() == "AUTO"
 _DEFAULT_SESSION_TAG = "NY_METALS"
+SESSION_WEEKEND_THRESHOLD_SECONDS = 36 * 3600  # 36 годин — явно weekend-gap
+SESSION_OVERNIGHT_THRESHOLD_SECONDS = 6 * 3600  # все, що довше 6 годин, не intraday break
+
+# Черги для взаємодії між потоками та асинхронними тасками 
+OHLCV_QUEUE_MAXSIZE = 200
+PRICE_QUEUE_MAXSIZE = 500
+HEARTBEAT_QUEUE_MAXSIZE = 200
+MARKET_STATUS_QUEUE_MAXSIZE = 50
+SUPERVISOR_SUBMIT_TIMEOUT_SECONDS = 2.0
+SUPERVISOR_RETRY_DELAY_SECONDS = 1.0
+SUPERVISOR_JOIN_TIMEOUT_SECONDS = 5.0
+THROTTLE_LOG_INTERVAL_SECONDS = 12.0
+_INFO_THROTTLE_REASONS = {"min_interval"}
+
 
 # Prometheus-метрики
 PROM_BARS_PUBLISHED = Counter(
@@ -244,18 +258,6 @@ PROM_PRICE_HISTORY_NOT_READY = Counter(
     "fxcm_pricehistory_not_ready_total",
     "Скільки разів FXCM повернув 'PriceHistoryCommunicator is not ready'",
 )
-
-# Черги для взаємодії між потоками та асинхронними тасками 
-OHLCV_QUEUE_MAXSIZE = 200
-PRICE_QUEUE_MAXSIZE = 500
-HEARTBEAT_QUEUE_MAXSIZE = 200
-MARKET_STATUS_QUEUE_MAXSIZE = 50
-SUPERVISOR_SUBMIT_TIMEOUT_SECONDS = 2.0
-SUPERVISOR_RETRY_DELAY_SECONDS = 1.0
-SUPERVISOR_JOIN_TIMEOUT_SECONDS = 5.0
-THROTTLE_LOG_INTERVAL_SECONDS = 12.0
-_INFO_THROTTLE_REASONS = {"min_interval"}
-
 
 class BackoffController:
     """Простий експоненційний backoff з логуванням."""
@@ -1299,6 +1301,23 @@ def _parse_iso8601(value: Any) -> Optional[dt.datetime]:
     return None
 
 
+def _derive_session_state_detail(
+    state_label: str,
+    seconds_to_next_open: Optional[float],
+    seconds_to_close: Optional[float],
+) -> Optional[str]:
+    state_norm = (state_label or "").lower()
+    if state_norm != "closed":
+        return None
+    if seconds_to_next_open is None:
+        return None
+    if seconds_to_next_open >= SESSION_WEEKEND_THRESHOLD_SECONDS:
+        return "weekend"
+    if seconds_to_next_open >= SESSION_OVERNIGHT_THRESHOLD_SECONDS:
+        return "overnight"
+    return "intrabreak"
+
+
 def _build_status_session_block(session_ctx: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
     global _LAST_SESSION_CONTEXT
     source: Optional[Dict[str, Any]]
@@ -1347,6 +1366,9 @@ def _build_status_session_block(session_ctx: Optional[Mapping[str, Any]]) -> Opt
         "seconds_to_close": seconds_to_close,
         "seconds_to_next_open": seconds_to_next_open,
     }
+    state_detail = _derive_session_state_detail(session_state, seconds_to_next_open, seconds_to_close)
+    if state_detail:
+        payload["state_detail"] = state_detail
     return {key: value for key, value in payload.items() if value is not None}
 
 
@@ -1421,7 +1443,31 @@ def _derive_status_note(
     price_state: str,
     ohlcv_state: str,
     context: Mapping[str, Any],
+    session_block: Optional[Mapping[str, Any]] = None,
 ) -> str:
+    session_state_detail: Optional[str]
+    if isinstance(session_block, Mapping):
+        detail_value = session_block.get("state_detail")
+        session_state_detail = str(detail_value) if isinstance(detail_value, str) else detail_value
+    else:
+        session_state_detail = None
+
+    def _resolve_next_open_seconds() -> Optional[float]:
+        value = _float_or_none(context.get("next_open_seconds"))
+        if value is not None:
+            return value
+        if isinstance(session_block, Mapping):
+            return _float_or_none(session_block.get("seconds_to_next_open"))
+        return None
+
+    if process_state in {"idle", "sleep"} and session_state_detail == "weekend":
+        next_open_seconds = _resolve_next_open_seconds()
+        if next_open_seconds is not None and next_open_seconds >= 86_400:
+            days = max(1, int(next_open_seconds // 86_400))
+            return f"weekend ({days}d)"
+        return "weekend"
+    if process_state in {"idle", "sleep"} and session_state_detail == "overnight":
+        return "overnight pause"
     if process_state == "idle":
         reason = str(context.get("idle_reason") or "market_closed")
         return f"idle: {reason}"
@@ -1455,7 +1501,7 @@ def _build_status_snapshot_from_heartbeat(payload: Dict[str, Any]) -> Optional[D
     price_state = _derive_price_status(context)
     ohlcv_state = _derive_ohlcv_status(context, process_state, payload.get("last_bar_close_ms"))
     session_block = _build_status_session_block(context.get("session"))
-    note = _derive_status_note(process_state, price_state, ohlcv_state, context)
+    note = _derive_status_note(process_state, price_state, ohlcv_state, context, session_block)
     status_payload: Dict[str, Any] = {
         "ts": time.time(),
         "process": process_state,

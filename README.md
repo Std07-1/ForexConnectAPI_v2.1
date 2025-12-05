@@ -65,6 +65,7 @@ Stage 3 закрито повністю: усі три підпроекти пр
     "name": "Tokyo",
     "tag": "TOKYO",
     "state": "open",
+    "state_detail": "active",
     "current_open_utc": "2025-12-05T00:00:00Z",
     "current_close_utc": "2025-12-05T09:00:00Z",
     "next_open_utc": "2025-12-05T09:00:00Z",
@@ -79,7 +80,7 @@ Stage 3 закрито повністю: усі три підпроекти пр
 - `market`: `open`, `closed`, `unknown` (якщо ще не отримали FXCM статус).
 - `price`: `ok`, `stale` (тиків давно не було), `down` (price feed відсутній).
 - `ohlcv`: `ok`, `delayed` (лаг >60 с), `down` (барів немає або процес у паузі).
-- `session`: структурований зріз активної сесії (людська назва, тег, відкриття/закриття, таймери до подій).
+- `session`: структурований зріз активної сесії (людська назва, тег, відкриття/закриття, таймери до подій) та `state_detail` (`active`, `overnight`, `weekend`, `intrabreak`).
 - `note`: короткий текст для людей: `ok`, `idle: calendar_closed`, `backoff FXCM 30s`, `price stale` тощо.
 
 Канал можна перевизначити через `FXCM_STATUS_CHANNEL` або `stream.status_channel` у `runtime_settings.json`; дефолт — `fxcm:status`. Усі інші розширені поля (`heartbeat.context`, `diag.backoff`, `history`) залишаються внутрішнім контрактом AiOne/SMC і не потрібні стороннім споживачам.

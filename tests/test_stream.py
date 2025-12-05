@@ -1618,6 +1618,34 @@ class StatusSnapshotTest(unittest.TestCase):
         self.assertIsInstance(session, dict)
         self.assertEqual(session.get("tag"), "LDN_METALS")
         self.assertEqual(session.get("state"), "closed")
+        self.assertEqual(session.get("state_detail"), "intrabreak")
+
+    def test_status_snapshot_marks_weekend(self) -> None:
+        fake_now = dt.datetime(2025, 12, 6, 12, 0, tzinfo=dt.timezone.utc)
+        payload = {
+            "type": "heartbeat",
+            "state": "idle",
+            "ts": fake_now.isoformat(),
+            "context": {
+                "idle_reason": "calendar_closed",
+                "next_open_seconds": 172800.0,
+                "session": {
+                    "tag": "NY_METALS",
+                    "session_open_utc": "2025-12-05T14:30:00+00:00",
+                    "session_close_utc": "2025-12-05T21:00:00+00:00",
+                    "next_open_utc": "2025-12-08T00:00:00+00:00",
+                    "next_open_seconds": 172800.0,
+                },
+            },
+        }
+        with mock.patch("connector._now_utc", return_value=fake_now):
+            snapshot = connector._build_status_snapshot_from_heartbeat(payload)
+        assert snapshot is not None
+        self.assertEqual(snapshot["note"], "weekend (2d)")
+        session = snapshot["session"]
+        self.assertIsInstance(session, dict)
+        self.assertEqual(session.get("state"), "closed")
+        self.assertEqual(session.get("state_detail"), "weekend")
 
 
 class IdleSleepHelperTest(unittest.TestCase):
