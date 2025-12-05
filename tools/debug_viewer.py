@@ -201,7 +201,7 @@ _IDLE_THRESHOLD_OVERRIDES: Dict[str, Tuple[float, float]] = {
 }
 ALERT_SEVERITY_ORDER = {"danger": 0, "warning": 1, "info": 2}
 ALERT_SEVERITY_COLORS = {"danger": "red", "warning": "yellow", "info": "cyan"}
-MENU_TEXT = "[P] пауза  [C] очистити  [Q] вихід  [0] TL  [1] SUM  [2] SES  [3] ALERT  [4] STREAM  [5] PRICE  [6] SUPR"
+MENU_TEXT = "[P] пауза  [C] очистити  [Q] вихід  [0] TL  [1] SUM  [2] SES  [3] ALERT  [4] STREAM  [5] PRICE  [6] SUPR  [7] HIST"
 TIMELINE_MATRIX_ROWS = _cfg_int("timeline_matrix_rows", 10, min_value=2)
 TIMELINE_MAX_COLUMNS = _cfg_int("timeline_max_columns", 120, min_value=10)
 _TIMELINE_HISTORY_DEFAULT = max(240, TIMELINE_MATRIX_ROWS * TIMELINE_MAX_COLUMNS * 2)
@@ -294,6 +294,7 @@ class DashboardMode(Enum):
     STREAMS = 4
     PRICE = 5
     SUPERVISOR = 6
+    HISTORY = 7
 
 
 @dataclass
@@ -343,6 +344,10 @@ class ViewerState:
     tick_silence_seconds: Optional[float] = None
     supervisor_diag: Dict[str, Any] = field(default_factory=dict)
     supervisor_updated: Optional[float] = None
+    history_quota: Dict[str, Any] = field(default_factory=dict)
+    history_quota_updated: Optional[float] = None
+    backoff_diag: Dict[str, Any] = field(default_factory=dict)
+    backoff_diag_updated: Optional[float] = None
 
     def note_heartbeat(self, payload: Dict[str, Any]) -> None:
         self.last_heartbeat = payload
@@ -375,6 +380,25 @@ class ViewerState:
         else:
             self.supervisor_diag = {}
             self.supervisor_updated = None
+        history_ctx = context.get("history")
+        if isinstance(history_ctx, dict):
+            self.history_quota = history_ctx
+            self.history_quota_updated = now_ts
+        else:
+            self.history_quota = {}
+            self.history_quota_updated = None
+        diag_ctx = context.get("diag")
+        backoff_ctx = None
+        if isinstance(diag_ctx, dict):
+            candidate = diag_ctx.get("backoff")
+            if isinstance(candidate, dict):
+                backoff_ctx = candidate
+        if backoff_ctx is not None:
+            self.backoff_diag = backoff_ctx
+            self.backoff_diag_updated = now_ts
+        else:
+            self.backoff_diag = {}
+            self.backoff_diag_updated = None
 
     def note_market_status(self, payload: Dict[str, Any]) -> None:
         self.last_market_status = payload
@@ -644,28 +668,64 @@ def _iso_to_epoch(value: Optional[str]) -> float:
     return dt.datetime.fromisoformat(normalized).timestamp()
 
 
-def _coerce_float(value: Any) -> Optional[float]:
+def _coerce_float(
+    value: Any,
+    default: Optional[float] = None,
+    *,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> Optional[float]:
+    parsed: Optional[float]
     if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str) and value.strip():
+        parsed = float(value)
+    elif isinstance(value, str) and value.strip():
         try:
-            return float(value)
+            parsed = float(value)
         except ValueError:
-            return None
-    return None
+            parsed = None
+    else:
+        parsed = None
+
+    if parsed is None:
+        parsed = default
+    if parsed is None:
+        return None
+    if min_value is not None:
+        parsed = max(min_value, parsed)
+    if max_value is not None:
+        parsed = min(max_value, parsed)
+    return parsed
 
 
-def _coerce_int(value: Any) -> Optional[int]:
+def _coerce_int(
+    value: Any,
+    default: Optional[int] = None,
+    *,
+    min_value: Optional[int] = None,
+    max_value: Optional[int] = None,
+) -> Optional[int]:
+    parsed: Optional[int]
     if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str) and value.strip():
+        parsed = int(value)
+    elif isinstance(value, float):
+        parsed = int(value)
+    elif isinstance(value, str) and value.strip():
         try:
-            return int(float(value))
+            parsed = int(float(value))
         except ValueError:
-            return None
-    return None
+            parsed = None
+    else:
+        parsed = None
+
+    if parsed is None:
+        parsed = default
+    if parsed is None:
+        return None
+    if min_value is not None:
+        parsed = max(min_value, parsed)
+    if max_value is not None:
+        parsed = min(max_value, parsed)
+    return parsed
 
 
 def _format_float(value: Optional[float], digits: int = 2) -> str:
@@ -959,6 +1019,7 @@ def handle_keypress(key: str, state: ViewerState) -> bool:
         "4": DashboardMode.STREAMS,
         "5": DashboardMode.PRICE,
         "6": DashboardMode.SUPERVISOR,
+        "7": DashboardMode.HISTORY,
     }
     if normalized in mode_map:
         new_mode = mode_map[normalized]
@@ -1815,6 +1876,136 @@ def build_stream_targets_panel(state: ViewerState) -> Panel:
     return Panel(table, title="Stream targets", border_style="magenta")
 
 
+def build_history_quota_panel(state: ViewerState) -> Panel:
+    data = state.history_quota or {}
+    updated_age = None
+    if state.history_quota_updated is not None:
+        updated_age = max(0.0, time.time() - state.history_quota_updated)
+    if not data:
+        hint = "Очікуємо history-квоту у heartbeat…"
+        if updated_age is not None:
+            hint = f"History quota не оновлювалась {updated_age:.0f} с"
+        return Panel(hint, title="History quota", border_style="yellow", box=box.ROUNDED)
+
+    summary = Table.grid(padding=(0, 1))
+    summary.add_column(style="bold cyan", overflow="fold")
+    summary.add_column(overflow="fold")
+
+    calls_60 = _coerce_int(data.get("calls_60s")) or 0
+    limit_60 = _coerce_int(data.get("limit_60s")) or 0
+    calls_3600 = _coerce_int(data.get("calls_3600s")) or 0
+    limit_3600 = _coerce_int(data.get("limit_3600s")) or 0
+    summary.add_row("Calls 60s", f"{calls_60}/{limit_60 or '∞'}")
+    summary.add_row("Calls 3600s", f"{calls_3600}/{limit_3600 or '∞'}")
+    throttle_state = str(data.get("throttle_state", "ok") or "ok").lower()
+    state_color = {"ok": "green", "warn": "yellow", "critical": "red"}.get(throttle_state, "cyan")
+    summary.add_row("State", Text(throttle_state, style=f"bold {state_color}"))
+    summary.add_row("Next slot", _format_diag_duration(data.get("next_slot_seconds")))
+    last_reason = data.get("last_denied_reason")
+    if last_reason:
+        summary.add_row("Last deny", last_reason)
+    if updated_age is not None:
+        summary.add_row("Updated", _format_diag_duration(updated_age))
+
+    priority_ctx = data.get("priority") or {}
+    reserve_min = _coerce_int(priority_ctx.get("reserve_per_min"))
+    reserve_hour = _coerce_int(priority_ctx.get("reserve_per_hour"))
+    if reserve_min:
+        summary.add_row("Reserve/min", str(reserve_min))
+    if reserve_hour:
+        summary.add_row("Reserve/hour", str(reserve_hour))
+    priority_calls = _coerce_int(priority_ctx.get("calls_60s"))
+    if priority_calls is not None:
+        summary.add_row("Priority calls 60s", str(priority_calls))
+
+    skipped_entries = []
+    raw_skipped = data.get("skipped_polls")
+    if isinstance(raw_skipped, list):
+        for entry in raw_skipped:
+            if not isinstance(entry, dict):
+                continue
+            skipped_entries.append(
+                {
+                    "symbol": entry.get("symbol", "?"),
+                    "tf": entry.get("tf", "?"),
+                    "count": _coerce_int(entry.get("count")) or 0,
+                }
+            )
+
+    priority_rows: List[Dict[str, Any]] = []
+    raw_targets = priority_ctx.get("targets")
+    if isinstance(raw_targets, list):
+        for target in raw_targets:
+            priority_rows.append({"target": str(target)})
+
+    skipped_table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    skipped_table.add_column("Symbol", style="bold", overflow="fold")
+    skipped_table.add_column("TF", overflow="fold")
+    skipped_table.add_column("Skipped", justify="right", overflow="fold")
+    if not skipped_entries:
+        skipped_table.add_row("—", "—", "0")
+    else:
+        for entry in skipped_entries[:8]:
+            skipped_table.add_row(str(entry["symbol"]), str(entry["tf"]), str(entry["count"]))
+
+    panels: List[Any] = [summary, Text("")]
+    if priority_rows:
+        priority_table = Table(box=box.SIMPLE_HEAVY, expand=True)
+        priority_table.add_column("Priority targets", style="bold", overflow="fold")
+        for entry in priority_rows[:8]:
+            priority_table.add_row(entry["target"])
+        panels.extend([priority_table, Text("")])
+    panels.append(skipped_table)
+    content = Group(*panels)
+    return Panel(content, title="History quota", border_style="magenta", box=box.ROUNDED)
+
+
+def build_backoff_panel(state: ViewerState) -> Panel:
+    data = state.backoff_diag or {}
+    updated_age = None
+    if state.backoff_diag_updated is not None:
+        updated_age = max(0.0, time.time() - state.backoff_diag_updated)
+    if not data:
+        hint = "Очікуємо diag.backoff у heartbeat…"
+        if updated_age is not None:
+            hint = f"Backoff diag не оновлювався {updated_age:.0f} с"
+        return Panel(hint, title="Backoff diag", border_style="yellow", box=box.ROUNDED)
+
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("Key", style="bold", overflow="fold")
+    table.add_column("State", overflow="fold")
+    table.add_column("Remaining", justify="right", overflow="fold")
+    table.add_column("Sleep", justify="right", overflow="fold")
+    table.add_column("Fails", justify="right", overflow="fold")
+    table.add_column("Last error", overflow="fold")
+
+    entries: List[Tuple[str, Dict[str, Any]]] = sorted(data.items(), key=lambda item: item[0])
+    for key, payload in entries:
+        remaining = _coerce_float(payload.get("remaining_seconds"), 0.0, min_value=0.0)
+        if remaining is None:
+            remaining = 0.0
+        sleep_seconds = _coerce_float(payload.get("sleep_seconds"), 0.0, min_value=0.0)
+        fail_count = _coerce_int(payload.get("fail_count"), 0, min_value=0)
+        active = bool(payload.get("active")) and remaining > 0.0
+        state_label = Text("active" if active else "idle", style="bold red" if active else "green")
+        last_error = payload.get("last_error") or "—"
+        if payload.get("last_error_ts"):
+            last_error = f"{last_error} ({payload['last_error_ts']})"
+        table.add_row(
+            key,
+            state_label,
+            _format_diag_duration(remaining),
+            _format_diag_duration(sleep_seconds),
+            str(fail_count),
+            str(last_error),
+        )
+
+    extras: List[Any] = [table]
+    if updated_age is not None:
+        extras.append(Text(f"Оновлено {updated_age:.1f} с тому", style="dim"))
+    return Panel(Group(*extras), title="Backoff diag", border_style="magenta", box=box.ROUNDED)
+
+
 def build_price_stream_panel(state: ViewerState) -> Panel:
     data = state.price_stream or {}
     symbols_state = data.get("symbols_state") if isinstance(data, dict) else None
@@ -2224,6 +2415,15 @@ def _render_mode_body(state: ViewerState) -> Union[Layout, Panel]:
         return build_price_stream_panel(state)
     if mode == DashboardMode.SUPERVISOR:
         return build_supervisor_mode(state)
+    if mode == DashboardMode.HISTORY:
+        layout = Layout(name="history_mode")
+        layout.split_column(
+            Layout(name="history_backoff", size=9, minimum_size=5),
+            Layout(name="history_quota", ratio=1, minimum_size=8),
+        )
+        layout["history_backoff"].update(build_backoff_panel(state))
+        layout["history_quota"].update(build_history_quota_panel(state))
+        return layout
     layout = Layout(name="alerts_mode")
     layout.split_column(
         Layout(name="alerts", ratio=1, minimum_size=5),

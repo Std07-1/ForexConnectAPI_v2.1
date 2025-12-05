@@ -104,6 +104,12 @@ def _parse_stream_targets_config(value: Any) -> List[Tuple[str, str]]:
     return targets or _parse_stream_targets(STREAM_DEFAULT_CONFIG)
 
 
+def _parse_priority_targets_setting(value: Any) -> List[Tuple[str, str]]:
+    if value is None:
+        return []
+    return _parse_stream_targets_config(value)
+
+
 def _coerce_float(value: Any, default: float, *, min_value: float = 0.1) -> float:
     if value is None:
         return default
@@ -112,6 +118,18 @@ def _coerce_float(value: Any, default: float, *, min_value: float = 0.1) -> floa
     except (TypeError, ValueError):
         return default
     return max(min_value, parsed)
+
+
+def _coerce_ratio(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed != parsed:  # noqa: PLR1716 - перевірка NaN
+        return default
+    return min(1.0, max(0.0, parsed))
 
 
 @dataclass(frozen=True)
@@ -171,6 +189,22 @@ class BackoffSettings:
     redis_stream: BackoffPolicy
 
 
+@dataclass(frozen=True)
+class HistoryLoadThresholds:
+    min_interval: float
+    warn: float
+    reserve: float
+    critical: float
+
+
+@dataclass(frozen=True)
+class BackoffTuning:
+    base_seconds: float
+    max_seconds: float
+    multiplier: float
+    jitter: float
+
+
 def _parse_backoff_policy(value: Any, fallback: BackoffPolicy) -> BackoffPolicy:
     if not isinstance(value, Mapping):
         return fallback
@@ -178,6 +212,21 @@ def _parse_backoff_policy(value: Any, fallback: BackoffPolicy) -> BackoffPolicy:
     factor = _coerce_float(value.get("factor"), fallback.factor, min_value=1.0)
     max_delay = _coerce_float(value.get("max_delay"), fallback.max_delay, min_value=base_delay)
     return BackoffPolicy(base_delay=base_delay, factor=factor, max_delay=max_delay)
+
+
+def _parse_backoff_tuning(value: Any, fallback: BackoffTuning) -> BackoffTuning:
+    if not isinstance(value, Mapping):
+        return fallback
+    base_seconds = _coerce_float(value.get("base_seconds"), fallback.base_seconds, min_value=0.1)
+    max_seconds = _coerce_float(value.get("max_seconds"), fallback.max_seconds, min_value=base_seconds)
+    multiplier = _coerce_float(value.get("multiplier"), fallback.multiplier, min_value=1.0)
+    jitter = _coerce_float(value.get("jitter"), fallback.jitter, min_value=0.0)
+    return BackoffTuning(
+        base_seconds=base_seconds,
+        max_seconds=max_seconds,
+        multiplier=multiplier,
+        jitter=jitter,
+    )
 
 
 def _load_calendar_settings() -> CalendarSettings:
@@ -247,6 +296,16 @@ class FXCMConfig:
     lookback_minutes: int
     stream_targets: List[Tuple[str, str]]
     price_stream: PriceStreamSettings
+    history_max_calls_per_min: int
+    history_max_calls_per_hour: int
+    history_min_interval_seconds_m1: Optional[float]
+    history_min_interval_seconds_m5: Optional[float]
+    history_priority_targets: List[Tuple[str, str]]
+    history_priority_reserve_per_min: int
+    history_priority_reserve_per_hour: int
+    history_load_thresholds: HistoryLoadThresholds
+    history_backoff: BackoffTuning
+    redis_backoff: BackoffTuning
     sample_request: SampleRequestSettings
     observability: ObservabilitySettings
     calendar: CalendarSettings
@@ -321,6 +380,53 @@ def load_config() -> FXCMConfig:
         ),
     )
 
+    history_max_calls_per_min = _coerce_int(
+        stream_cfg.get("history_max_calls_per_min"),
+        120,
+        min_value=1,
+    )
+    history_max_calls_per_hour = _coerce_int(
+        stream_cfg.get("history_max_calls_per_hour"),
+        2_400,
+        min_value=1,
+    )
+
+    def _optional_history_interval(key: str) -> Optional[float]:
+        value = stream_cfg.get(key)
+        if value is None:
+            return None
+        return _coerce_float(value, 0.0, min_value=0.0)
+
+    history_min_interval_seconds_m1 = _optional_history_interval("history_min_interval_seconds_m1")
+    history_min_interval_seconds_m5 = _optional_history_interval("history_min_interval_seconds_m5")
+    history_priority_targets = _parse_priority_targets_setting(stream_cfg.get("history_priority_targets"))
+    history_priority_reserve_per_min = _coerce_int(
+        stream_cfg.get("history_priority_reserve_per_min"),
+        0,
+        min_value=0,
+    )
+    history_priority_reserve_per_hour = _coerce_int(
+        stream_cfg.get("history_priority_reserve_per_hour"),
+        0,
+        min_value=0,
+    )
+    thresholds_raw = stream_cfg.get("history_load_thresholds")
+    thresholds_cfg = thresholds_raw if isinstance(thresholds_raw, Mapping) else {}
+    history_load_thresholds = HistoryLoadThresholds(
+        min_interval=_coerce_ratio(thresholds_cfg.get("min_interval"), 0.45),
+        warn=_coerce_ratio(thresholds_cfg.get("warn"), 0.7),
+        reserve=_coerce_ratio(thresholds_cfg.get("reserve"), 0.7),
+        critical=_coerce_ratio(thresholds_cfg.get("critical"), 0.9),
+    )
+    history_backoff = _parse_backoff_tuning(
+        stream_cfg.get("history_backoff"),
+        BackoffTuning(base_seconds=5.0, max_seconds=180.0, multiplier=2.0, jitter=0.25),
+    )
+    redis_backoff = _parse_backoff_tuning(
+        stream_cfg.get("redis_backoff"),
+        BackoffTuning(base_seconds=2.0, max_seconds=60.0, multiplier=2.0, jitter=0.2),
+    )
+
     sample_cfg_raw = runtime_settings.get("sample_request")
     sample_cfg = sample_cfg_raw if isinstance(sample_cfg_raw, dict) else {}
     sample_request = SampleRequestSettings(
@@ -389,6 +495,16 @@ def load_config() -> FXCMConfig:
         lookback_minutes=lookback_minutes,
         stream_targets=stream_targets,
         price_stream=price_stream,
+        history_max_calls_per_min=history_max_calls_per_min,
+        history_max_calls_per_hour=history_max_calls_per_hour,
+        history_min_interval_seconds_m1=history_min_interval_seconds_m1,
+        history_min_interval_seconds_m5=history_min_interval_seconds_m5,
+        history_priority_targets=history_priority_targets,
+        history_priority_reserve_per_min=history_priority_reserve_per_min,
+        history_priority_reserve_per_hour=history_priority_reserve_per_hour,
+        history_load_thresholds=history_load_thresholds,
+        history_backoff=history_backoff,
+        redis_backoff=redis_backoff,
         sample_request=sample_request,
         observability=observability,
         calendar=calendar_settings,

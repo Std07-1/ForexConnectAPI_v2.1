@@ -15,16 +15,19 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import math
 import os
 import queue
+import random
 import threading
 import time
+from collections import defaultdict, deque
 from concurrent.futures import TimeoutError as FutureTimeout
 from functools import partial
 from dataclasses import dataclass
 from logging import Logger
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union, cast
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -79,6 +82,7 @@ from cache_utils import (
 )
 from config import (
     BackoffPolicy,
+    BackoffTuning,
     CalendarSettings,
     FXCMConfig,
     RedisSettings,
@@ -239,6 +243,8 @@ MARKET_STATUS_QUEUE_MAXSIZE = 50
 SUPERVISOR_SUBMIT_TIMEOUT_SECONDS = 2.0
 SUPERVISOR_RETRY_DELAY_SECONDS = 1.0
 SUPERVISOR_JOIN_TIMEOUT_SECONDS = 5.0
+THROTTLE_LOG_INTERVAL_SECONDS = 12.0
+_INFO_THROTTLE_REASONS = {"min_interval"}
 
 
 class BackoffController:
@@ -255,6 +261,379 @@ class BackoffController:
 
     def reset(self) -> None:
         self._current = self.policy.base_delay
+
+
+class HistoryQuota:
+    """Неблокуючий rate-limiter для get_history з ковзними вікнами та пріоритетами."""
+
+    _MIN_INTERVAL_THRESHOLD = 0.45  # значення за замовчуванням для мінімальних інтервалів
+    _WARN_THRESHOLD = 0.7  # дефолт для попереджувального стану
+    _RESERVE_THRESHOLD = 0.7  # дефолт для пріоритетного резерву
+    _CRITICAL_THRESHOLD = 0.9  # дефолт для критичного стану
+
+    def __init__(
+        self,
+        max_calls_per_min: int,
+        max_calls_per_hour: int,
+        *,
+        min_interval_by_tf: Optional[Dict[str, float]] = None,
+        priority_targets: Optional[Sequence[Tuple[str, str]]] = None,
+        priority_reserve_per_min: int = 0,
+        priority_reserve_per_hour: int = 0,
+        load_thresholds: Optional[Mapping[str, float]] = None,
+    ) -> None:
+        self.max_calls_per_min = max(1, int(max_calls_per_min))
+        self.max_calls_per_hour = max(1, int(max_calls_per_hour))
+        normalized_intervals: Dict[str, float] = {}
+        if min_interval_by_tf:
+            for raw_tf, value in min_interval_by_tf.items():
+                if value is None:
+                    continue
+                tf_key = self._tf_key(raw_tf)
+                if not tf_key:
+                    continue
+                normalized_intervals[tf_key] = max(0.0, float(value))
+        self.min_interval_by_tf = normalized_intervals
+        self.priority_reserve_per_min = max(0, int(priority_reserve_per_min))
+        self.priority_reserve_per_hour = max(0, int(priority_reserve_per_hour))
+        self._priority_targets: Set[Tuple[str, str]] = {
+            self._priority_key(symbol, timeframe)
+            for symbol, timeframe in (priority_targets or [])
+        }
+        thresholds = load_thresholds or {}
+        self._min_interval_threshold = self._clamp_ratio(
+            thresholds.get("min_interval"),
+            self._MIN_INTERVAL_THRESHOLD,
+        )
+        self._warn_threshold = self._clamp_ratio(
+            thresholds.get("warn"),
+            self._WARN_THRESHOLD,
+        )
+        self._reserve_threshold = self._clamp_ratio(
+            thresholds.get("reserve"),
+            self._RESERVE_THRESHOLD,
+        )
+        self._critical_threshold = self._clamp_ratio(
+            thresholds.get("critical"),
+            self._CRITICAL_THRESHOLD,
+        )
+        self._calls_60s: Deque[float] = deque()
+        self._calls_3600s: Deque[float] = deque()
+        self._priority_calls_60s: Deque[float] = deque()
+        self._priority_calls_3600s: Deque[float] = deque()
+        self._non_priority_calls_60s: Deque[float] = deque()
+        self._non_priority_calls_3600s: Deque[float] = deque()
+        self._last_call_ts_by_tf: Dict[str, float] = {}
+        self._skipped_polls: Dict[Tuple[str, str], int] = defaultdict(int)
+        self._last_next_slot = 0.0
+        self._last_denied_ts: Optional[float] = None
+        self._last_denied_reason: Optional[str] = None
+        self._state_decay_seconds = 15.0
+
+    @staticmethod
+    def _tf_key(label: str) -> str:
+        return (label or "").strip().lower()
+
+    @staticmethod
+    def _priority_key(symbol: str, timeframe: str) -> Tuple[str, str]:
+        return (_normalize_symbol(symbol), _map_timeframe_label(timeframe).lower())
+
+    @staticmethod
+    def _clamp_ratio(value: Optional[float], default: float) -> float:
+        if value is None:
+            return default
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        if math.isnan(parsed):
+            return default
+        return min(1.0, max(0.0, parsed))
+
+    def _prune(self, now: float) -> None:
+        cutoff_60 = now - 60.0
+        for window in (
+            self._calls_60s,
+            self._priority_calls_60s,
+            self._non_priority_calls_60s,
+        ):
+            while window and window[0] <= cutoff_60:
+                window.popleft()
+        cutoff_3600 = now - 3_600.0
+        for window in (
+            self._calls_3600s,
+            self._priority_calls_3600s,
+            self._non_priority_calls_3600s,
+        ):
+            while window and window[0] <= cutoff_3600:
+                window.popleft()
+
+    @staticmethod
+    def _window_wait(window: Deque[float], limit: int, window_seconds: float, now: float) -> float:
+        if limit <= 0 or len(window) < limit:
+            return 0.0
+        oldest = window[0]
+        remaining = window_seconds - (now - oldest)
+        return max(0.0, remaining)
+
+    def _interval_wait(self, tf_label: str, now: float) -> float:
+        tf_key = self._tf_key(tf_label)
+        min_interval = self.min_interval_by_tf.get(tf_key)
+        if not min_interval:
+            return 0.0
+        last_call = self._last_call_ts_by_tf.get(tf_key)
+        if last_call is None:
+            return 0.0
+        return max(0.0, min_interval - (now - last_call))
+
+    def allow_call(self, symbol: str, timeframe: str, now: float) -> Tuple[bool, float, str]:
+        """Перевіряє бюджет get_history без блокування."""
+
+        self._prune(now)
+        tf_norm = _map_timeframe_label(timeframe)
+        is_priority = self._priority_key(symbol, timeframe) in self._priority_targets
+        wait_60 = self._window_wait(self._calls_60s, self.max_calls_per_min, 60.0, now)
+        wait_3600 = self._window_wait(self._calls_3600s, self.max_calls_per_hour, 3_600.0, now)
+        wait_interval = self._interval_wait(tf_norm, now)
+        wait_reserve = 0.0
+        if not is_priority:
+            wait_reserve = max(
+                self._reserve_wait(
+                    self._non_priority_calls_60s,
+                    self.max_calls_per_min - self.priority_reserve_per_min,
+                    60.0,
+                    now,
+                ),
+                self._reserve_wait(
+                    self._non_priority_calls_3600s,
+                    self.max_calls_per_hour - self.priority_reserve_per_hour,
+                    3_600.0,
+                    now,
+                ),
+            )
+        ratio_60 = len(self._calls_60s) / self.max_calls_per_min if self.max_calls_per_min else 0.0
+        ratio_3600 = len(self._calls_3600s) / self.max_calls_per_hour if self.max_calls_per_hour else 0.0
+        load_ratio = max(ratio_60, ratio_3600)
+        apply_min_interval = (
+            load_ratio >= self._min_interval_threshold
+            and not is_priority
+        )
+        apply_priority_reserve = (
+            load_ratio >= self._reserve_threshold
+            and not is_priority
+        )
+
+        candidates: List[Tuple[str, float]] = []
+
+        def _register_wait(label: str, value: float) -> None:
+            if value > 0.0:
+                candidates.append((label, value))
+
+        _register_wait("minute_quota", wait_60)
+        _register_wait("hour_quota", wait_3600)
+        if apply_min_interval:
+            _register_wait("min_interval", wait_interval)
+        if apply_priority_reserve:
+            _register_wait("priority_reserve", wait_reserve)
+
+        if not candidates:
+            self._last_next_slot = 0.0
+            self._last_denied_reason = None
+            return True, 0.0, "ok"
+
+        deny_reason, wait_seconds = max(candidates, key=lambda item: item[1])
+
+        self._last_next_slot = wait_seconds
+        self._last_denied_ts = now
+        self._last_denied_reason = deny_reason
+        return False, wait_seconds, deny_reason
+
+    @staticmethod
+    def _reserve_wait(window: Deque[float], limit: int, window_seconds: float, now: float) -> float:
+        if limit <= 0:
+            return window_seconds
+        if len(window) < max(0, limit):
+            return 0.0
+        oldest = window[0]
+        remaining = window_seconds - (now - oldest)
+        return max(0.0, remaining)
+
+    def record_call(self, symbol: str, timeframe: str, now: float) -> None:
+        """Фіксує успішний виклик get_history."""
+
+        tf_norm = _map_timeframe_label(timeframe)
+        is_priority = self._priority_key(symbol, timeframe) in self._priority_targets
+        self._calls_60s.append(now)
+        self._calls_3600s.append(now)
+        target_60 = self._priority_calls_60s if is_priority else self._non_priority_calls_60s
+        target_3600 = self._priority_calls_3600s if is_priority else self._non_priority_calls_3600s
+        target_60.append(now)
+        target_3600.append(now)
+        self._prune(now)
+        self._last_call_ts_by_tf[self._tf_key(tf_norm)] = now
+        self._last_next_slot = 0.0
+
+    def register_skip(self, symbol: str, timeframe: str) -> None:
+        key = (_normalize_symbol(symbol), _map_timeframe_label(timeframe))
+        self._skipped_polls[key] += 1
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = time.monotonic()
+        state = self._resolve_state(now)
+        skipped = [
+            {"symbol": symbol, "tf": tf, "count": count}
+            for (symbol, tf), count in sorted(
+                self._skipped_polls.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        ][:12]
+        priority_targets = [
+            f"{symbol}:{tf}"
+            for symbol, tf in sorted(self._priority_targets)
+        ]
+        return {
+            "calls_60s": len(self._calls_60s),
+            "limit_60s": self.max_calls_per_min,
+            "calls_3600s": len(self._calls_3600s),
+            "limit_3600s": self.max_calls_per_hour,
+            "priority": {
+                "targets": priority_targets,
+                "reserve_per_min": self.priority_reserve_per_min,
+                "reserve_per_hour": self.priority_reserve_per_hour,
+                "calls_60s": len(self._priority_calls_60s),
+                "calls_3600s": len(self._priority_calls_3600s),
+            },
+            "throttle_state": state,
+            "next_slot_seconds": round(self._last_next_slot, 3),
+            "last_denied_reason": self._last_denied_reason,
+            "skipped_polls": skipped,
+        }
+
+    def _resolve_state(self, now: float) -> str:
+        ratio_60 = len(self._calls_60s) / self.max_calls_per_min if self.max_calls_per_min else 0.0
+        ratio_3600 = len(self._calls_3600s) / self.max_calls_per_hour if self.max_calls_per_hour else 0.0
+        max_ratio = max(ratio_60, ratio_3600)
+        recent_quota_deny = (
+            self._last_denied_ts is not None
+            and now - self._last_denied_ts <= self._state_decay_seconds
+            and (self._last_denied_reason in {"minute_quota", "hour_quota"})
+        )
+        if max_ratio >= self._critical_threshold and recent_quota_deny:
+            return "critical"
+        if max_ratio >= self._warn_threshold or recent_quota_deny:
+            return "warn"
+        return "ok"
+
+
+class FxcmBackoffController:
+    """Потокобезпечний backoff з джитером для FXCM history та Redis."""
+
+    def __init__(
+        self,
+        *,
+        base_seconds: float,
+        max_seconds: float,
+        multiplier: float,
+        jitter: float,
+    ) -> None:
+        self._base_seconds = max(0.1, float(base_seconds))
+        self._max_seconds = max(self._base_seconds, float(max_seconds))
+        self._multiplier = max(1.0, float(multiplier))
+        self._jitter = max(0.0, float(jitter))
+        self._lock = threading.Lock()
+        self._current_sleep = self._base_seconds
+        self._fail_count = 0
+        self._active = False
+        self._last_error: Optional[str] = None
+        self._last_error_ts: Optional[dt.datetime] = None
+        self._resume_wall: Optional[dt.datetime] = None
+        self._resume_monotonic = 0.0
+
+    @classmethod
+    def from_tuning(cls, tuning: BackoffTuning) -> "FxcmBackoffController":
+        return cls(
+            base_seconds=tuning.base_seconds,
+            max_seconds=tuning.max_seconds,
+            multiplier=tuning.multiplier,
+            jitter=tuning.jitter,
+        )
+
+    def fail(self, reason: str) -> float:
+        with self._lock:
+            target = self._current_sleep if self._active else self._base_seconds
+            next_sleep = min(self._max_seconds, target * (self._multiplier if self._active else 1.0))
+            jitter_factor = 1.0
+            if self._jitter > 0.0:
+                jitter_factor = random.uniform(max(0.0, 1.0 - self._jitter), 1.0 + self._jitter)
+            sleep_seconds = min(self._max_seconds, max(self._base_seconds, next_sleep * jitter_factor))
+            now_mon = time.monotonic()
+            now_wall = dt.datetime.now(dt.timezone.utc)
+            self._current_sleep = sleep_seconds
+            self._fail_count += 1
+            self._active = True
+            self._last_error = reason
+            self._last_error_ts = now_wall
+            self._resume_monotonic = now_mon + sleep_seconds
+            self._resume_wall = now_wall + dt.timedelta(seconds=sleep_seconds)
+            return sleep_seconds
+
+    def success(self) -> None:
+        with self._lock:
+            if not self._active and self._fail_count == 0:
+                return
+            self._active = False
+            self._fail_count = 0
+            self._current_sleep = self._base_seconds
+            self._resume_monotonic = 0.0
+            self._resume_wall = None
+
+    def remaining(self) -> float:
+        with self._lock:
+            return self._remaining_locked()
+
+    def is_active(self) -> bool:
+        with self._lock:
+            self._expire_if_needed_locked()
+            return self._active
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            remaining = self._remaining_locked()
+            return {
+                "active": self._active and remaining > 0.0,
+                "sleep_seconds": round(self._current_sleep, 3),
+                "remaining_seconds": round(max(0.0, remaining), 3),
+                "fail_count": self._fail_count,
+                "last_error": self._last_error,
+                "last_error_ts": self._format_ts(self._last_error_ts),
+                "resume_at": self._format_ts(self._resume_wall),
+            }
+
+    def _remaining_locked(self) -> float:
+        if not self._active:
+            return 0.0
+        remaining = self._resume_monotonic - time.monotonic()
+        if remaining <= 0:
+            self._expire_if_needed_locked()
+            return 0.0
+        return remaining
+
+    def _expire_if_needed_locked(self) -> None:
+        if not self._active:
+            return
+        if self._resume_monotonic <= 0.0:
+            return
+        if self._resume_monotonic - time.monotonic() <= 0:
+            self._active = False
+            self._resume_monotonic = 0.0
+            self._resume_wall = None
+
+    @staticmethod
+    def _format_ts(value: Optional[dt.datetime]) -> Optional[str]:
+        if value is None:
+            return None
+        return value.isoformat()
 
 
 class FXCMRetryableError(RuntimeError):
@@ -655,11 +1034,11 @@ def _publish_market_status(
     state: str,
     *,
     next_open: Optional[dt.datetime] = None,
-) -> None:
+) -> bool:
     global _LAST_MARKET_STATUS, _LAST_MARKET_STATUS_TS
 
     if redis_client is None:
-        return
+        return False
 
     next_open_key = int(next_open.timestamp() * 1000) if next_open else None
     status_key = (state, next_open_key)
@@ -669,7 +1048,7 @@ def _publish_market_status(
         and _LAST_MARKET_STATUS_TS is not None
         and now_monotonic - _LAST_MARKET_STATUS_TS < MARKET_STATUS_REFRESH_SECONDS
     ):
-        return
+        return True
 
     payload = cast(
         MarketStatusPayload,
@@ -695,8 +1074,11 @@ def _publish_market_status(
         _LAST_MARKET_STATUS_TS = now_monotonic
         log.info("Статус ринку → %s", state)
         PROM_MARKET_STATUS.set(1 if state == "open" else 0)
+        return True
     except Exception as exc:  # noqa: BLE001
         log.exception("Не вдалося надіслати market_status у Redis: %s", exc)
+        PROM_ERROR_COUNTER.labels(type="redis").inc()
+        return False
 
 
 def _publish_heartbeat(
@@ -708,9 +1090,9 @@ def _publish_heartbeat(
     next_open: Optional[dt.datetime] = None,
     sleep_seconds: Optional[float] = None,
     context: Optional[Dict[str, Any]] = None,
-) -> None:
+) -> bool:
     if redis_client is None or not channel:
-        return
+        return False
 
     payload: Dict[str, Any] = {
         "type": "heartbeat",
@@ -730,9 +1112,11 @@ def _publish_heartbeat(
     try:
         redis_client.publish(channel, message)
         PROM_HEARTBEAT_TS.set(_now_utc().timestamp())
+        return True
     except Exception as exc:  # noqa: BLE001
         PROM_ERROR_COUNTER.labels(type="redis").inc()
         log.debug("Heartbeat publish неуспішний: %s", exc)
+        return False
 
 
 def _calc_lag_seconds(last_close_ms: Optional[int]) -> Optional[float]:
@@ -865,9 +1249,11 @@ class AsyncStreamSupervisor:
         price_channel: Optional[str] = None,
         hmac_secret: Optional[str] = None,
         hmac_algo: str = "sha256",
+        redis_backoff: Optional[FxcmBackoffController] = None,
     ) -> None:
         self._redis_supplier = redis_supplier
         self._redis_reconnector = redis_reconnector
+        self._redis_backoff = redis_backoff
         self._data_gate = data_gate
         self._heartbeat_channel = heartbeat_channel
         self._price_channel = price_channel
@@ -1137,8 +1523,11 @@ class AsyncStreamSupervisor:
 
     async def _publish_heartbeat_event(self, event: HeartbeatEvent) -> None:
         client = await self._ensure_redis_client()
+        if client is None:
+            await asyncio.sleep(SUPERVISOR_RETRY_DELAY_SECONDS)
+            return
         try:
-            await self._run_blocking(
+            ok = await self._run_blocking(
                 _publish_heartbeat,
                 client,
                 self._heartbeat_channel,
@@ -1148,21 +1537,34 @@ class AsyncStreamSupervisor:
                 sleep_seconds=event.sleep_seconds,
                 context=event.context,
             )
+            if not ok:
+                raise RedisRetryableError("heartbeat publish failed")
             self._mark_publish("heartbeat")
+        except RedisRetryableError:
+            PROM_ERROR_COUNTER.labels(type="redis").inc()
+            await self._handle_redis_error()
         except Exception as exc:  # noqa: BLE001
             self._last_error = f"heartbeat: {exc}"
             log.exception("Supervisor: публікація heartbeat завершилась помилкою.")
 
     async def _publish_market_status_event(self, event: MarketStatusEvent) -> None:
         client = await self._ensure_redis_client()
+        if client is None:
+            await asyncio.sleep(SUPERVISOR_RETRY_DELAY_SECONDS)
+            return
         try:
-            await self._run_blocking(
+            ok = await self._run_blocking(
                 _publish_market_status,
                 client,
                 event.state,
                 next_open=event.next_open,
             )
+            if not ok:
+                raise RedisRetryableError("market status publish failed")
             self._mark_publish("market_status")
+        except RedisRetryableError:
+            PROM_ERROR_COUNTER.labels(type="redis").inc()
+            await self._handle_redis_error()
         except Exception as exc:  # noqa: BLE001
             self._last_error = f"market_status: {exc}"
             log.exception("Supervisor: публікація market_status завершилась помилкою.")
@@ -1193,6 +1595,8 @@ class AsyncStreamSupervisor:
                 return
 
     async def _ensure_redis_client(self) -> Optional[Any]:  # noqa: PLR6301 - метод класу
+        if self._redis_backoff is not None and self._redis_backoff.remaining() > 0.0:
+            return None
         client = self._redis_supplier()
         if client is not None:
             return client
@@ -1205,6 +1609,7 @@ class AsyncStreamSupervisor:
             return None
 
     async def _handle_redis_error(self) -> None:
+        self._note_redis_failure("redis_error")
         if self._redis_reconnector is None:
             await asyncio.sleep(SUPERVISOR_RETRY_DELAY_SECONDS)
             return
@@ -1284,6 +1689,16 @@ class AsyncStreamSupervisor:
             entries.append(("price", self._price_queue))
         return entries
 
+    def _note_redis_failure(self, reason: str) -> None:
+        if self._redis_backoff is None:
+            return
+        self._redis_backoff.fail(reason)
+
+    def _note_redis_success(self) -> None:
+        if self._redis_backoff is None:
+            return
+        self._redis_backoff.success()
+
     def _task_state_label(self, task: Optional[asyncio.Task[Any]]) -> str:
         if task is None:
             return "disabled"
@@ -1297,6 +1712,7 @@ class AsyncStreamSupervisor:
         now = time.time()
         self._last_publish_ts[channel] = now
         self._publish_counts[channel] = self._publish_counts.get(channel, 0) + 1
+        self._note_redis_success()
 
     async def _gather_diag_snapshot(self) -> Dict[str, Any]:
         diag: Dict[str, Any] = {
@@ -2664,6 +3080,29 @@ def _attach_supervisor_context(
         context["async_supervisor"] = snapshot
 
 
+def _attach_history_quota_context(context: Dict[str, Any], quota: Optional[HistoryQuota]) -> None:
+    if quota is None:
+        return
+    context["history"] = quota.snapshot()
+
+
+def _attach_backoff_context(
+    context: Dict[str, Any],
+    *,
+    history_backoff: Optional[FxcmBackoffController],
+    redis_backoff: Optional[FxcmBackoffController],
+) -> None:
+    payload: Dict[str, Any] = {}
+    if history_backoff is not None:
+        payload["fxcm_history"] = history_backoff.snapshot()
+    if redis_backoff is not None:
+        payload["redis"] = redis_backoff.snapshot()
+    if not payload:
+        return
+    diag = context.setdefault("diag", {})
+    diag["backoff"] = payload
+
+
 def stream_fx_data(
     fx: ForexConnect,
     *,
@@ -2686,7 +3125,10 @@ def stream_fx_data(
     heartbeat_sink: Optional[Callable[[HeartbeatEvent], None]] = None,
     market_status_sink: Optional[Callable[[MarketStatusEvent], None]] = None,
     async_supervisor: Optional["AsyncStreamSupervisor"] = None,
+    history_quota: Optional[HistoryQuota] = None,
     fx_session_observer: Optional[Callable[[ForexConnect], None]] = None,
+    history_backoff: Optional[FxcmBackoffController] = None,
+    redis_backoff: Optional[FxcmBackoffController] = None,
 ) -> None:
     """Безкінечний цикл стрімінгу OHLCV у Redis.
 
@@ -2725,7 +3167,15 @@ def stream_fx_data(
             except Exception:  # noqa: BLE001
                 log.exception("Не вдалося передати market_status sink.")
         else:
-            _publish_market_status(current_redis, state, next_open=next_open)
+            ok = _publish_market_status(current_redis, state, next_open=next_open)
+            if not ok:
+                if current_redis is None:
+                    return
+                if redis_backoff is not None:
+                    redis_backoff.fail("redis_market_status")
+                raise RedisRetryableError("Публікація market_status неуспішна")
+            if redis_backoff is not None:
+                redis_backoff.success()
 
     def _emit_heartbeat_event(
         *,
@@ -2748,7 +3198,7 @@ def stream_fx_data(
             except Exception:  # noqa: BLE001
                 log.exception("Не вдалося передати heartbeat у sink.")
         else:
-            _publish_heartbeat(
+            ok = _publish_heartbeat(
                 current_redis,
                 heartbeat_channel,
                 state=state,
@@ -2757,6 +3207,14 @@ def stream_fx_data(
                 sleep_seconds=sleep_seconds,
                 context=context,
             )
+            if not ok:
+                if current_redis is None or not heartbeat_channel:
+                    return
+                if redis_backoff is not None:
+                    redis_backoff.fail("redis_heartbeat")
+                raise RedisRetryableError("Публікація heartbeat неуспішна")
+            if redis_backoff is not None:
+                redis_backoff.success()
 
     last_published_close_ms: Optional[int] = None
     last_open_time_ms: Dict[Tuple[str, str], int] = {}
@@ -2772,6 +3230,17 @@ def stream_fx_data(
                 if last_published_close_ms is None or cached_close > last_published_close_ms:
                     last_published_close_ms = cached_close
     publish_rate_limit: Dict[Tuple[str, str], float] = {}
+    throttle_log_state: Dict[Tuple[str, str, str], float] = {}
+
+    def _should_log_throttle(symbol_norm: str, timeframe_norm: str, reason: str) -> bool:
+        now_log = time.monotonic()
+        key = (symbol_norm, timeframe_norm, reason)
+        last_logged = throttle_log_state.get(key)
+        if last_logged is not None and now_log - last_logged < THROTTLE_LOG_INTERVAL_SECONDS:
+            return False
+        throttle_log_state[key] = now_log
+        return True
+
     ohlcv_sink_effective = ohlcv_sink
     if ohlcv_sink is not None and publish_interval_seconds > 0:
         min_interval = float(publish_interval_seconds)
@@ -2806,71 +3275,127 @@ def stream_fx_data(
             idle_reason: Optional[str] = None
             cycle_published_bars = 0
             now = _now_utc()
+            history_backoff_remaining = history_backoff.remaining() if history_backoff is not None else 0.0
+            history_paused_by_backoff = history_backoff_remaining > 0.0
+            redis_backoff_remaining = redis_backoff.remaining() if redis_backoff is not None else 0.0
             if not is_trading_time(now):
                 market_pause = True
                 closed_reference = now
                 idle_reason = "calendar_closed"
             else:
-                for symbol, tf_raw in config:
-                    try:
-                        df_new = _fetch_and_publish_recent(
-                            current_fx,
-                            symbol=symbol,
-                            timeframe_raw=tf_raw,
-                            redis_client=current_redis,
-                            lookback_minutes=lookback_minutes,
-                            last_open_time_ms=last_open_time_ms,
-                            data_gate=gate,
-                            min_publish_interval=publish_interval_seconds,
-                            publish_rate_limit=publish_rate_limit,
-                            hmac_secret=hmac_secret,
-                            hmac_algo=hmac_algo,
-                            session_stats=session_stats_tracker,
-                            ohlcv_sink=ohlcv_sink_effective,
-                            market_status_sink=market_status_sink,
-                        )
-                    except MarketTemporarilyClosed as exc:
-                        log.info("Стрім: ринок недоступний (%s)", exc)
-                        market_pause = True
-                        closed_reference = _now_utc()
-                        idle_reason = "fxcm_temporarily_unavailable"
-                        break
-                    except FXCMRetryableError as exc:
-                        log.warning("Втрачено з'єднання з FXCM: %s", exc)
-                        PROM_ERROR_COUNTER.labels(type="fxcm").inc()
-                        if fx_reconnector is None:
-                            raise
-                        _close_fxcm_session(current_fx, announce=False)
-                        current_fx = fx_reconnector()
-                        _notify_fx_session_observer(current_fx)
-                        restart_cycle = True
-                        break
-                    except RedisRetryableError as exc:
-                        log.warning("Помилка Redis під час публікації: %s", exc)
-                        PROM_ERROR_COUNTER.labels(type="redis").inc()
-                        if redis_reconnector is None:
-                            raise
-                        current_redis = redis_reconnector()
-                        restart_cycle = True
-                        break
+                history_call_attempted = False
+                if history_paused_by_backoff:
+                    idle_reason = "fxcm_backoff"
+                else:
+                    for symbol, tf_raw in config:
+                        tf_norm = _map_timeframe_label(tf_raw)
+                        call_started_ts: Optional[float] = None
+                        deny_reason = ""
+                        if history_quota is not None:
+                            call_started_ts = time.monotonic()
+                            allowed, next_slot, deny_reason = history_quota.allow_call(
+                                symbol,
+                                tf_norm,
+                                call_started_ts,
+                            )
+                            if not allowed:
+                                history_quota.register_skip(symbol, tf_norm)
+                                symbol_norm = _normalize_symbol(symbol)
+                                if _should_log_throttle(symbol_norm, tf_norm, deny_reason):
+                                    logger = log.info if deny_reason in _INFO_THROTTLE_REASONS else log.warning
+                                    logger(
+                                        "FXCM history throttle (%s): %s %s, наступний слот через %.1f с.",
+                                        deny_reason,
+                                        symbol,
+                                        tf_raw,
+                                        next_slot,
+                                    )
+                                continue
+                        history_call_attempted = True
+                        try:
+                            df_new = _fetch_and_publish_recent(
+                                current_fx,
+                                symbol=symbol,
+                                timeframe_raw=tf_raw,
+                                redis_client=current_redis,
+                                lookback_minutes=lookback_minutes,
+                                last_open_time_ms=last_open_time_ms,
+                                data_gate=gate,
+                                min_publish_interval=publish_interval_seconds,
+                                publish_rate_limit=publish_rate_limit,
+                                hmac_secret=hmac_secret,
+                                hmac_algo=hmac_algo,
+                                session_stats=session_stats_tracker,
+                                ohlcv_sink=ohlcv_sink_effective,
+                                market_status_sink=market_status_sink,
+                            )
+                        except MarketTemporarilyClosed as exc:
+                            log.info("Стрім: ринок недоступний (%s)", exc)
+                            market_pause = True
+                            closed_reference = _now_utc()
+                            idle_reason = "fxcm_temporarily_unavailable"
+                            break
+                        except FXCMRetryableError as exc:
+                            log.warning("Втрачено з'єднання з FXCM: %s", exc)
+                            PROM_ERROR_COUNTER.labels(type="fxcm").inc()
+                            if history_backoff is not None:
+                                history_backoff.fail("fxcm_history")
+                            if fx_reconnector is None:
+                                raise
+                            _close_fxcm_session(current_fx, announce=False)
+                            current_fx = fx_reconnector()
+                            _notify_fx_session_observer(current_fx)
+                            restart_cycle = True
+                            break
+                        except RedisRetryableError as exc:
+                            log.warning("Помилка Redis під час публікації: %s", exc)
+                            PROM_ERROR_COUNTER.labels(type="redis").inc()
+                            if redis_backoff is not None:
+                                redis_backoff.fail("redis_publish")
+                            if redis_reconnector is None:
+                                raise
+                            current_redis = redis_reconnector()
+                            restart_cycle = True
+                            break
+                        finally:
+                            if history_quota is not None and call_started_ts is not None:
+                                history_quota.record_call(symbol, tf_norm, call_started_ts)
 
-                    if df_new.empty:
-                        continue
+                        if df_new.empty:
+                            continue
 
-                    log.info(
-                        "Стрім: %s %s → %d нових барів",
-                        symbol,
-                        tf_raw,
-                        len(df_new),
-                    )
-                    last_published_close_ms = int(df_new["close_time"].max())
-                    cycle_published_bars += len(df_new)
-                    if cache_manager is not None:
-                        cache_manager.append_stream_bars(
-                            symbol_raw=symbol,
-                            timeframe_raw=tf_raw,
-                            df_new=df_new,
+                        log.info(
+                            "Стрім: %s %s → %d нових барів",
+                            symbol,
+                            tf_raw,
+                            len(df_new),
                         )
+                        last_published_close_ms = int(df_new["close_time"].max())
+                        cycle_published_bars += len(df_new)
+                        if cache_manager is not None:
+                            cache_manager.append_stream_bars(
+                                symbol_raw=symbol,
+                                timeframe_raw=tf_raw,
+                                df_new=df_new,
+                            )
+
+                if (
+                    history_backoff is not None
+                    and history_call_attempted
+                    and not restart_cycle
+                    and not market_pause
+                ):
+                    history_backoff.success()
+                    history_backoff_remaining = history_backoff.remaining()
+
+            if not restart_cycle and redis_backoff is not None and async_supervisor is None:
+                redis_backoff.success()
+
+            if history_backoff is not None:
+                history_backoff_remaining = history_backoff.remaining()
+                history_paused_by_backoff = history_backoff_remaining > 0.0
+            if redis_backoff is not None:
+                redis_backoff_remaining = redis_backoff.remaining()
 
             if restart_cycle:
                 gate.update_staleness_metrics()
@@ -2926,6 +3451,16 @@ def stream_fx_data(
                 }
                 _attach_price_stream_context(idle_context, price_stream)
                 _attach_supervisor_context(idle_context, async_supervisor)
+                _attach_history_quota_context(idle_context, history_quota)
+                if history_paused_by_backoff and history_backoff_remaining > 0.0:
+                    idle_context["history_backoff_seconds"] = round(history_backoff_remaining, 3)
+                if redis_backoff_remaining > 0.0:
+                    idle_context["redis_backoff_seconds"] = round(redis_backoff_remaining, 3)
+                _attach_backoff_context(
+                    idle_context,
+                    history_backoff=history_backoff,
+                    redis_backoff=redis_backoff,
+                )
                 if lag_seconds is not None:
                     idle_context["lag_seconds"] = lag_seconds
                 stats_snapshot = session_stats_tracker.snapshot()
@@ -2960,6 +3495,16 @@ def stream_fx_data(
                 }
                 _attach_price_stream_context(stream_context, price_stream)
                 _attach_supervisor_context(stream_context, async_supervisor)
+                _attach_history_quota_context(stream_context, history_quota)
+                if history_paused_by_backoff and history_backoff_remaining > 0.0:
+                    stream_context["history_backoff_seconds"] = round(history_backoff_remaining, 3)
+                if redis_backoff_remaining > 0.0:
+                    stream_context["redis_backoff_seconds"] = round(redis_backoff_remaining, 3)
+                _attach_backoff_context(
+                    stream_context,
+                    history_backoff=history_backoff,
+                    redis_backoff=redis_backoff,
+                )
                 if lag_seconds is not None:
                     stream_context["lag_seconds"] = lag_seconds
                 stats_snapshot = session_stats_tracker.snapshot()
@@ -2976,6 +3521,12 @@ def stream_fx_data(
                 last_idle_next_open = None
                 gate.update_staleness_metrics()
                 sleep_for = max(0.0, poll_seconds - elapsed)
+
+            if not market_pause:
+                if history_backoff_remaining > 0.0:
+                    sleep_for = max(sleep_for, history_backoff_remaining)
+                if redis_backoff_remaining > 0.0:
+                    sleep_for = max(sleep_for, redis_backoff_remaining)
 
             cycles += 1
             if max_cycles is not None and cycles >= max_cycles:
@@ -3196,17 +3747,6 @@ def main() -> None:
                     log.info(
                         "Redis недоступний — працюємо у file-only режимі (без публікацій)."
                     )
-            if config.async_supervisor:
-                supervisor = AsyncStreamSupervisor(
-                    redis_supplier=lambda: redis_holder["client"],
-                    redis_reconnector=redis_reconnector,
-                    data_gate=publish_gate,
-                    heartbeat_channel=config.observability.heartbeat_channel,
-                    price_channel=config.price_stream.channel,
-                    hmac_secret=config.hmac_secret,
-                    hmac_algo=config.hmac_algo,
-                )
-                supervisor.start()
             subscription_holder: Dict[str, Optional[FXCMOfferSubscription]] = {
                 "instance": None
             }
@@ -3226,6 +3766,41 @@ def main() -> None:
                 config.price_stream.channel,
                 config.price_stream.interval_seconds,
             )
+
+            min_interval_map: Dict[str, float] = {}
+            if config.history_min_interval_seconds_m1 is not None:
+                min_interval_map["1m"] = float(config.history_min_interval_seconds_m1)
+            if config.history_min_interval_seconds_m5 is not None:
+                min_interval_map["5m"] = float(config.history_min_interval_seconds_m5)
+            history_quota = HistoryQuota(
+                max_calls_per_min=config.history_max_calls_per_min,
+                max_calls_per_hour=config.history_max_calls_per_hour,
+                min_interval_by_tf=min_interval_map,
+                priority_targets=config.history_priority_targets,
+                priority_reserve_per_min=config.history_priority_reserve_per_min,
+                priority_reserve_per_hour=config.history_priority_reserve_per_hour,
+                load_thresholds={
+                    "min_interval": config.history_load_thresholds.min_interval,
+                    "warn": config.history_load_thresholds.warn,
+                    "reserve": config.history_load_thresholds.reserve,
+                    "critical": config.history_load_thresholds.critical,
+                },
+            )
+            history_backoff_ctrl = FxcmBackoffController.from_tuning(config.history_backoff)
+            redis_backoff_ctrl = FxcmBackoffController.from_tuning(config.redis_backoff)
+
+            if config.async_supervisor:
+                supervisor = AsyncStreamSupervisor(
+                    redis_supplier=lambda: redis_holder["client"],
+                    redis_reconnector=redis_reconnector,
+                    data_gate=publish_gate,
+                    heartbeat_channel=config.observability.heartbeat_channel,
+                    price_channel=config.price_stream.channel,
+                    hmac_secret=config.hmac_secret,
+                    hmac_algo=config.hmac_algo,
+                    redis_backoff=redis_backoff_ctrl,
+                )
+                supervisor.start()
 
             def _refresh_price_subscription(target_fx: ForexConnect) -> None:
                 if price_worker is None:
@@ -3269,7 +3844,10 @@ def main() -> None:
                         supervisor.submit_market_status if supervisor is not None else None
                     ),
                     async_supervisor=supervisor,
+                    history_quota=history_quota,
                     fx_session_observer=_refresh_price_subscription,
+                    history_backoff=history_backoff_ctrl,
+                    redis_backoff=redis_backoff_ctrl,
                 )
             finally:
                 offer_subscription = subscription_holder.get("instance")

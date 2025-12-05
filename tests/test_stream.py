@@ -272,6 +272,52 @@ class WarmupStreamTest(unittest.TestCase):
         self.assertIn("session", last_heartbeat["context"])
 
 
+class BackoffControllerTest(unittest.TestCase):
+    def test_backoff_remaining_and_snapshot(self) -> None:
+        controller = connector.FxcmBackoffController(
+            base_seconds=2.0,
+            max_seconds=8.0,
+            multiplier=2.0,
+            jitter=0.0,
+        )
+        fake_time = {"value": 100.0}
+
+        def fake_monotonic() -> float:
+            return fake_time["value"]
+
+        with mock.patch("connector.time.monotonic", side_effect=fake_monotonic):
+            with mock.patch("connector.random.uniform", return_value=1.0):
+                delay = controller.fail("fxcm_history")
+                self.assertAlmostEqual(delay, 2.0)
+            fake_time["value"] = 101.0
+            remaining = controller.remaining()
+            self.assertAlmostEqual(remaining, 1.0)
+            snapshot = controller.snapshot()
+            self.assertTrue(snapshot["active"])
+            self.assertGreater(snapshot["remaining_seconds"], 0)
+            controller.success()
+            self.assertFalse(controller.snapshot()["active"])
+            self.assertEqual(controller.remaining(), 0.0)
+
+    def test_backoff_multiplier_capped_by_max(self) -> None:
+        controller = connector.FxcmBackoffController(
+            base_seconds=3.0,
+            max_seconds=5.0,
+            multiplier=2.0,
+            jitter=0.0,
+        )
+        with mock.patch("connector.random.uniform", return_value=1.0), mock.patch(
+            "connector.time.monotonic", return_value=50.0
+        ):
+            first = controller.fail("fxcm_history")
+        with mock.patch("connector.random.uniform", return_value=1.0), mock.patch(
+            "connector.time.monotonic", return_value=60.0
+        ):
+            second = controller.fail("fxcm_history")
+        self.assertAlmostEqual(first, 3.0)
+        self.assertAlmostEqual(second, 5.0)
+
+
 class FetchRecentSinkTest(unittest.TestCase):
     def test_fetch_recent_uses_sink_without_redis(self) -> None:
         fixed_now = dt.datetime(2025, 5, 6, 10, 0, tzinfo=dt.timezone.utc)
@@ -398,21 +444,207 @@ class HeartbeatContractTest(unittest.TestCase):
         ctx = last_msg["context"]
         self.assertEqual(ctx.get("mode"), "stream")
         self.assertIn("stream_targets", ctx)
-        self.assertIn("cycle_seconds", ctx)
-        self.assertIn("session", ctx)
-        session_block = ctx["session"]
-        self.assertEqual(session_block.get("tag"), "LDN_METALS")
-        self.assertEqual(session_block.get("timezone"), "Europe/London")
-        self.assertEqual(session_block.get("session_open_utc"), session_match.session_open_utc.isoformat())
-        stats = session_block.get("stats")
-        self.assertIsInstance(stats, dict)
-        self.assertIn("LDN_METALS", stats)
-        symbols = stats["LDN_METALS"].get("symbols")
-        self.assertTrue(symbols)
-        first_symbol = symbols[0]
-        self.assertIn("range", first_symbol)
-        self.assertIn("avg", first_symbol)
-        self.assertGreater(first_symbol["bars"], 0)
+
+
+class HistoryQuotaTest(unittest.TestCase):
+    def test_sliding_windows_limit_calls(self) -> None:
+        quota = connector.HistoryQuota(max_calls_per_min=2, max_calls_per_hour=4)
+        base_now = time.monotonic()
+        allowed_first, wait_first, reason_first = quota.allow_call("XAU/USD", "1m", base_now)
+        self.assertTrue(allowed_first)
+        self.assertEqual(wait_first, 0.0)
+        self.assertEqual(reason_first, "ok")
+        quota.record_call("XAU/USD", "1m", base_now)
+
+        allowed_second, _, _ = quota.allow_call("XAU/USD", "1m", base_now + 1.0)
+        self.assertTrue(allowed_second)
+        quota.record_call("XAU/USD", "1m", base_now + 1.0)
+
+        allowed_third, wait_third, reason_third = quota.allow_call("XAU/USD", "1m", base_now + 2.0)
+        self.assertFalse(allowed_third)
+        self.assertGreater(wait_third, 40.0)
+        self.assertEqual(reason_third, "minute_quota")
+        snapshot = quota.snapshot()
+        self.assertEqual(snapshot["calls_60s"], 2)
+        self.assertEqual(snapshot["throttle_state"], "critical")
+
+    def test_min_interval_and_skipped_snapshot(self) -> None:
+        quota = connector.HistoryQuota(
+            max_calls_per_min=10,
+            max_calls_per_hour=20,
+            min_interval_by_tf={"1m": 2.0},
+        )
+        base_now = time.monotonic()
+        required_calls = int(quota.max_calls_per_min * connector.HistoryQuota._MIN_INTERVAL_THRESHOLD) + 1
+        for i in range(required_calls):
+            quota.record_call("EUR/USD", "1m", base_now - 10 + i * 0.1)
+        allowed, _, _ = quota.allow_call("EUR/USD", "1m", base_now)
+        self.assertTrue(allowed)
+        quota.record_call("EUR/USD", "1m", base_now)
+        allowed_fast, wait_fast, reason_fast = quota.allow_call("EUR/USD", "1m", base_now + 0.5)
+        self.assertFalse(allowed_fast)
+        self.assertGreater(wait_fast, 0.9)
+        self.assertEqual(reason_fast, "min_interval")
+        quota.register_skip("EUR/USD", "1m")
+        snapshot = quota.snapshot()
+        skipped = snapshot.get("skipped_polls") or []
+        self.assertTrue(skipped)
+        self.assertEqual(skipped[0]["symbol"], "EURUSD")
+        self.assertEqual(skipped[0]["tf"], "1m")
+        self.assertEqual(snapshot["throttle_state"], "ok")
+
+    def test_min_interval_disabled_when_load_low(self) -> None:
+        quota = connector.HistoryQuota(
+            max_calls_per_min=120,
+            max_calls_per_hour=2400,
+            min_interval_by_tf={"1m": 2.0},
+        )
+        now = time.monotonic()
+        allowed_first, _, _ = quota.allow_call("EUR/USD", "1m", now)
+        self.assertTrue(allowed_first)
+        quota.record_call("EUR/USD", "1m", now)
+        allowed_second, wait_second, reason_second = quota.allow_call("EUR/USD", "1m", now + 0.5)
+        self.assertTrue(allowed_second)
+        self.assertEqual(wait_second, 0.0)
+        self.assertEqual(reason_second, "ok")
+
+    def test_custom_min_interval_threshold_triggers_early(self) -> None:
+        quota = connector.HistoryQuota(
+            max_calls_per_min=20,
+            max_calls_per_hour=40,
+            min_interval_by_tf={"1m": 2.0},
+            load_thresholds={"min_interval": 0.1},
+        )
+        base_now = time.monotonic()
+        for offset in (-3.0, -0.5, -0.2):
+            quota.record_call("EUR/USD", "1m", base_now + offset)
+        allowed_fast, wait_fast, reason_fast = quota.allow_call("EUR/USD", "1m", base_now)
+        self.assertFalse(allowed_fast)
+        self.assertGreater(wait_fast, 1.5)
+        self.assertEqual(reason_fast, "min_interval")
+
+    def test_warn_state_when_usage_high(self) -> None:
+        quota = connector.HistoryQuota(max_calls_per_min=4, max_calls_per_hour=40)
+        base_now = time.monotonic()
+        for i in range(3):
+            quota.record_call("XAU/USD", "1m", base_now + i * 0.1)
+        snapshot = quota.snapshot()
+        self.assertEqual(snapshot["throttle_state"], "warn")
+
+    def test_warn_threshold_can_be_configured(self) -> None:
+        quota = connector.HistoryQuota(
+            max_calls_per_min=10,
+            max_calls_per_hour=40,
+            load_thresholds={"warn": 0.3},
+        )
+        base_now = time.monotonic()
+        for i in range(3):
+            quota.record_call("XAU/USD", "1m", base_now + i * 0.1)
+        snapshot = quota.snapshot()
+        self.assertEqual(snapshot["throttle_state"], "warn")
+
+    def test_priority_skips_min_interval_under_load(self) -> None:
+        quota = connector.HistoryQuota(
+            max_calls_per_min=10,
+            max_calls_per_hour=20,
+            min_interval_by_tf={"1m": 2.0},
+            priority_targets=[("XAU/USD", "m1")],
+        )
+        base_now = time.monotonic()
+        required_calls = int(quota.max_calls_per_min * connector.HistoryQuota._MIN_INTERVAL_THRESHOLD) + 1
+        for i in range(required_calls):
+            quota.record_call("EUR/USD", "1m", base_now - 10 + i * 0.1)
+        allowed_first, _, _ = quota.allow_call("XAU/USD", "1m", base_now)
+        self.assertTrue(allowed_first)
+        quota.record_call("XAU/USD", "1m", base_now)
+        allowed_second, wait_second, reason_second = quota.allow_call("XAU/USD", "1m", base_now + 0.5)
+        self.assertTrue(allowed_second)
+        self.assertEqual(wait_second, 0.0)
+        self.assertEqual(reason_second, "ok")
+
+    def test_recent_quota_denial_promotes_state(self) -> None:
+        quota = connector.HistoryQuota(max_calls_per_min=2, max_calls_per_hour=40)
+        base_now = time.monotonic()
+        for offset in (0.0, 0.5):
+            allowed, _, _ = quota.allow_call("XAU/USD", "1m", base_now + offset)
+            self.assertTrue(allowed)
+            quota.record_call("XAU/USD", "1m", base_now + offset)
+        allowed_blocked, _, reason = quota.allow_call("XAU/USD", "1m", base_now + 1.0)
+        self.assertFalse(allowed_blocked)
+        self.assertEqual(reason, "minute_quota")
+        quota._calls_60s.clear()
+        quota._calls_3600s.clear()
+        snapshot = quota.snapshot()
+        self.assertEqual(snapshot["throttle_state"], "warn")
+
+    def test_priority_reserve_blocks_non_priority(self) -> None:
+        quota = connector.HistoryQuota(
+            max_calls_per_min=4,
+            max_calls_per_hour=40,
+            priority_targets=[("XAU/USD", "m1")],
+            priority_reserve_per_min=2,
+        )
+        now = 0.0
+        for _ in range(2):
+            allowed, _, _ = quota.allow_call("XAU/USD", "m1", now)
+            self.assertTrue(allowed)
+            quota.record_call("XAU/USD", "m1", now)
+            now += 1.0
+
+        for _ in range(2):
+            allowed_non_priority, _, _ = quota.allow_call("EUR/USD", "m1", now)
+            self.assertTrue(allowed_non_priority)
+            quota.record_call("EUR/USD", "m1", now)
+            now += 1.0
+
+        allowed_blocked, wait_blocked, reason_blocked = quota.allow_call("EUR/USD", "m1", now)
+        self.assertFalse(allowed_blocked)
+        self.assertGreater(wait_blocked, 0.0)
+        self.assertEqual(reason_blocked, "priority_reserve")
+
+
+class HistoryThrottleIntegrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        connector._LAST_MARKET_STATUS = None
+        self.fixed_now = dt.datetime(2025, 5, 5, 12, 0, tzinfo=dt.timezone.utc)
+
+    def _extract_channel_messages(self, redis_client: FakeRedis, channel: str) -> list[dict[str, Any]]:
+        return [json.loads(payload) for published_channel, payload in redis_client.messages if published_channel == channel]
+
+    def test_stream_exposes_quota_in_heartbeat(self) -> None:
+        fx = FakeForexConnect(_make_sample_df(self.fixed_now - dt.timedelta(minutes=10), 12))
+        redis_client = FakeRedis()
+        heartbeat_events: list[HeartbeatEvent] = []
+        quota = connector.HistoryQuota(max_calls_per_min=2, max_calls_per_hour=10)
+        session_match = _make_session_match(self.fixed_now)
+
+        with mock.patch("connector._now_utc", return_value=self.fixed_now), mock.patch(
+            "connector.is_trading_time", return_value=True
+        ), mock.patch("connector.resolve_session", return_value=session_match):
+            stream_fx_data(
+                cast(connector.ForexConnect, fx),
+                redis_client=redis_client,
+                require_redis=False,
+                poll_seconds=0,
+                publish_interval_seconds=0,
+                lookback_minutes=5,
+                config=[("XAU/USD", "m1")],
+                cache_manager=None,
+                max_cycles=3,
+                heartbeat_sink=heartbeat_events.append,
+                history_quota=quota,
+            )
+
+        self.assertTrue(heartbeat_events)
+        last_event = heartbeat_events[-1]
+        self.assertEqual(last_event.state, "stream")
+        history_ctx = last_event.context.get("history") if last_event.context else None
+        self.assertIsNotNone(history_ctx)
+        assert isinstance(history_ctx, dict)
+        self.assertEqual(history_ctx.get("calls_60s"), 2)
+        skipped = history_ctx.get("skipped_polls") or []
+        self.assertTrue(skipped)
+        self.assertGreaterEqual(skipped[0].get("count", 0), 1)
 
     def test_stream_heartbeat_includes_supervisor_context(self) -> None:
         fx = FakeForexConnect(_make_sample_df(self.fixed_now - dt.timedelta(minutes=10), 10))

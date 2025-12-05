@@ -163,13 +163,41 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
   },
   "stream": {
     "mode": 1,
+    "async_supervisor": true,
     "poll_seconds": 5,
     "fetch_interval_seconds": 5,
     "publish_interval_seconds": 5,
     "lookback_minutes": 5,
     "config": "XAU/USD:m1,XAU/USD:m5, EUR/USD:m1,EUR/USD:m5",
     "price_snap_channel": "fxcm:price_tik",
-    "price_snap_interval_seconds": 3
+    "price_snap_interval_seconds": 3,
+    "history_max_calls_per_min": 360,
+    "history_max_calls_per_hour": 7200,
+    "history_min_interval_seconds_m1": 2,
+    "history_min_interval_seconds_m5": 6,
+    "history_priority_targets": [
+      "XAU/USD:m1"
+    ],
+    "history_priority_reserve_per_min": 108,
+    "history_priority_reserve_per_hour": 2160,
+    "history_load_thresholds": {
+      "min_interval": 0.7,
+      "warn": 0.9,
+      "reserve": 0.9,
+      "critical": 0.95
+    },
+    "history_backoff": {
+      "base_seconds": 6,
+      "max_seconds": 120,
+      "multiplier": 2,
+      "jitter": 0.3
+    },
+    "redis_backoff": {
+      "base_seconds": 2,
+      "max_seconds": 45,
+      "multiplier": 2,
+      "jitter": 0.25
+    }
   },
   "sample_request": {
     "symbol": "XAU/USD",
@@ -215,9 +243,23 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 - `stream.mode=0` → один warmup-прохід; `1` → нескінченний стрім.
 - `stream.config` приймає рядок або масив `{ "symbol": ..., "tf": ... }`.
 - `stream.price_snap_channel` задає Redis-канал для тик-снепшотів, а `stream.price_snap_interval_seconds` — інтервал між пакетами (3–5 с). Ці значення читає `PriceSnapshotWorker`, що агрегує OfferTable-тикі.
+- `stream.history_*` контролюють неблокуючий throttle `HistoryQuota` (Stage 3.1):
+  - `history_max_calls_per_min` / `_per_hour` — глобальні бюджети FXCM-викликів.
+  - `history_min_interval_seconds_<tf>` — локальні мінімальні інтервали по таймфреймах (наприклад, `m1`, `m5`).
+  - `history_priority_targets` — символи/таймфрейми з пріоритетом (`SYMBOL:tf`).
+  - `history_priority_reserve_per_min` / `_per_hour` — резерв викликів, що зберігається для пріоритетних пар.
+  - `history_load_thresholds` — пороги вмикання `min_interval`, WARN-стану, резервів та CRITICAL (`min_interval`, `warn`, `reserve`, `critical` у діапазоні 0–1). **Оновлено 2025‑12‑05:** тепер усі пороги конфігуруються тут, без правок у коді.
+  - `history_backoff` — параметри експоненційного backoff для викликів FXCM history (`base_seconds`, `max_seconds`, `multiplier`, `jitter`). Якщо FXCM повертає ретраябельну помилку, стрім робить паузу й пропускає лише history частину, але продовжує heartbeat/price feed. **Новинка Stage 3.2.**
+  - `redis_backoff` — аналогічна схема пауз для Redis-публікацій (для supervisor та fallback sink-ів). Backoff активний для всіх каналів і прогортається автоматично після успішної публікації. **Новинка Stage 3.2.**
 - `cache.dir` можна винести у `/var/lib/fxcm_connector/<env>_cache` для продакшну.
 - `viewer.*` задає канали Redis та таймінги алертів для `tools/debug_viewer.py` (щоб не плодити ENV). Деталі: `docs/viewer.md`.
 - `backoff.*` контролюють експоненційні паузи для FXCM/Redis.
+
+#### 6.2.1 Останні зміни Stage 3.1 (2025‑12‑05)
+
+- `history_load_thresholds` тепер джерело правди для порогів завантаження (`min_interval`, `warn`, `reserve`, `critical`).
+- Значення автоматично обрізаються до `[0,1]`, тож став пороги у порядку зростання, щоб уникати неочікуваної поведінки (`min_interval ≤ warn ≤ reserve ≤ critical ≤ 1`).
+- У heartbeat (`context.history`) відображаються `last_denied_reason`, `skipped_polls` і `throttle_state`, що допомагає тестувати різні конфіги в реальному часі.
 
 ## 7. Робочі режими
 

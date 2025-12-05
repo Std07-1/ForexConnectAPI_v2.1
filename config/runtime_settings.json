@@ -13,7 +13,34 @@
         "lookback_minutes": 5,
         "config": "XAU/USD:m1,XAU/USD:m5, EUR/USD:m1,EUR/USD:m5",
         "price_snap_channel": "fxcm:price_tik",
-        "price_snap_interval_seconds": 3
+        "price_snap_interval_seconds": 3,
+        "history_max_calls_per_min": 360,
+        "history_max_calls_per_hour": 7200,
+        "history_min_interval_seconds_m1": 2,
+        "history_min_interval_seconds_m5": 6,
+        "history_priority_targets": [
+            "XAU/USD:m1"
+        ],
+        "history_priority_reserve_per_min": 108,
+        "history_priority_reserve_per_hour": 2160,
+        "history_load_thresholds": {
+            "min_interval": 0.7,
+            "warn": 0.85,
+            "reserve": 0.9,
+            "critical": 0.95
+        },
+        "history_backoff": {
+            "base_seconds": 6,
+            "max_seconds": 120,
+            "multiplier": 2,
+            "jitter": 0.3
+        },
+        "redis_backoff": {
+            "base_seconds": 2,
+            "max_seconds": 45,
+            "multiplier": 2,
+            "jitter": 0.25
+        }
     },
     "sample_request": {
         "symbol": "XAU/USD",
