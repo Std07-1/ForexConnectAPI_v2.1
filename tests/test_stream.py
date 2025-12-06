@@ -314,6 +314,36 @@ class WarmupStreamTest(unittest.TestCase):
         self.assertIn("session", last_heartbeat["context"])
 
 
+class MarketStatusSyncTest(unittest.TestCase):
+    def test_sync_emits_open_when_calendar_active(self) -> None:
+        redis_client = FakeRedis()
+        fake_now = dt.datetime(2025, 5, 6, 9, 0, tzinfo=dt.timezone.utc)
+
+        with mock.patch("connector._now_utc", return_value=fake_now), mock.patch(
+            "connector.is_trading_time", return_value=True
+        ), mock.patch("connector._publish_market_status") as publish_mock, mock.patch(
+            "connector._notify_market_closed"
+        ) as closed_mock:
+            connector._sync_market_status_with_calendar(redis_client)
+
+        publish_mock.assert_called_once_with(redis_client, "open")
+        closed_mock.assert_not_called()
+
+    def test_sync_emits_closed_when_calendar_idle(self) -> None:
+        redis_client = FakeRedis()
+        fake_now = dt.datetime(2025, 5, 3, 12, 0, tzinfo=dt.timezone.utc)
+
+        with mock.patch("connector._now_utc", return_value=fake_now), mock.patch(
+            "connector.is_trading_time", return_value=False
+        ), mock.patch("connector._publish_market_status") as publish_mock, mock.patch(
+            "connector._notify_market_closed"
+        ) as closed_mock:
+            connector._sync_market_status_with_calendar(redis_client)
+
+        closed_mock.assert_called_once_with(fake_now, redis_client)
+        publish_mock.assert_not_called()
+
+
 class BackoffControllerTest(unittest.TestCase):
     def test_backoff_remaining_and_snapshot(self) -> None:
         controller = connector.FxcmBackoffController(

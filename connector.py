@@ -1265,6 +1265,18 @@ def _publish_market_status(
     return success
 
 
+def _sync_market_status_with_calendar(redis_client: Optional[Any]) -> None:
+    """Публікує open/closed відповідно до календаря на момент виклику."""
+
+    if redis_client is None:
+        return
+    now = _now_utc()
+    if is_trading_time(now):
+        _publish_market_status(redis_client, "open")
+        return
+    _notify_market_closed(now, redis_client)
+
+
 def _float_or_none(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -3421,7 +3433,7 @@ def _fetch_and_publish_recent(
         except Exception:  # noqa: BLE001
             log.exception("Не вдалося передати market_status sink (open).")
     else:
-        _publish_market_status(redis_client, "open")
+        _sync_market_status_with_calendar(redis_client)
     return df_to_publish
 
 
@@ -3548,7 +3560,7 @@ def fetch_history_sample(
 
     if publish_ok:
         log.info("Warmup-пакет успішно опубліковано у Redis.")
-        _publish_market_status(redis_client, "open")
+        _sync_market_status_with_calendar(redis_client)
         last_close_ms = int(df_ohlcv["close_time"].max())
         lag_seconds = _calc_lag_seconds(last_close_ms)
         heartbeat_context: Dict[str, Any] = {
@@ -4280,8 +4292,7 @@ def main() -> None:
                     timeframe_raw=tf_raw,
                     last_open_time=last_published,
                 )
-                if is_trading_time(_now_utc()):
-                    _publish_market_status(redis_conn, "open")
+                _sync_market_status_with_calendar(redis_conn)
                 last_close_ms = int(warmup_slice["close_time"].max())
                 lag_seconds = _calc_lag_seconds(last_close_ms)
                 warmup_context: Dict[str, Any] = {
