@@ -27,7 +27,7 @@ from functools import partial
 from dataclasses import dataclass
 from logging import Logger
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, cast
 
 import pandas as pd
 from dotenv import load_dotenv

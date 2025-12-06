@@ -84,10 +84,12 @@ def _load_viewer_settings() -> Dict[str, Any]:
     return viewer_cfg if isinstance(viewer_cfg, dict) else {}
 
 
+# --- Завантаження runtime-конфігурації viewer ---
 _VIEWER_SETTINGS = _load_viewer_settings()
 
 
 def _cfg_str(key: str, default: str) -> str:
+    """Читає текстове значення з viewer-конфігурації з запасним дефолтом."""
     value = _VIEWER_SETTINGS.get(key)
     if isinstance(value, str) and value.strip():
         return value.strip()
@@ -95,6 +97,7 @@ def _cfg_str(key: str, default: str) -> str:
 
 
 def _cfg_float(key: str, default: float, *, min_value: Optional[float] = None) -> float:
+    """Парсить числову опцію та гарантує мінімальне значення, якщо задано."""
     value = _VIEWER_SETTINGS.get(key)
     if value is None:
         return default
@@ -116,6 +119,7 @@ def _cfg_float(key: str, default: float, *, min_value: Optional[float] = None) -
 
 
 def _cfg_int(key: str, default: int, *, min_value: int = 1) -> int:
+    """Перетворює опцію у ціле число, страхуючи від порожніх/некоректних значень."""
     value = _VIEWER_SETTINGS.get(key)
     if value is None:
         return default
@@ -137,6 +141,7 @@ def _cfg_int(key: str, default: int, *, min_value: int = 1) -> int:
 
 
 def _cfg_list(key: str, default: Sequence[str]) -> List[str]:
+    """Розбиває список каналів/секцій із конфіга в акуратний перелік рядків."""
     value = _VIEWER_SETTINGS.get(key)
     items: List[str] = []
     if isinstance(value, list):
@@ -157,6 +162,7 @@ def _cfg_list(key: str, default: Sequence[str]) -> List[str]:
 
 
 def _cfg_dict_str(key: str) -> Dict[str, str]:
+    """Повертає словник рядків для override-підказок каналів supervisor."""
     value = _VIEWER_SETTINGS.get(key)
     if not isinstance(value, dict):
         return {}
@@ -168,6 +174,7 @@ def _cfg_dict_str(key: str) -> Dict[str, str]:
             result[key_text] = val_text
     return result
 
+# --- Базові канали, пороги та довідники для UI ---
 HEARTBEAT_CHANNEL_DEFAULT = _cfg_str("heartbeat_channel", "fxcm:heartbeat")
 MARKET_STATUS_CHANNEL_DEFAULT = _cfg_str("market_status_channel", "fxcm:market_status")
 OHLCV_CHANNEL_DEFAULT = _cfg_str("ohlcv_channel", "fxcm:ohlcv")
@@ -283,10 +290,12 @@ if PromCounter is not None:
         ["symbol", "tf"],
     )
 else:  # pragma: no cover
+    # --- Опціональні Prometheus-метрики для спостереження за viewer ---
     PROM_VIEWER_OHLCV_GAPS_TOTAL = None
 
 
 class DashboardMode(Enum):
+    """Перелік режимів головного Layout, між якими перемикається користувач."""
     TIMELINE = 0
     SUMMARY = 1
     SESSION = 2
@@ -299,6 +308,7 @@ class DashboardMode(Enum):
 
 @dataclass
 class TimelineEvent:
+    """Зберігає одну подію таймлайна з джерелом і часовими відмітками."""
     source: str
     state: str
     ts_iso: str
@@ -307,6 +317,7 @@ class TimelineEvent:
 
 @dataclass
 class ViewerAlert:
+    """Представляє активний алерт із важливістю та початком інциденту."""
     key: str
     message: str
     severity: str
@@ -315,6 +326,7 @@ class ViewerAlert:
 
 @dataclass
 class ViewerState:
+    """Тримає кешований стан панелей та похідні лічильники для рендеру."""
     last_heartbeat: Optional[Dict[str, Any]] = None
     last_market_status: Optional[Dict[str, Any]] = None
     last_message_ts: float = field(default_factory=time.time)
@@ -354,6 +366,7 @@ class ViewerState:
     tick_cadence_updated: Optional[float] = None
 
     def note_heartbeat(self, payload: Dict[str, Any]) -> None:
+        """Оновлює кеші та діагностику згідно з новим heartbeat payload."""
         self.last_heartbeat = payload
         now_ts = time.time()
         self.last_message_ts = now_ts
@@ -412,6 +425,7 @@ class ViewerState:
             self.backoff_diag_updated = None
 
     def note_market_status(self, payload: Dict[str, Any]) -> None:
+        """Фіксує поточний стан ринку для таймлайна та алертів."""
         self.last_market_status = payload
         self.last_message_ts = time.time()
         self._add_timeline_event(source="MS", state=str(payload.get("state", "?")), ts=payload.get("ts"))
@@ -474,6 +488,7 @@ class ViewerState:
             self._prune_ohlcv(now_ts)
 
     def _prune_ohlcv(self, now_ts: float) -> None:
+        """Прибирає символи, які давно не оновлювались, щоб обмежити пам'ять."""
         cutoff = now_ts - 6 * 3600
         for key in list(self.ohlcv_targets.keys()):
             updated = self.ohlcv_updated.get(key)
@@ -486,6 +501,7 @@ class ViewerState:
                 self.ohlcv_lag_flags.pop(key, None)
 
     def note_redis_health(self, payload: Dict[str, Any]) -> None:
+        """Зберігає результат ping/info та оновлює критичний алерт за Redis."""
         self.redis_health = payload
         status = str(payload.get("status", "")).lower()
         error_message = payload.get("error")
@@ -499,6 +515,7 @@ class ViewerState:
         self._set_alert("redis_health", status == "error", message, severity="danger")
 
     def _add_timeline_event(self, *, source: str, state: str, ts: Optional[str]) -> None:
+        """Нормалізує timestamp та додає подію до таймлайна з обмеженим обсягом."""
         try:
             ts_epoch = _iso_to_epoch(ts)
             ts_iso = ts or dt.datetime.fromtimestamp(ts_epoch, tz=dt.timezone.utc).isoformat()
@@ -509,6 +526,7 @@ class ViewerState:
         self.timeline_events.append(TimelineEvent(source=source, state=symbol_state, ts_iso=ts_iso, ts_epoch=ts_epoch))
 
     def _update_staleness_history(self, context: Dict[str, Any]) -> None:
+        """Підтримує коротку історію staleness для кожної пари symbol/tf."""
         targets = context.get("stream_targets") or []
         seen_keys: Set[Tuple[str, str]] = set()
         now_ts = time.time()
@@ -532,6 +550,7 @@ class ViewerState:
                 self.stream_target_updated.pop(key, None)
 
     def _update_session_ranges(self, session_context: Dict[str, Any]) -> None:
+        """Обчислює поточні діапазони сесій і ковзну базу для візуалізації."""
         stats = session_context.get("stats") if isinstance(session_context, dict) else None
         if not isinstance(stats, dict):
             return
@@ -569,17 +588,21 @@ class ViewerState:
                     self.session_range_snapshot.pop(key, None)
 
     def toggle_pause(self) -> None:
+        """Перемикає режим паузи, щоб тимчасово зафіксувати UI."""
         self.paused = not self.paused
         self.last_action = "Пауза увімкнена" if self.paused else "Пауза вимкнена"
 
     def clear_timeline(self) -> None:
+        """Скидає накопичені події таймлайна за запитом користувача."""
         self.timeline_events.clear()
         self.last_action = "Таймлайн очищено"
 
     def note_action(self, text: str) -> None:
+        """Записує короткий текст про останню взаємодію (клавіша, автодія)."""
         self.last_action = text
 
     def _append_incident(self, key: str, active: bool, detail: Optional[str]) -> None:
+        """Зберігає зріз алерту в incident-feed, щоб користувач бачив контекст."""
         entry = {
             "key": key,
             "label": ISSUE_LABELS.get(key, key),
@@ -590,6 +613,7 @@ class ViewerState:
         self.incident_feed.appendleft(entry)
 
     def _set_alert(self, key: str, active: bool, message: Optional[str], severity: str = "warning") -> bool:
+        """Керує словником активних алертів і повертає, чи змінився стан."""
         changed = False
         if active:
             existing = self.alerts.get(key)
@@ -620,6 +644,7 @@ class ViewerState:
         )
 
     def _record_issue(self, key: str, detail: Optional[str]) -> None:
+        """Підвищує лічильник інциденту, щоб бачити частоту проблем."""
         entry = self.issue_counters.setdefault(key, {"count": 0})
         entry["count"] += 1
         entry["last_ts"] = time.time()
@@ -627,6 +652,7 @@ class ViewerState:
             entry["detail"] = detail
 
     def _track_issue_state(self, key: str, active: bool, detail: Optional[str]) -> None:
+        """Стежить за переходами інциденту та пушить подію в фід при зміні."""
         previous = self.issue_state_flags.get(key, False)
         self.issue_state_flags[key] = active
         if active and not previous:
@@ -635,6 +661,7 @@ class ViewerState:
             self._append_incident(key, active, detail)
 
     def _update_issue_counters(self, state: str, context: Dict[str, Any]) -> None:
+        """Розкладає причини idle/pause/lag, щоби сформувати релевантні алерти."""
         idle_reason_raw = context.get("idle_reason")
         pause_reason_raw = context.get("market_pause_reason")
         idle_reason = str(idle_reason_raw).strip().lower() if idle_reason_raw else ""
@@ -667,11 +694,13 @@ class ViewerState:
         self._set_alert("lag_spike", lag_active, detail_lag, severity="warning")
 
     def heartbeat_age(self) -> Optional[float]:
+        """Обчислює, скільки секунд минуло від останнього heartbeat."""
         if self.last_heartbeat_ts is None:
             return None
         return max(0.0, time.time() - self.last_heartbeat_ts)
 
     def _update_price_stream(self, payload: Dict[str, Any], now_ts: float) -> None:
+        """Синхронізує статистику live-цiн, щоби панель price відображала активність."""
         self.price_stream = payload
         self.price_stream_updated = now_ts
         last_snap_ts = _coerce_float(payload.get("last_snap_ts"))
@@ -697,6 +726,7 @@ class ViewerState:
         self.price_last_snap_ts = last_snap_ts
 
 
+# --- Допоміжні перетворення та форматування для UI ---
 def _iso_to_epoch(value: Optional[str]) -> float:
     if not value:
         raise ValueError("missing timestamp")
@@ -1093,6 +1123,7 @@ def _format_bytes(value: Optional[int]) -> str:
 
 
 def refresh_time_alerts(state: ViewerState) -> bool:
+    """Оновлює алерти heartbeat_missing/heartbeat_stale та повертає, чи щось змінилось."""
     changed = False
     if state.last_heartbeat is None:
         changed |= state._set_alert("heartbeat_missing", True, "Очікуємо перший heartbeat…", severity="info")
@@ -1112,6 +1143,7 @@ def refresh_time_alerts(state: ViewerState) -> bool:
 
 
 def refresh_ohlcv_alerts(state: ViewerState) -> bool:
+    """Перераховує OHLCV алерти (idle, lag, empty) з урахуванням ринку."""
     changed = False
     now = time.time()
     if state.last_ohlcv_ts is None:
@@ -1235,6 +1267,7 @@ def refresh_ohlcv_alerts(state: ViewerState) -> bool:
 
 
 def refresh_redis_health(redis_client: "redis.Redis", state: ViewerState) -> None:  # type: ignore[name-defined]
+    """Раз на інтервал виконує ping/info та логічно зливає дані у ViewerState."""
     started = time.perf_counter()
     payload: Dict[str, Any]
     try:
@@ -1326,6 +1359,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_summary_panel(state: ViewerState) -> Panel:
+    """Відображає ключові поля heartbeat/market у компактній таблиці."""
     table = Table.grid(padding=1)
     table.add_column(justify="right", style="bold cyan", overflow="fold")
     table.add_column(overflow="fold")
@@ -1369,6 +1403,7 @@ def build_summary_panel(state: ViewerState) -> Panel:
 
 
 def build_fxcm_diag_panel(state: ViewerState) -> Panel:
+    """Деталізує технічні параметри heartbeat контексту (lag, cycle, redis)."""
     heartbeat = state.last_heartbeat or {}
     context = heartbeat.get("context") or {}
     if not context:
@@ -1420,6 +1455,7 @@ def build_fxcm_diag_panel(state: ViewerState) -> Panel:
 
 
 def build_incidents_panel(state: ViewerState) -> Panel:
+    """Показує останні переходи алертів із часовим штампом та деталями."""
     incidents = list(state.incident_feed)
     if not incidents:
         return Panel(
@@ -1451,9 +1487,11 @@ def build_incidents_panel(state: ViewerState) -> Panel:
 
 
 def build_menu_bar() -> Panel:
+    """Малює підказку по гарячих клавішах та режимах перегляду."""
     return Panel(Text(MENU_TEXT, justify="center", style="bold"), box=box.SIMPLE, border_style="dim")
 
 def build_alerts_panel(state: ViewerState) -> Panel:
+    """Список активних алертів із важливістю та моментом активації."""
     alerts = state.active_alerts()
     if not alerts:
         return Panel("Активних алертів немає", title="Alerts", border_style="green", box=box.ROUNDED)
@@ -1472,6 +1510,7 @@ def build_alerts_panel(state: ViewerState) -> Panel:
     return Panel(table, title="Alerts", border_style=border, box=box.ROUNDED)
 
 def build_issue_panel(state: ViewerState) -> Panel:
+    """Зводить лічильники інцидентів, щоби бачити частоту й останній час."""
     table = Table(box=box.SIMPLE_HEAVY, expand=True)
     table.add_column("Issue", style="bold", overflow="fold")
     table.add_column("Count", justify="right", overflow="fold")
@@ -1591,6 +1630,7 @@ def build_supervisor_summary_panel(
     queues: List[Dict[str, Any]],
     tasks: List[Dict[str, Any]],
 ) -> Panel:
+    """Подає агреговану діагностику async supervisor (loop, uptime, errors)."""
     table = Table.grid(padding=(0, 1))
     table.add_column(style="bold cyan", justify="right", overflow="fold")
     table.add_column(overflow="fold")
@@ -1626,6 +1666,7 @@ def build_supervisor_summary_panel(
 
 
 def build_supervisor_queues_panel(queues: List[Dict[str, Any]]) -> Panel:
+    """Розкладає черги supervisor за завантаженістю та віком повідомлень."""
     table = Table(box=box.SIMPLE_HEAVY, expand=True)
     table.add_column("Черга", style="bold", overflow="fold")
     table.add_column("Depth", justify="right", overflow="fold")
@@ -1668,6 +1709,7 @@ def build_supervisor_queues_panel(queues: List[Dict[str, Any]]) -> Panel:
 
 
 def build_supervisor_tasks_panel(tasks: List[Dict[str, Any]]) -> Panel:
+    """Показує стан воркерів supervisor, їх продуктивність та помилки."""
     table = Table(box=box.SIMPLE_HEAVY, expand=True)
     table.add_column("Таск", style="bold", overflow="fold")
     table.add_column("Стан", justify="left", overflow="fold")
@@ -1701,6 +1743,7 @@ def build_supervisor_tasks_panel(tasks: List[Dict[str, Any]]) -> Panel:
 
 
 def build_supervisor_metrics_panel(diag: Dict[str, Any]) -> Panel:
+    """Відображає сукупні лічильники supervisor та спеціальні канали."""
     totals_table = Table.grid(padding=(0, 1))
     totals_table.add_column(style="bold cyan", justify="right", overflow="fold")
     totals_table.add_column(justify="right", overflow="fold")
@@ -1742,6 +1785,7 @@ def build_supervisor_metrics_panel(diag: Dict[str, Any]) -> Panel:
 
 
 def _build_publish_counts_table(diag: Dict[str, Any]) -> Table:
+    """Готує таблицю publish_counts із сортуванням за спаданням."""
     table = Table(box=box.MINIMAL_DOUBLE_HEAD, expand=True)
     table.add_column("Канал", style="bold", overflow="fold")
     table.add_column("Публікацій", justify="right", overflow="fold")
@@ -1762,6 +1806,7 @@ def build_supervisor_special_channels_panel(
     diag: Dict[str, Any],
     fallback_counts: Optional[Mapping[str, float]] = None,
 ) -> Optional[Panel]:
+    """Виділяє важливі канали supervisor, щоб перевірити активність sink-ів."""
     if not SUPERVISOR_CHANNELS or not diag:
         return None
     publish_counts_raw = diag.get("publish_counts")
@@ -1790,6 +1835,7 @@ def build_supervisor_special_channels_panel(
 
 
 def build_supervisor_mode(state: ViewerState) -> Union[Layout, Panel]:
+    """Комбінує усі supervisor-панелі в окремий макет режиму #6."""
     diag = state.supervisor_diag
     if not diag:
         hint = "Heartbeat поки не містить supervisor-контекст. Перевір, чи увімкнено async_supervisor."
@@ -1824,6 +1870,7 @@ def build_supervisor_mode(state: ViewerState) -> Union[Layout, Panel]:
 
 
 def build_redis_panel(state: ViewerState) -> Panel:
+    """Показує останній ping Redis, клієнтів, пам'ять та версію."""
     health = state.redis_health
     if not health:
         return Panel("Очікуємо ping/info…", title="Redis health", border_style="yellow", box=box.ROUNDED)
@@ -1868,6 +1915,7 @@ def build_redis_panel(state: ViewerState) -> Panel:
 
 
 def build_stream_targets_panel(state: ViewerState) -> Panel:
+    """Візуалізує поточні stream targets зі staleness та трендом."""
     heartbeat = state.last_heartbeat or {}
     context = heartbeat.get("context") or {}
     targets = context.get("stream_targets") or []
@@ -1918,6 +1966,7 @@ def build_stream_targets_panel(state: ViewerState) -> Panel:
 
 
 def build_history_quota_panel(state: ViewerState) -> Panel:
+    """Розкриває використання історичних квот і пропуски таргетів."""
     data = state.history_quota or {}
     updated_age = None
     if state.history_quota_updated is not None:
@@ -2002,6 +2051,7 @@ def build_history_quota_panel(state: ViewerState) -> Panel:
 
 
 def build_backoff_panel(state: ViewerState) -> Panel:
+    """Деталізує активні backoff-стани за ключами, щоб бачити стопи."""
     data = state.backoff_diag or {}
     updated_age = None
     if state.backoff_diag_updated is not None:
@@ -2048,6 +2098,7 @@ def build_backoff_panel(state: ViewerState) -> Panel:
 
 
 def build_tick_cadence_panel(state: ViewerState) -> Optional[Panel]:
+    """Пояснює, у якому стані знаходиться адаптивна cadence/stream/history логіка."""
     data = state.tick_cadence or {}
     updated_age = None
     if state.tick_cadence_updated is not None:
@@ -2130,6 +2181,7 @@ def build_tick_cadence_panel(state: ViewerState) -> Optional[Panel]:
 
 
 def build_price_stream_panel(state: ViewerState) -> Panel:
+    """Рендерить стан live-цін із підсумком потоку та списком символів."""
     data = state.price_stream or {}
     symbols_state = data.get("symbols_state") if isinstance(data, dict) else None
     updated_age = None
@@ -2219,6 +2271,7 @@ def build_price_stream_panel(state: ViewerState) -> Panel:
 
 
 def build_ohlcv_panel(state: ViewerState) -> Panel:
+    """Показує активні OHLCV пари з лагом, msg age та історією."""
     if not state.ohlcv_targets:
         return Panel("Очікуємо OHLCV payload…", title="OHLCV channel", border_style="yellow", box=box.ROUNDED)
 
@@ -2271,6 +2324,7 @@ def build_ohlcv_panel(state: ViewerState) -> Panel:
 
 
 def build_session_panel(state: ViewerState) -> Panel:
+    """Комбінує контекст сесій, статистику символів та динаміку діапазону."""
     heartbeat = state.last_heartbeat or {}
     context = heartbeat.get("context") or {}
     session = context.get("session") or {}
@@ -2478,6 +2532,7 @@ def _timeline_summary_lines(events: List[TimelineEvent], state: ViewerState) -> 
 
 
 def build_timeline_panel(state: ViewerState) -> Panel:
+    """Рендерить матрицю подій HB/MS з резюме інтервалів."""
     events = list(state.timeline_events)
     if not events:
         return Panel("Очікуємо події…", title="Timeline", border_style="blue")
@@ -2517,6 +2572,7 @@ def build_timeline_panel(state: ViewerState) -> Panel:
 
 
 def _render_mode_body(state: ViewerState) -> Union[Layout, Panel]:
+    """Повертає Layout/Panel залежно від активного режиму користувача."""
     mode = state.active_mode
     if mode == DashboardMode.SUMMARY:
         layout = Layout(name="summary_mode")
@@ -2566,6 +2622,7 @@ def _render_mode_body(state: ViewerState) -> Union[Layout, Panel]:
 
 
 def render_dashboard(state: ViewerState) -> Layout:
+    """Формує кореневий Layout із тілом панелей та нижнім меню."""
     root = Layout(name="root")
     root.split_column(
         Layout(name="body", ratio=1),
@@ -2577,6 +2634,7 @@ def render_dashboard(state: ViewerState) -> Layout:
 
 
 def run_viewer(args: argparse.Namespace) -> None:
+    """Основний цикл: підписка на Redis, обробка клавіш та рендер."""
     if redis is None:
         raise RuntimeError("Потрібно встановити пакет redis для використання viewer.")
 
@@ -2603,6 +2661,7 @@ def run_viewer(args: argparse.Namespace) -> None:
         ) as live:
             try:
                 while True:
+                    # Обробляємо повідомлення Redis-pubsub та оновлюємо відповідні кеші.
                     message = pubsub.get_message(timeout=0.5)
                     if message and message.get("type") == "message":
                         channel = message.get("channel")
@@ -2625,12 +2684,14 @@ def run_viewer(args: argparse.Namespace) -> None:
                             state.note_ohlcv(payload)
                         force_render = True
 
+                    # Перевіряємо натискання клавіш користувача.
                     key = keyboard.poll()
                     if key:
                         if handle_keypress(key, state):
                             raise KeyboardInterrupt
                         force_render = True
 
+                    # Оновлюємо watchdog-алерти, навіть коли немає свіжих даних.
                     if refresh_time_alerts(state):
                         force_render = True
                     if refresh_ohlcv_alerts(state):
@@ -2640,11 +2701,13 @@ def run_viewer(args: argparse.Namespace) -> None:
                     if state.active_mode != current_mode:
                         current_mode = state.active_mode
                         force_render = True
+                    # Пінгуємо Redis з контрольним інтервалом, щоб бачити здоров'я сервера.
                     if now >= next_health_check:
                         refresh_redis_health(client, state)
                         next_health_check = now + max(2.0, REDIS_HEALTH_INTERVAL)
                         force_render = True
 
+                    # Визначаємо, чи потрібно перемалювати dashboard.
                     should_render = False
                     if not state.paused and (now - last_render >= args.refresh):
                         should_render = True
@@ -2663,6 +2726,7 @@ def run_viewer(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    """Завантажує .env, читає аргументи CLI та запускає viewer."""
     load_dotenv()
     args = parse_args()
     run_viewer(args)
