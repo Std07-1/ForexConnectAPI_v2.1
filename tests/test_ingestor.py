@@ -44,6 +44,37 @@ class FXCMIngestorValidationTest(unittest.TestCase):
         self.assertEqual(len(result["bars"]), 2)
         self.assertGreater(result["bars"][1]["open_time"], result["bars"][0]["open_time"])
 
+    def test_accepts_tick_agg_payload_complete_true(self) -> None:
+        bar1 = dict(self._sample_bar(2))
+        bar1["complete"] = True
+        bar1["synthetic"] = False
+        bar2 = dict(self._sample_bar(1))
+        bar2["complete"] = True
+        bar2["synthetic"] = True
+        payload = {
+            "symbol": "XAUUSD",
+            "tf": "1m",
+            "source": "tick_agg",
+            "bars": [bar1, bar2],
+        }
+        result = self.ingestor.validate_payload(payload)
+        self.assertEqual(len(result["bars"]), 2)
+        self.assertIn("open_time", result["bars"][0])
+        self.assertNotIn("complete", result["bars"][0])
+
+    def test_skips_incomplete_bars(self) -> None:
+        complete_bar = dict(self._sample_bar(2))
+        complete_bar["complete"] = True
+        incomplete_bar = dict(self._sample_bar(1))
+        incomplete_bar["complete"] = False
+        payload = {
+            "symbol": "XAUUSD",
+            "tf": "1m",
+            "bars": [complete_bar, incomplete_bar],
+        }
+        result = self.ingestor.validate_payload(payload)
+        self.assertEqual(len(result["bars"]), 1)
+
     def test_rejects_unknown_symbol(self) -> None:
         payload = {"symbol": "GBPUSD", "tf": "1m", "bars": [self._sample_bar(1)]}
         with self.assertRaises(IngestValidationError):

@@ -28,6 +28,7 @@ python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 | `5` | Live FXCM price (PRICE). |
 | `6` | Async supervisor (SUPERVISOR). |
 | `7` | History/backoff (HISTORY). |
+| `8` | S1 stats / gaps (STAT). |
 
 Меню відображається внизу інтерфейсу (`MENU_TEXT`). Поточний режим також видно у блоку "Monitor mode" в summary.
 
@@ -82,6 +83,22 @@ python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 - «History quota» відображає `context.history`: бюджети `calls_60s/3600s`, кольоровий `throttle_state`, `next_slot_seconds`, останню причину deny та резерви для `history_priority_targets`. Окрема таблиця показує список пріоритетних таргетів і лічильник `skipped_polls` по символах/TF, що допомагає перевірити fairness та резерв Stage 3.1.
 - Якщо будь-який блок ще не прийшов у heartbeat, панель показує жовтий хінт із часом останнього оновлення, щоби швидко діагностувати відсутність телеметрії.
 
+### 8. S1 stats / gaps (STAT)
+
+- Режим для валідації поведінки S1 (коли календар може бути закритий, але тики ще «живі»).
+- Панель `S1 stats` читає ключові поля з `heartbeat.context`: `calendar_open`, `ticks_alive`, `effective_market_open`, `idle_reason`, `tick_silence_seconds`, а також `history_state` і `tick_cadence` (якщо вони присутні).
+- Панель `Top 10 largest gaps` аналізує прогалини між OHLCV-чанками за `open_time/close_time` та показує найбільші розриви (оцінка `missing_bars`/`missing_min`).
+- Колонка `sleep_model` класифікує gap як `sleep` або `awake` за порогом `viewer.sleep_model_gap_threshold_minutes`.
+- `synth_min` показує, скільки хвилин у межах gap було заповнено synthetic-барами (рахується по `bar.synthetic=true`). Якщо продьюсер не надсилає `synthetic`, значення буде 0.
+
+#### Увімкнення tick aggregation (Phase B)
+
+- У файлі `config/runtime_settings.json` → `stream.*`:
+  - `tick_aggregation_enabled: true` — вмикає tick→OHLCV агрегацію (джерело `source="tick_agg"`).
+  - `tick_aggregation_max_synth_gap_minutes` — максимальний розрив (хв), який дозволено «добивати» synthetic-барами.
+- Коли `tick_aggregation_enabled=true`, конектор не публікує FXCM history OHLCV для `1m/5m`, щоб не змішувати два джерела в одному каналі `fxcm:ohlcv`.
+- У поточній реалізації конектор публікує у `fxcm:ohlcv` лише `complete=true` бари; live (`complete=false`) не транслюється.
+
 ## Інциденти та алерти
 
 Viewer відстежує кілька ключових ситуацій:
@@ -112,6 +129,7 @@ Viewer відстежує кілька ключових ситуацій:
 | `timeline_matrix_rows`, `timeline_max_columns`, `timeline_history_max`, `timeline_focus_minutes` | Контролюють розмірність таймлайну. |
 | `supervisor_channels` | Масив назв sink-каналів, які треба завжди показувати в панелі Supervisor Metrics (наприклад `["ohlcv", "heartbeat", "price"]`). |
 | `supervisor_channel_hints` | (optional) словник `"channel": "опис"`, яким можна перевизначити підказки для спеціальних каналів. |
+| `sleep_model_gap_threshold_minutes` | Поріг (хв) для класифікації OHLCV gap як `sleep`/`awake` у режимі STAT. |
 
 фрагмент:
 
@@ -127,6 +145,7 @@ Viewer відстежує кілька ключових ситуацій:
     "ohlcv_msg_idle_error_seconds": 180,
     "ohlcv_lag_warn_seconds": 45,
     "ohlcv_lag_error_seconds": 120,
+    "sleep_model_gap_threshold_minutes": 60,
     "timeline_matrix_rows": 10,
     "timeline_max_columns": 120,
     "timeline_history_max": 2400,

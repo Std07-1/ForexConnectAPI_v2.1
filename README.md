@@ -231,6 +231,8 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
     "price_snap_channel": "fxcm:price_tik",
     "price_snap_interval_seconds": 3,
     "status_channel": "fxcm:status",
+    "tick_aggregation_enabled": false,
+    "tick_aggregation_max_synth_gap_minutes": 60,
     "history_max_calls_per_min": 360,
     "history_max_calls_per_hour": 7200,
     "history_min_interval_seconds_m1": 2,
@@ -303,6 +305,8 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 - `stream.mode=0` → один warmup-прохід; `1` → нескінченний стрім.
 - `stream.config` приймає рядок або масив `{ "symbol": ..., "tf": ... }`.
 - `stream.price_snap_channel` задає Redis-канал для тик-снепшотів, а `stream.price_snap_interval_seconds` — інтервал між пакетами (3–5 с). Ці значення читає `PriceSnapshotWorker`, що агрегує OfferTable-тикі.
+- `stream.tick_aggregation_enabled` вмикає tick→OHLCV агрегацію (джерело `source="tick_agg"`). Якщо `true`, FXCM history-полінг **не публікує** `1m/5m` у `fxcm:ohlcv`, щоб не змішувати два джерела.
+- `stream.tick_aggregation_max_synth_gap_minutes` задає максимальний розрив (хв), який дозволено заповнювати synthetic-барами в tick-агрегації.
 - `stream.history_*` контролюють неблокуючий throttle `HistoryQuota` (Stage 3.1):
   - `history_max_calls_per_min` / `_per_hour` — глобальні бюджети FXCM-викликів.
   - `history_min_interval_seconds_<tf>` — локальні мінімальні інтервали по таймфреймах (наприклад, `m1`, `m5`).
@@ -343,7 +347,7 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 
 ### 7.2 Стрім (реальний час)
 
-- У циклі викликає `_fetch_and_publish_recent`, що поважає календар і lookback.
+- У циклі викликає `_fetch_and_publish_recent` (FXCM history), що поважає календар і lookback. Якщо увімкнена tick-агрегація (`stream.tick_aggregation_enabled=true`), history-публікація для `1m/5m` пропускається, щоб не змішувати джерела OHLCV.
 - `PublishDataGate` відкидає дублікати та зберігає останні `open_time` / `close_time` для lag-метрик.
 - Кожне видання барів → Prometheus `fxcm_ohlcv_bars_total` та оновлення лагів.
 - Якщо FXCM повертає `PriceHistoryCommunicator is not ready` або торгове вікно закрите — піднімається `MarketTemporarilyClosed`, публікується `state=closed` і heartbeat `idle` з `next_open`.

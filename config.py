@@ -361,6 +361,8 @@ class FXCMConfig:
     hmac_secret: Optional[str]
     hmac_algo: str
     redis_required: bool
+    tick_aggregation_enabled: bool
+    tick_aggregation_max_synth_gap_minutes: int
 
 
 def load_config() -> FXCMConfig:
@@ -485,6 +487,16 @@ def load_config() -> FXCMConfig:
         BackoffTuning(base_seconds=2.0, max_seconds=60.0, multiplier=2.0, jitter=0.2),
     )
 
+    tick_aggregation_enabled = _coerce_bool(
+        stream_cfg.get("tick_aggregation_enabled"),
+        False,
+    )
+    tick_aggregation_max_synth_gap_minutes = _coerce_int(
+        stream_cfg.get("tick_aggregation_max_synth_gap_minutes"),
+        60,
+        min_value=0,
+    )
+
     sample_cfg_raw = runtime_settings.get("sample_request")
     sample_cfg = sample_cfg_raw if isinstance(sample_cfg_raw, dict) else {}
     sample_request = SampleRequestSettings(
@@ -581,4 +593,6 @@ def load_config() -> FXCMConfig:
         hmac_secret=hmac_secret,
         hmac_algo=hmac_algo,
         redis_required=redis_required,
+        tick_aggregation_enabled=tick_aggregation_enabled,
+        tick_aggregation_max_synth_gap_minutes=tick_aggregation_max_synth_gap_minutes,
     )

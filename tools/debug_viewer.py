@@ -71,6 +71,11 @@ except Exception:  # pragma: no cover - fallback якщо модуль config н
     _RUNTIME_SETTINGS_PATH = Path("config/runtime_settings.json")
 
 
+MILLISECONDS_IN_SECOND = 1_000
+SECONDS_IN_MINUTE = 60
+MILLISECONDS_IN_MINUTE = MILLISECONDS_IN_SECOND * SECONDS_IN_MINUTE
+
+
 def _load_viewer_settings() -> Dict[str, Any]:
     try:
         payload = json.loads(_RUNTIME_SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -196,6 +201,7 @@ OHLCV_MSG_IDLE_WARN_SECONDS = _cfg_float("ohlcv_msg_idle_warn_seconds", 90.0, mi
 OHLCV_MSG_IDLE_ERROR_SECONDS = _cfg_float("ohlcv_msg_idle_error_seconds", 180.0, min_value=10.0)
 OHLCV_LAG_WARN_SECONDS = _cfg_float("ohlcv_lag_warn_seconds", 45.0, min_value=5.0)
 OHLCV_LAG_ERROR_SECONDS = _cfg_float("ohlcv_lag_error_seconds", 120.0, min_value=10.0)
+SLEEP_MODEL_GAP_THRESHOLD_MINUTES = _cfg_float("sleep_model_gap_threshold_minutes", 60.0, min_value=1.0)
 _IDLE_THRESHOLD_OVERRIDES: Dict[str, Tuple[float, float]] = {
     "1m": (
         _cfg_float("tf_1m_idle_warn_seconds", 70.0, min_value=5.0),
@@ -208,7 +214,7 @@ _IDLE_THRESHOLD_OVERRIDES: Dict[str, Tuple[float, float]] = {
 }
 ALERT_SEVERITY_ORDER = {"danger": 0, "warning": 1, "info": 2}
 ALERT_SEVERITY_COLORS = {"danger": "red", "warning": "yellow", "info": "cyan"}
-MENU_TEXT = "[P] пауза  [C] очистити  [Q] вихід  [0] TL  [1] SUM  [2] SES  [3] ALERT  [4] STREAM  [5] PRICE  [6] SUPR  [7] HIST"
+MENU_TEXT = "[P] пауза  [C] очистити  [Q] вихід  [0] TL  [1] SUM  [2] SES  [3] ALERT  [4] STREAM  [5] PRICE  [6] SUPR  [7] HIST  [8] STAT"
 TIMELINE_MATRIX_ROWS = _cfg_int("timeline_matrix_rows", 10, min_value=2)
 TIMELINE_MAX_COLUMNS = _cfg_int("timeline_max_columns", 120, min_value=10)
 _TIMELINE_HISTORY_DEFAULT = max(240, TIMELINE_MATRIX_ROWS * TIMELINE_MAX_COLUMNS * 2)
@@ -253,6 +259,13 @@ def _tf_label_to_minutes(tf_label: str) -> Optional[float]:
     if tf_norm.endswith("d") and tf_norm[:-1].isdigit():
         return float(max(1, int(tf_norm[:-1] or "1")) * 1_440)
     return None
+
+
+def _tf_label_to_ms(tf_label: str) -> Optional[int]:
+    minutes = _tf_label_to_minutes(tf_label)
+    if minutes is None:
+        return None
+    return int(minutes * MILLISECONDS_IN_MINUTE)
 
 
 def resolve_idle_thresholds(tf_label: str) -> Tuple[float, float]:
@@ -304,6 +317,7 @@ class DashboardMode(Enum):
     PRICE = 5
     SUPERVISOR = 6
     HISTORY = 7
+    STATS = 8
 
 
 @dataclass
@@ -322,6 +336,46 @@ class ViewerAlert:
     message: str
     severity: str
     since_ts: float
+
+
+@dataclass
+class OhlcvGapEvent:
+    """Одна gap-подія між двома послідовними OHLCV чанками для symbol/tf."""
+
+    symbol: str
+    tf: str
+    tf_ms: int
+    missing_bars: int
+    prev_end_ms: int
+    next_start_ms: int
+    sleep_model: bool
+    first_seen_ts: float
+    last_update_ts: float
+    filled_bars: int = 0
+    synthetic_bars: int = 0
+    filled: bool = False
+    _counted_opens: Set[int] = field(default_factory=set, repr=False)
+
+    def _count_open(self, open_ms: int, *, synthetic: bool) -> bool:
+        if self.filled:
+            return False
+        if open_ms in self._counted_opens:
+            return False
+        self._counted_opens.add(open_ms)
+        self.filled_bars += 1
+        if synthetic:
+            self.synthetic_bars += 1
+        if self.filled_bars >= self.missing_bars:
+            self.filled = True
+        return True
+
+    @property
+    def missing_min(self) -> float:
+        return (self.missing_bars * self.tf_ms) / MILLISECONDS_IN_MINUTE
+
+    @property
+    def synth_min(self) -> float:
+        return (self.synthetic_bars * self.tf_ms) / MILLISECONDS_IN_MINUTE
 
 
 @dataclass
@@ -364,6 +418,7 @@ class ViewerState:
     backoff_diag_updated: Optional[float] = None
     tick_cadence: Dict[str, Any] = field(default_factory=dict)
     tick_cadence_updated: Optional[float] = None
+    ohlcv_gap_events: Deque["OhlcvGapEvent"] = field(default_factory=lambda: deque(maxlen=220))
 
     def note_heartbeat(self, payload: Dict[str, Any]) -> None:
         """Оновлює кеші та діагностику згідно з новим heartbeat payload."""
@@ -449,6 +504,63 @@ class ViewerState:
         bars_per_msg = len(bars)
         now_ts = time.time()
 
+        tf_ms = _tf_label_to_ms(tf)
+        # Збираємо open/close з payload, щоби детектити gap'и між чанками.
+        opens: List[int] = []
+        close_times: List[int] = []
+        synthetic_by_open: Dict[int, bool] = {}
+        for entry in bars:
+            if not isinstance(entry, dict):
+                continue
+            open_ms = _coerce_int(entry.get("open_time"))
+            close_ms = _coerce_int(entry.get("close_time"))
+            if open_ms is None or close_ms is None:
+                continue
+            opens.append(open_ms)
+            close_times.append(close_ms)
+            synthetic_by_open[open_ms] = bool(entry.get("synthetic")) if "synthetic" in entry else False
+
+        prev_last_close_ms = None
+        if key in self.ohlcv_targets:
+            prev_last_close_ms = _coerce_int(self.ohlcv_targets[key].get("last_close_ms"))
+
+        if tf_ms is not None and prev_last_close_ms is not None and opens:
+            first_open_ms = min(opens)
+            prev_end_ms = prev_last_close_ms + 1  # close_time у нас інклюзивний
+            if first_open_ms > prev_end_ms:
+                gap_ms = first_open_ms - prev_end_ms
+                missing_bars = int(gap_ms // tf_ms)
+                if missing_bars > 0:
+                    missing_minutes = (missing_bars * tf_ms) / MILLISECONDS_IN_MINUTE
+                    self.ohlcv_gap_events.appendleft(
+                        OhlcvGapEvent(
+                            symbol=symbol,
+                            tf=tf,
+                            tf_ms=tf_ms,
+                            missing_bars=missing_bars,
+                            prev_end_ms=prev_end_ms,
+                            next_start_ms=first_open_ms,
+                            sleep_model=missing_minutes > SLEEP_MODEL_GAP_THRESHOLD_MINUTES,
+                            first_seen_ts=now_ts,
+                            last_update_ts=now_ts,
+                        )
+                    )
+
+        if opens and tf_ms is not None:
+            # Оновлюємо існуючі gap-події: якщо у поточному payload прийшли бари,
+            # які попадають у проміжок gap'а — це backfill (може бути synthetic).
+            for open_ms in sorted(set(opens)):
+                is_synth = synthetic_by_open.get(open_ms, False)
+                for gap in self.ohlcv_gap_events:
+                    if gap.filled:
+                        continue
+                    if gap.symbol != symbol or gap.tf != tf:
+                        continue
+                    if open_ms < gap.prev_end_ms or open_ms >= gap.next_start_ms:
+                        continue
+                    if gap._count_open(open_ms, synthetic=is_synth):
+                        gap.last_update_ts = now_ts
+
         last_close_ms: Optional[int] = None
         for entry in bars:
             if not isinstance(entry, dict):
@@ -486,6 +598,8 @@ class ViewerState:
 
         if len(self.ohlcv_targets) > 200:
             self._prune_ohlcv(now_ts)
+
+
 
     def _prune_ohlcv(self, now_ts: float) -> None:
         """Прибирає символи, які давно не оновлювались, щоб обмежити пам'ять."""
@@ -1086,6 +1200,7 @@ def handle_keypress(key: str, state: ViewerState) -> bool:
         "5": DashboardMode.PRICE,
         "6": DashboardMode.SUPERVISOR,
         "7": DashboardMode.HISTORY,
+        "8": DashboardMode.STATS,
     }
     if normalized in mode_map:
         new_mode = mode_map[normalized]
@@ -1452,6 +1567,119 @@ def build_fxcm_diag_panel(state: ViewerState) -> Panel:
         table.add_row(label, str(value))
 
     return Panel(table, title="FXCM diagnostics", border_style="cyan", box=box.ROUNDED)
+
+
+def build_s1_stats_panel(state: ViewerState) -> Panel:
+    """Показує S1-діагностику: календар vs живі тики та ефективний стан стріму."""
+
+    heartbeat = state.last_heartbeat or {}
+    context = heartbeat.get("context") or {}
+    market_status = state.last_market_status or {}
+
+    calendar_open = context.get("calendar_open")
+    ticks_alive = context.get("ticks_alive")
+    effective_open = context.get("effective_market_open")
+
+    def _flag(value: Any) -> Text:
+        if value is True:
+            return Text("YES", style="bold green")
+        if value is False:
+            return Text("NO", style="bold red")
+        return Text("—", style="dim")
+
+    table = Table.grid(padding=(0, 1))
+    table.add_column(style="bold cyan", justify="right", overflow="fold")
+    table.add_column(overflow="fold")
+
+    hb_state = str(heartbeat.get("state", "—") or "—")
+    ms_state = str(market_status.get("state", "—") or "—")
+
+    table.add_row("Heartbeat state", hb_state)
+    table.add_row("Market status", ms_state)
+    table.add_row("Calendar open", _flag(calendar_open))
+    table.add_row("Ticks alive", _flag(ticks_alive))
+    table.add_row("Effective open", _flag(effective_open))
+
+    idle_reason = context.get("idle_reason")
+    if idle_reason:
+        table.add_row("Idle reason", str(idle_reason))
+
+    history_state = context.get("history_state")
+    if history_state:
+        table.add_row("History state", str(history_state))
+
+    tick_silence = _coerce_float(context.get("tick_silence_seconds"))
+    if tick_silence is not None:
+        table.add_row("Tick silence", _format_diag_duration(tick_silence))
+
+    cadence = context.get("tick_cadence") if isinstance(context, dict) else None
+    if isinstance(cadence, dict):
+        cadence_state = cadence.get("state")
+        cadence_reason = cadence.get("reason")
+        multiplier = _coerce_float(cadence.get("multiplier"))
+        if cadence_state is not None:
+            table.add_row("Cadence state", str(cadence_state))
+        if cadence_reason is not None:
+            table.add_row("Cadence reason", str(cadence_reason))
+        if multiplier is not None:
+            table.add_row("Cadence x", f"{multiplier:.2f}")
+
+    hb_age = state.heartbeat_age()
+    if hb_age is not None:
+        table.add_row("Heartbeat age", _format_duration(hb_age))
+
+    border = "green" if effective_open is True else "yellow" if effective_open is None else "red"
+    return Panel(table, title="S1 stats", border_style=border, box=box.ROUNDED)
+
+
+def _format_gap_ts(ms_value: Optional[int]) -> str:
+    if ms_value is None:
+        return "—"
+    dt_value = dt.datetime.fromtimestamp(ms_value / 1000.0, tz=dt.timezone.utc)
+    return dt_value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_ohlcv_gaps_panel(state: ViewerState) -> Panel:
+    """Топ-N найбільших OHLCV gap'ів, які viewer побачив між чанками."""
+
+    events = list(state.ohlcv_gap_events)
+    if not events:
+        return Panel(
+            "Gap-подій поки немає (потрібні OHLCV payload-и).",
+            title="Top 10 largest gaps",
+            border_style="green",
+            box=box.ROUNDED,
+        )
+
+    events.sort(key=lambda ev: (ev.missing_min, ev.first_seen_ts), reverse=True)
+    top = events[:10]
+
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("Symbol", style="bold", overflow="fold")
+    table.add_column("TF", overflow="fold")
+    table.add_column("missing_min", justify="right", overflow="fold")
+    table.add_column("synth_min", justify="right", overflow="fold")
+    table.add_column("filled?", justify="center", overflow="fold")
+    table.add_column("sleep_model", justify="center", overflow="fold")
+    table.add_column("prev_end", overflow="fold")
+    table.add_column("next_start", overflow="fold")
+
+    for ev in top:
+        filled_text = Text("True" if ev.filled else "False", style=f"bold {'green' if ev.filled else 'red'}")
+        sleep_text = Text("True" if ev.sleep_model else "False", style=f"bold {'yellow' if ev.sleep_model else 'dim'}")
+        table.add_row(
+            ev.symbol,
+            ev.tf,
+            f"{ev.missing_min:.0f}",
+            f"{ev.synth_min:.0f}",
+            filled_text,
+            sleep_text,
+            _format_gap_ts(ev.prev_end_ms),
+            _format_gap_ts(ev.next_start_ms),
+        )
+
+    border = "red" if any((not ev.filled and not ev.sleep_model) for ev in top) else "cyan"
+    return Panel(table, title="Top 10 largest gaps", border_style=border, box=box.ROUNDED)
 
 
 def build_incidents_panel(state: ViewerState) -> Panel:
@@ -2180,7 +2408,7 @@ def build_tick_cadence_panel(state: ViewerState) -> Optional[Panel]:
     return Panel(body, title="Adaptive cadence", border_style="cyan", box=box.ROUNDED)
 
 
-def build_price_stream_panel(state: ViewerState) -> Panel:
+def build_price_stream_panel(state: ViewerState, *, include_cadence: bool = True) -> Panel:
     """Рендерить стан live-цін із підсумком потоку та списком символів."""
     data = state.price_stream or {}
     symbols_state = data.get("symbols_state") if isinstance(data, dict) else None
@@ -2258,9 +2486,10 @@ def build_price_stream_panel(state: ViewerState) -> Panel:
             )
 
     extras: List[Any] = [summary]
-    cadence_panel = build_tick_cadence_panel(state)
-    if cadence_panel is not None:
-        extras.append(cadence_panel)
+    if include_cadence:
+        cadence_panel = build_tick_cadence_panel(state)
+        if cadence_panel is not None:
+            extras.append(cadence_panel)
     extras.append(rows_table)
     fallback_counts: Optional[Mapping[str, float]] = {"price": float(state.price_snapshot_total)}
     special_panel = build_supervisor_special_channels_panel(state.supervisor_diag, fallback_counts=fallback_counts)
@@ -2608,6 +2837,32 @@ def _render_mode_body(state: ViewerState) -> Union[Layout, Panel]:
         )
         layout["history_backoff"].update(build_backoff_panel(state))
         layout["history_quota"].update(build_history_quota_panel(state))
+        return layout
+    if mode == DashboardMode.STATS:
+        layout = Layout(name="stats_mode")
+        layout.split_row(
+            Layout(name="left", ratio=2, minimum_size=8),
+            Layout(name="right", ratio=3, minimum_size=8),
+        )
+
+        left = Layout(name="stats_left")
+        left.split_column(
+            Layout(name="s1", size=14, minimum_size=8),
+            Layout(name="gaps", ratio=1, minimum_size=10),
+        )
+        left["s1"].update(build_s1_stats_panel(state))
+        left["gaps"].update(build_ohlcv_gaps_panel(state))
+        layout["left"].update(left)
+
+        right = Layout(name="stats_right")
+        right.split_column(
+            Layout(name="cadence", size=14, minimum_size=8),
+            Layout(name="price", ratio=1, minimum_size=8),
+        )
+        cadence_panel = build_tick_cadence_panel(state)
+        right["cadence"].update(cadence_panel or Panel("Очікуємо tick_cadence у heartbeat…", title="Adaptive cadence", border_style="yellow", box=box.ROUNDED))
+        right["price"].update(build_price_stream_panel(state, include_cadence=False))
+        layout["right"].update(right)
         return layout
     layout = Layout(name="alerts_mode")
     layout.split_column(

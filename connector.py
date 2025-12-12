@@ -106,6 +106,12 @@ from fxcm_schema import (
     SessionContextPayload,
     RedisBar,
 )
+from tick_ohlcv import (
+    FxcmTick,
+    OhlcvBar as TickOhlcvBar,
+    OhlcvFromLowerTfAggregator,
+    TickOhlcvAggregator,
+)
 
 # Налаштування логування
 log: Logger = logging.getLogger("fxcm_connector")
@@ -240,6 +246,22 @@ PROM_ERROR_COUNTER = Counter(
 PROM_MARKET_STATUS = Gauge(
     "fxcm_market_status",
     "Статус ринку: 1=open, 0=closed",
+)
+PROM_CALENDAR_OPEN = Gauge(
+    "fxcm_calendar_open",
+    "Статус ринку за календарем: 1=open, 0=closed",
+)
+PROM_TICK_STREAM_ALIVE = Gauge(
+    "fxcm_tick_stream_alive",
+    "Чи надходять тики (tick_silence нижче порогу): 1=alive, 0=down",
+)
+PROM_EFFECTIVE_MARKET_OPEN = Gauge(
+    "fxcm_effective_market_open",
+    "Ефективний стан стріму: 1=працюємо, 0=idle",
+)
+PROM_CALENDAR_CLOSED_TICKS_ALIVE = Counter(
+    "fxcm_calendar_closed_ticks_alive_total",
+    "Скільки разів календар CLOSED, але тики ще надходили",
 )
 PROM_HEARTBEAT_TS = Gauge(
     "fxcm_connector_heartbeat_timestamp",
@@ -1284,6 +1306,38 @@ def _float_or_none(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _tick_stream_alive(
+    tick_metadata: Optional[Dict[str, Any]],
+    *,
+    tick_cadence: Optional[TickCadenceController] = None,
+) -> bool:
+    """Повертає True, якщо FXCM ще реально шле тики.
+
+    Важлива вимога S1: календар може показувати CLOSED, але FXCM інколи ще
+    певний час продовжує штовхати котирування. У такому випадку ми не
+    «засинаємо» тільки через календар — тримаємо стрім активним, доки тики
+    не згаснуть.
+    """
+
+    if not tick_metadata:
+        return False
+    silence = _float_or_none(tick_metadata.get("tick_silence_seconds"))
+    if silence is None:
+        return False
+
+    threshold = float(STATUS_PRICE_DOWN_SECONDS)
+    if tick_cadence is not None:
+        tuning = getattr(tick_cadence, "_tuning", None)
+        idle_threshold = getattr(tuning, "idle_threshold_seconds", None)
+        if idle_threshold is not None:
+            try:
+                threshold = float(idle_threshold)
+            except (TypeError, ValueError):
+                threshold = float(STATUS_PRICE_DOWN_SECONDS)
+
+    return silence < threshold
 
 
 def _humanize_session_name(tag: str) -> str:
@@ -2506,6 +2560,150 @@ class PriceSnapshotWorker:
             self._last_snapshot_ts = snap_ts
 
 
+class TickOhlcvWorker:
+    """Агрегує live тики у 1m/5m OHLCV та віддає complete-бари у ohlcv sink.
+
+    Важливо:
+    - Вхідні тики приходять з FXCM OfferTable callback у довільному потоці.
+    - Агрегатори НЕ thread-safe, тому обробка іде у власному worker thread через чергу.
+    - У Phase B публікуємо лише `complete=True` бари (live-оновлення не шлемо).
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        symbols: Sequence[str],
+        max_synth_gap_minutes: int,
+        ohlcv_sink: Callable[[OhlcvBatch], None],
+    ) -> None:
+        self._enabled = bool(enabled)
+        self._symbols: Set[str] = {_normalize_symbol(sym) for sym in symbols if sym}
+        self._max_synth_gap_minutes = max(0, int(max_synth_gap_minutes))
+        self._ohlcv_sink = ohlcv_sink
+        self._queue: "queue.Queue[PriceTick]" = queue.Queue(maxsize=PRICE_SNAPSHOT_QUEUE_MAXSIZE)
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._agg_1m: Dict[str, TickOhlcvAggregator] = {}
+        self._agg_5m: Dict[str, OhlcvFromLowerTfAggregator] = {}
+
+    def start(self) -> None:
+        if not self._enabled:
+            return
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="tick-ohlcv-worker", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def enqueue_tick(self, symbol: str, bid: float, ask: float, tick_ts: float) -> None:
+        if not self._enabled:
+            return
+        symbol_norm = _normalize_symbol(symbol)
+        if self._symbols and symbol_norm not in self._symbols:
+            return
+        mid = (float(bid) + float(ask)) / 2.0
+        tick = PriceTick(symbol=symbol_norm, bid=float(bid), ask=float(ask), mid=mid, tick_ts=float(tick_ts))
+        try:
+            self._queue.put_nowait(tick)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:  # pragma: no cover
+                pass
+            try:
+                self._queue.put_nowait(tick)
+            except queue.Full:
+                log.debug("Черга tick_ohlcv переповнена — тик %s відкинуто.", symbol_norm)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            drained = False
+            while True:
+                try:
+                    tick = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                drained = True
+                try:
+                    self._process_tick(tick)
+                finally:
+                    self._queue.task_done()
+            if not drained:
+                self._stop.wait(0.1)
+
+    def _process_tick(self, tick: PriceTick) -> None:
+        symbol = tick.symbol
+        agg_1m = self._agg_1m.get(symbol)
+        if agg_1m is None:
+            agg_1m = TickOhlcvAggregator(
+                symbol,
+                tf_seconds=60,
+                fill_gaps=True,
+                max_synthetic_gap_minutes=self._max_synth_gap_minutes,
+                source="tick_agg",
+            )
+            self._agg_1m[symbol] = agg_1m
+        agg_5m = self._agg_5m.get(symbol)
+        if agg_5m is None:
+            agg_5m = OhlcvFromLowerTfAggregator(
+                symbol,
+                target_tf_seconds=300,
+                lower_tf_seconds=60,
+                source="tick_agg",
+            )
+            self._agg_5m[symbol] = agg_5m
+
+        fx_tick = FxcmTick(
+            symbol=symbol,
+            ts_ms=int(tick.tick_ts * 1000),
+            price=float(tick.mid),
+            volume=0.0,
+        )
+
+        result_1m = agg_1m.ingest_tick(fx_tick)
+        for bar in result_1m.closed_bars:
+            self._publish_tick_bar(bar)
+            result_5m = agg_5m.ingest_bar(bar)
+            for higher_bar in result_5m.closed_bars:
+                self._publish_tick_bar(higher_bar)
+
+    def _publish_tick_bar(self, bar: TickOhlcvBar) -> None:
+        # Публікуємо тільки complete бари.
+        if not bar.complete:
+            return
+        df = pd.DataFrame(
+            [
+                {
+                    "open_time": int(bar.start_ms),
+                    "close_time": int(bar.end_ms),
+                    "open": float(bar.open),
+                    "high": float(bar.high),
+                    "low": float(bar.low),
+                    "close": float(bar.close),
+                    "volume": float(bar.volume),
+                    "complete": bool(bar.complete),
+                    "synthetic": bool(bar.synthetic),
+                    "source": str(bar.source),
+                    "tf": str(bar.tf),
+                }
+            ]
+        )
+        batch = OhlcvBatch(
+            symbol=bar.symbol,
+            timeframe=str(bar.tf),
+            data=df,
+            fetched_at=time.time(),
+            source=str(bar.source),
+        )
+        self._ohlcv_sink(batch)
+
+
 class FXCMOfferSubscription:
     """Підписка на FXCM OfferTable для отримання живих котирувань."""
 
@@ -3183,6 +3381,7 @@ def publish_ohlcv_to_redis(
     publish_rate_limit: Optional[Dict[Tuple[str, str], float]] = None,
     hmac_secret: Optional[str] = None,
     hmac_algo: str = "sha256",
+    source: Optional[str] = None,
 ) -> bool:
     """Серіалізує OHLCV у JSON і публікує до Redis."""
 
@@ -3201,7 +3400,7 @@ def publish_ohlcv_to_redis(
             log.info("Data gate: немає нових барів для %s %s.", symbol, timeframe)
             return False
 
-    bar_cols = [
+    base_cols = [
         "open_time",
         "close_time",
         "open",
@@ -3210,29 +3409,48 @@ def publish_ohlcv_to_redis(
         "close",
         "volume",
     ]
-    bars: List[RedisBar] = []
-    for (
-        open_time,
-        close_time,
-        open_price,
-        high_price,
-        low_price,
-        close_price,
-        volume_value,
-    ) in df_to_publish[bar_cols].itertuples(index=False, name=None):
-        bar = cast(
-            RedisBar,
-            {
-                "open_time": int(open_time),
-                "close_time": int(close_time),
-                "open": float(open_price),
-                "high": float(high_price),
-                "low": float(low_price),
-                "close": float(close_price),
-                "volume": float(volume_value),
-            },
-        )
-        bars.append(bar)
+    include_complete = "complete" in df_to_publish.columns
+    include_synthetic = "synthetic" in df_to_publish.columns
+    include_source = "source" in df_to_publish.columns
+    include_tf = "tf" in df_to_publish.columns
+
+    cols = list(base_cols)
+    if include_complete:
+        cols.append("complete")
+    if include_synthetic:
+        cols.append("synthetic")
+    if include_source:
+        cols.append("source")
+    if include_tf:
+        cols.append("tf")
+
+    bars: List[Dict[str, Any]] = []
+    for row in df_to_publish[cols].itertuples(index=False, name=None):
+        # Порядок row відповідає `cols`.
+        open_time = int(row[0])
+        close_time = int(row[1])
+        bar_payload: Dict[str, Any] = {
+            "open_time": open_time,
+            "close_time": close_time,
+            "open": float(row[2]),
+            "high": float(row[3]),
+            "low": float(row[4]),
+            "close": float(row[5]),
+            "volume": float(row[6]),
+        }
+        idx = len(base_cols)
+        if include_complete:
+            bar_payload["complete"] = bool(row[idx])
+            idx += 1
+        if include_synthetic:
+            bar_payload["synthetic"] = bool(row[idx])
+            idx += 1
+        if include_source:
+            bar_payload["source"] = str(row[idx])
+            idx += 1
+        if include_tf:
+            bar_payload["tf"] = str(row[idx])
+        bars.append(bar_payload)
 
     symbol_norm = _normalize_symbol(symbol)
     rate_limit_key = (symbol_norm, timeframe)
@@ -3247,6 +3465,8 @@ def publish_ohlcv_to_redis(
         "bars": bars,
     }
     payload = dict(base_payload)
+    if source:
+        payload["source"] = str(source)
     if hmac_secret:
         payload["sig"] = compute_payload_hmac(
             base_payload,
@@ -3319,6 +3539,7 @@ def _fetch_and_publish_recent(
     session_stats: Optional[SessionStatsTracker] = None,
     ohlcv_sink: Optional[Callable[[OhlcvBatch], None]] = None,
     market_status_sink: Optional[Callable[[MarketStatusEvent], None]] = None,
+    allow_calendar_closed: bool = False,
 ) -> pd.DataFrame:
     """Витягує останні `lookback_minutes` і публікує лише нові бари.
 
@@ -3327,7 +3548,7 @@ def _fetch_and_publish_recent(
     """
 
     end_dt = _now_utc()
-    if not is_trading_time(end_dt):
+    if not allow_calendar_closed and not is_trading_time(end_dt):
         next_open = _notify_market_closed(end_dt, redis_client if market_status_sink is None else None)
         if market_status_sink is not None:
             try:
@@ -3433,7 +3654,10 @@ def _fetch_and_publish_recent(
         except Exception:  # noqa: BLE001
             log.exception("Не вдалося передати market_status sink (open).")
     else:
-        _sync_market_status_with_calendar(redis_client)
+        if allow_calendar_closed:
+            _publish_market_status(redis_client, "open")
+        else:
+            _sync_market_status_with_calendar(redis_client)
     return df_to_publish
 
 
@@ -3676,6 +3900,8 @@ def stream_fx_data(
     history_backoff: Optional[FxcmBackoffController] = None,
     redis_backoff: Optional[FxcmBackoffController] = None,
     tick_cadence: Optional[TickCadenceController] = None,
+    tick_aggregation_enabled: bool = False,
+    tick_aggregation_timeframes: Optional[Sequence[str]] = None,
 ) -> None:
     """Безкінечний цикл стрімінгу OHLCV у Redis.
 
@@ -3779,6 +4005,16 @@ def stream_fx_data(
     publish_rate_limit: Dict[Tuple[str, str], float] = {}
     throttle_log_state: Dict[Tuple[str, str, str], float] = {}
 
+    tick_agg_timeframes: Set[str] = set()
+    if tick_aggregation_enabled:
+        if tick_aggregation_timeframes:
+            tick_agg_timeframes = {
+                _map_timeframe_label(tf) for tf in tick_aggregation_timeframes if isinstance(tf, str)
+            }
+        else:
+            # Phase B: tick-агрегація зараз генерує 1m і 5m.
+            tick_agg_timeframes = {"1m", "5m"}
+
     def _should_log_throttle(symbol_norm: str, timeframe_norm: str, reason: str) -> bool:
         now_log = time.monotonic()
         key = (symbol_norm, timeframe_norm, reason)
@@ -3812,6 +4048,7 @@ def stream_fx_data(
     cycles = 0
     last_idle_log_ts: Optional[float] = None
     last_idle_next_open: Optional[dt.datetime] = None
+    last_ticks_alive: Optional[bool] = None
 
     try:
         while True:
@@ -3822,8 +4059,16 @@ def stream_fx_data(
             idle_reason: Optional[str] = None
             cycle_published_bars = 0
             now = _now_utc()
-            market_open = is_trading_time(now)
+            calendar_open = is_trading_time(now)
             price_stream_metadata = price_stream.snapshot_metadata() if price_stream is not None else None
+            ticks_alive = _tick_stream_alive(price_stream_metadata, tick_cadence=tick_cadence)
+            market_open = calendar_open or ticks_alive
+
+            PROM_CALENDAR_OPEN.set(1 if calendar_open else 0)
+            PROM_TICK_STREAM_ALIVE.set(1 if ticks_alive else 0)
+            PROM_EFFECTIVE_MARKET_OPEN.set(1 if market_open else 0)
+            if ticks_alive and not calendar_open:
+                PROM_CALENDAR_CLOSED_TICKS_ALIVE.inc()
             cadence_snapshot: Optional[Dict[str, Any]] = None
             if tick_cadence is not None:
                 tick_cadence.update_state(
@@ -3838,7 +4083,10 @@ def stream_fx_data(
             if not market_open:
                 market_pause = True
                 closed_reference = now
-                idle_reason = "calendar_closed"
+                if last_ticks_alive:
+                    idle_reason = "ticks_stopped_after_calendar_close"
+                else:
+                    idle_reason = "calendar_closed"
             else:
                 history_call_attempted = False
                 cadence_allowances: Dict[str, bool] = {}
@@ -3847,6 +4095,9 @@ def stream_fx_data(
                 else:
                     for symbol, tf_raw in config:
                         tf_norm = _map_timeframe_label(tf_raw)
+                        if tick_aggregation_enabled and tf_norm in tick_agg_timeframes:
+                            # Не змішуємо FXCM history-клини з tick-agg у одному каналі.
+                            continue
                         if tick_cadence is not None:
                             allow_cadence = cadence_allowances.get(tf_norm)
                             if allow_cadence is None:
@@ -3893,6 +4144,7 @@ def stream_fx_data(
                                 session_stats=session_stats_tracker,
                                 ohlcv_sink=ohlcv_sink_effective,
                                 market_status_sink=market_status_sink,
+                                allow_calendar_closed=ticks_alive,
                             )
                         except MarketTemporarilyClosed as exc:
                             log.info("Стрім: ринок недоступний (%s)", exc)
@@ -4004,6 +4256,9 @@ def stream_fx_data(
                 idle_context: Dict[str, Any] = {
                     "channel": heartbeat_channel,
                     "mode": "idle",
+                    "calendar_open": calendar_open,
+                    "ticks_alive": ticks_alive,
+                    "effective_market_open": market_open,
                     "redis_connected": current_redis is not None,
                     "redis_required": require_redis,
                     "redis_channel": REDIS_CHANNEL,
@@ -4059,6 +4314,9 @@ def stream_fx_data(
                 stream_context: Dict[str, Any] = {
                     "channel": heartbeat_channel,
                     "mode": "stream",
+                    "calendar_open": calendar_open,
+                    "ticks_alive": ticks_alive,
+                    "effective_market_open": market_open,
                     "redis_connected": current_redis is not None,
                     "redis_required": require_redis,
                     "redis_channel": REDIS_CHANNEL,
@@ -4117,6 +4375,8 @@ def stream_fx_data(
                     sleep_for = max(sleep_for, history_backoff_remaining)
                 if redis_backoff_remaining > 0.0:
                     sleep_for = max(sleep_for, redis_backoff_remaining)
+
+            last_ticks_alive = ticks_alive
 
             cycles += 1
             if max_cycles is not None and cycles >= max_cycles:
@@ -4401,9 +4661,38 @@ def main() -> None:
                 )
                 supervisor.start()
 
+            def _direct_ohlcv_sink(batch: OhlcvBatch) -> None:
+                publish_ohlcv_to_redis(
+                    batch.data,
+                    symbol=batch.symbol,
+                    timeframe=batch.timeframe,
+                    redis_client=redis_holder["client"],
+                    data_gate=publish_gate,
+                    hmac_secret=config.hmac_secret,
+                    hmac_algo=config.hmac_algo,
+                    source=batch.source,
+                )
+
+            ohlcv_sink = (
+                supervisor.submit_ohlcv_batch
+                if supervisor is not None
+                else _direct_ohlcv_sink
+            )
+
+            tick_ohlcv_worker = TickOhlcvWorker(
+                enabled=config.tick_aggregation_enabled,
+                symbols=[symbol for symbol, _ in stream_config],
+                max_synth_gap_minutes=config.tick_aggregation_max_synth_gap_minutes,
+                ohlcv_sink=ohlcv_sink,
+            )
+            tick_ohlcv_worker.start()
+
             def _refresh_price_subscription(target_fx: ForexConnect) -> None:
                 if price_worker is None:
                     return
+                def _on_tick(symbol: str, bid: float, ask: float, tick_ts: float) -> None:
+                    price_worker.enqueue_tick(symbol, bid, ask, tick_ts)
+                    tick_ohlcv_worker.enqueue_tick(symbol, bid, ask, tick_ts)
                 existing = subscription_holder["instance"]
                 if existing is not None:
                     existing.close()
@@ -4411,7 +4700,7 @@ def main() -> None:
                     subscription_holder["instance"] = FXCMOfferSubscription(
                         target_fx,
                         symbols=[symbol for symbol, _ in stream_config],
-                        on_tick=price_worker.enqueue_tick,
+                        on_tick=_on_tick,
                     )
                 except Exception:
                     subscription_holder["instance"] = None
@@ -4448,6 +4737,8 @@ def main() -> None:
                     history_backoff=history_backoff_ctrl,
                     redis_backoff=redis_backoff_ctrl,
                     tick_cadence=tick_cadence_controller,
+                    tick_aggregation_enabled=config.tick_aggregation_enabled,
+                    tick_aggregation_timeframes=("1m", "5m"),
                 )
             finally:
                 offer_subscription = subscription_holder.get("instance")
@@ -4455,6 +4746,7 @@ def main() -> None:
                     offer_subscription.close()
                 if price_worker is not None:
                     price_worker.stop()
+                tick_ohlcv_worker.stop()
                 if supervisor is not None:
                     supervisor.stop()
         else:

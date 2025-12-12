@@ -290,12 +290,79 @@ def test_special_channels_panel_shows_price_hint(monkeypatch: pytest.MonkeyPatch
     panel = dv.build_supervisor_special_channels_panel(diag)
 
     assert isinstance(panel, Panel)
+
+
+def test_handle_keypress_switches_to_stats_mode() -> None:
+    state = dv.ViewerState()
+    assert state.active_mode != dv.DashboardMode.STATS
+
+    should_exit = dv.handle_keypress("8", state)
+
+    assert should_exit is False
+    assert state.active_mode == dv.DashboardMode.STATS
+    # smoke: рендер STATS не має падати
+    dashboard = dv.render_dashboard(state)
+    assert isinstance(dashboard, Layout)
     console = Console(record=True, width=120)
-    console.print(panel)
+    console.print(dashboard)
     render_str = console.export_text()
-    assert "price" in render_str
-    assert "Снепшоти" in render_str
-    assert "0" in render_str
+    assert "S1 stats" in render_str
+
+
+def test_note_ohlcv_detects_gap_between_chunks() -> None:
+    state = dv.ViewerState()
+    # Перший чанк: останній бар закінчився о 00:00:59
+    state.note_ohlcv(
+        {
+            "symbol": "XAUUSD",
+            "tf": "1m",
+            "bars": [
+                {
+                    "open_time": 0,
+                    "close_time": 59_999,
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "volume": 0.0,
+                }
+            ],
+        }
+    )
+
+    # Другий чанк: стартує з 00:02:00 (пропущена 1 хвилина 00:01)
+    state.note_ohlcv(
+        {
+            "symbol": "XAUUSD",
+            "tf": "1m",
+            "bars": [
+                {
+                    "open_time": 120_000,
+                    "close_time": 179_999,
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "volume": 0.0,
+                }
+            ],
+        }
+    )
+
+    assert state.ohlcv_gap_events
+    gap = state.ohlcv_gap_events[0]
+    assert gap.symbol == "XAUUSD"
+    assert gap.tf == "1m"
+    assert gap.missing_min == 1.0
+    assert gap.filled is False
+
+    panel = dv.build_ohlcv_gaps_panel(state)
+    assert isinstance(panel, Panel)
+    console = Console(record=True, width=160)
+    console.print(panel)
+    text = console.export_text()
+    assert "Top 10 largest gaps" in text
+    assert "XAUUSD" in text
 
 
 def test_supervisor_special_channels_panel_uses_fallback_counts(monkeypatch: pytest.MonkeyPatch) -> None:

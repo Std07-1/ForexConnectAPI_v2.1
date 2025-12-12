@@ -187,6 +187,12 @@ class FXCMIngestor:
         now_ms = _now_ms()
         max_allowed = now_ms + MAX_FUTURE_DRIFT_SECONDS * 1000
         for idx, bar in enumerate(bars_raw):
+            if isinstance(bar, Mapping):
+                # Phase C: live-незакриті бари не пишемо/не передаємо далі.
+                # Якщо complete відсутній — вважаємо, що бар complete=True.
+                complete = bar.get("complete", True)
+                if complete is False:
+                    continue
             sanitized_bar = self._sanitize_bar(bar, idx)
             if sanitized_bar["open_time"] < MIN_ALLOWED_BAR_TIMESTAMP_MS:
                 raise IngestValidationError(

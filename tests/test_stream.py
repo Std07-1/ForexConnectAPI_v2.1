@@ -260,7 +260,71 @@ class WarmupStreamTest(unittest.TestCase):
             if channel == connector.REDIS_STATUS_CHANNEL
         ]
         self.assertTrue(status_messages)
+
+
+class SessionAwareStreamTest(unittest.TestCase):
+    def setUp(self) -> None:
+        connector._LAST_MARKET_STATUS = None
+
+    def test_calendar_closed_but_ticks_alive_keeps_streaming(self) -> None:
+        fixed_now = dt.datetime(2025, 5, 5, 12, 0, tzinfo=dt.timezone.utc)
+
+        def fake_now() -> dt.datetime:
+            return fixed_now
+
+        df = _make_sample_df(fixed_now - dt.timedelta(minutes=4), 4)
+        fx = FakeForexConnect(df)
+        redis_client = FakeRedis()
+        heartbeat_channel = "fxcm:test:heartbeat"
+        price_stream = StaticPriceStream({
+            "state": "ok",
+            "tick_silence_seconds": 1.0,
+        })
+
+        with mock.patch("connector._now_utc", side_effect=fake_now), mock.patch(
+            "connector.is_trading_time", return_value=False
+        ):
+            stream_fx_data(
+                cast(connector.ForexConnect, fx),
+                redis_client=redis_client,
+                poll_seconds=0,
+                publish_interval_seconds=0,
+                lookback_minutes=5,
+                config=[("XAU/USD", "m1")],
+                max_cycles=1,
+                heartbeat_channel=heartbeat_channel,
+                price_stream=cast(connector.PriceSnapshotWorker, price_stream),
+                tick_cadence=None,
+            )
+
+        ohlcv_messages = [
+            json.loads(payload)
+            for channel, payload in redis_client.messages
+            if channel == connector.REDIS_CHANNEL
+        ]
+        self.assertTrue(ohlcv_messages)
+        self.assertGreaterEqual(len(ohlcv_messages[-1].get("bars", [])), 1)
+
+        status_messages = [
+            json.loads(payload)
+            for channel, payload in redis_client.messages
+            if channel == connector.REDIS_STATUS_CHANNEL
+        ]
+        self.assertTrue(status_messages)
         self.assertEqual(status_messages[-1]["state"], "open")
+
+        heartbeat_messages = [
+            json.loads(payload)
+            for channel, payload in redis_client.messages
+            if channel == heartbeat_channel
+        ]
+        self.assertTrue(heartbeat_messages)
+        last_heartbeat = heartbeat_messages[-1]
+        self.assertEqual(last_heartbeat["state"], "stream")
+        ctx = last_heartbeat.get("context") or {}
+        self.assertIs(ctx.get("calendar_open"), False)
+        self.assertIs(ctx.get("ticks_alive"), True)
+        self.assertIs(ctx.get("effective_market_open"), True)
 
     def test_market_status_closed(self) -> None:
         saturday = dt.datetime(2025, 5, 3, 12, 0, tzinfo=dt.timezone.utc)
@@ -269,7 +333,7 @@ class WarmupStreamTest(unittest.TestCase):
         def fake_now() -> dt.datetime:
             return holder["now"]
 
-        fx = FakeForexConnect(self._build_df(saturday - dt.timedelta(minutes=5), 2))
+        fx = FakeForexConnect(_make_sample_df(saturday - dt.timedelta(minutes=5), 2))
         redis_client = FakeRedis()
         heartbeat_channel = "fxcm:test:heartbeat"
 
@@ -312,6 +376,41 @@ class WarmupStreamTest(unittest.TestCase):
         self.assertEqual(last_heartbeat["context"]["mode"], "idle")
         self.assertIn("idle_reason", last_heartbeat["context"])
         self.assertIn("session", last_heartbeat["context"])
+
+
+class TickAggregationIsolationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        connector._LAST_MARKET_STATUS = None
+
+    def test_tick_aggregation_disables_history_stream_for_m1(self) -> None:
+        fixed_now = dt.datetime(2025, 5, 5, 12, 0, tzinfo=dt.timezone.utc)
+        df = _make_sample_df(fixed_now - dt.timedelta(minutes=4), 4)
+        fx = FakeForexConnect(df)
+        redis_client = FakeRedis()
+
+        with mock.patch("connector._now_utc", return_value=fixed_now), mock.patch(
+            "connector.is_trading_time", return_value=True
+        ):
+            with mock.patch.object(fx, "get_history", wraps=fx.get_history) as history_mock:
+                stream_fx_data(
+                    cast(connector.ForexConnect, fx),
+                    redis_client=redis_client,
+                    poll_seconds=0,
+                    publish_interval_seconds=0,
+                    lookback_minutes=5,
+                    config=[("XAU/USD", "m1")],
+                    max_cycles=1,
+                    tick_aggregation_enabled=True,
+                    tick_aggregation_timeframes=("1m", "5m"),
+                )
+
+        history_mock.assert_not_called()
+        ohlcv_messages = [
+            json.loads(payload)
+            for channel, payload in redis_client.messages
+            if channel == connector.REDIS_CHANNEL
+        ]
+        self.assertFalse(ohlcv_messages)
 
 
 class MarketStatusSyncTest(unittest.TestCase):
@@ -1490,7 +1589,12 @@ class HMACTest(unittest.TestCase):
         payload = json.loads(payload_raw)
         sig = payload.pop("sig", None)
         self.assertIsNotNone(sig)
-        expected = compute_payload_hmac(payload, secret, "sha256")
+        base_payload = {
+            "symbol": payload.get("symbol"),
+            "tf": payload.get("tf"),
+            "bars": payload.get("bars"),
+        }
+        expected = compute_payload_hmac(base_payload, secret, "sha256")
         self.assertEqual(sig, expected)
 
     def test_publish_skips_signature_when_secret_missing(self) -> None:
@@ -1539,6 +1643,52 @@ class CalendarOverrideTest(unittest.TestCase):
         after_reopen = dt.datetime(2025, 7, 7, 22, 5, tzinfo=dt.timezone.utc)
         self.assertFalse(sessions.is_trading_time(maintenance_dt))
         self.assertTrue(sessions.is_trading_time(after_reopen))
+
+
+class OhlcvPublishMetadataTest(unittest.TestCase):
+    def test_publish_includes_optional_bar_fields_when_present(self) -> None:
+        redis_client = FakeRedis()
+        df = pd.DataFrame(
+            [
+                {
+                    "open_time": 1000,
+                    "close_time": 2000,
+                    "open": 1.0,
+                    "high": 2.0,
+                    "low": 0.5,
+                    "close": 1.5,
+                    "volume": 3.0,
+                    "complete": True,
+                    "synthetic": True,
+                    "source": "tick_agg",
+                    "tf": "1m",
+                }
+            ]
+        )
+
+        publish_ohlcv_to_redis(
+            df,
+            symbol="XAU/USD",
+            timeframe="1m",
+            redis_client=redis_client,
+            source="tick_agg",
+        )
+
+        _, payload_raw = redis_client.messages[-1]
+        payload = json.loads(payload_raw)
+        self.assertEqual(payload.get("symbol"), "XAUUSD")
+        self.assertEqual(payload.get("tf"), "1m")
+        self.assertEqual(payload.get("source"), "tick_agg")
+        bars = payload.get("bars")
+        self.assertIsInstance(bars, list)
+        self.assertEqual(len(bars), 1)
+        bar = bars[0]
+        self.assertEqual(bar.get("open_time"), 1000)
+        self.assertEqual(bar.get("close_time"), 2000)
+        self.assertEqual(bar.get("complete"), True)
+        self.assertEqual(bar.get("synthetic"), True)
+        self.assertEqual(bar.get("source"), "tick_agg")
+        self.assertEqual(bar.get("tf"), "1m")
 
     def test_is_trading_time_handles_ahead_timezone_weekend(self) -> None:
         sessions.override_calendar(
