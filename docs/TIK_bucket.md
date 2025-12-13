@@ -73,6 +73,10 @@
 
 - Поточний конектор публікує у `fxcm:ohlcv` масив `bars` (batch). Обовʼязкові поля бару: `open_time`, `close_time`, `open`, `high`, `low`, `close`, `volume`.
 - Поля `complete`, `synthetic`, `source`, `tf` — опціональні та додаються, якщо продьюсер їх має (Phase B додає їх для `tick_agg`).
+- Додатково `tick_agg` може додавати «мікроструктурні» метрики бару (усі опційні):
+  - `tick_count` — скільки тиків увійшло в бар;
+  - `bar_range`, `body_size`, `upper_wick`, `lower_wick` — геометрія свічки;
+  - `avg_spread`, `max_spread` — середній/максимальний спред усередині бару (за bid/ask з OfferTable).
 - У поточній реалізації Phase B публікуються лише `complete=true` бари; live (`complete=false`) не транслюється.
 - Поле `source` використовується для діагностики походження даних (наприклад, `tick_agg` vs `stream`). У стрім-режимі з `tick_aggregation_enabled=true` конектор **не змішує** FXCM history та tick-агрегацію для `1m/5m`: history-полінг для цих TF не публікується у `fxcm:ohlcv`.
 

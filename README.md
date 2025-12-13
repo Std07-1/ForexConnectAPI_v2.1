@@ -2,7 +2,7 @@
 
 > Легковаговий стрімер OHLCV барів із FXCM (ForexConnect API) до Redis з валідацією HMAC, файловим кешем та продакшн-орієнтованим моніторингом.
 
-**Версія 2.3 · 05 грудня 2025**
+**Версія релізу:** береться з файлу `VERSION` (виводиться на старті як `FXCM_CONNECTOR_VERSION`).
 
 - Redis-повідомлення `fxcm:ohlcv` підписуються HMAC і перевіряються `fxcm_ingestor` перед записом у UnifiedStore.
 - Idle-heartbeat підтягує останній close з кешу, тож UI бачить лаг і `next_open` навіть коли ринок спить.
@@ -43,12 +43,26 @@ Stage 3 закрито повністю: усі три підпроекти пр
 | Канал | Producer | Частота | Основні поля |
 | --- | --- | --- | --- |
 | `fxcm:ohlcv` | `connector.publish_ohlcv_to_redis` | За кожен цикл per `stream.config` | `symbol`, `tf`, `bars` (масив `open_time/close_time/open/high/low/close/volume` у мс, float), опційно `sig` (HMAC). |
-| `fxcm:market_status` | `_publish_market_status` | При зміні стану або раз на ≤30 c | `type="market_status"`, `state=open|closed`,`ts`,`next_open_{utc,ms,in_seconds}`,`session` (тег, таймзона, вікна, статистика). |
+| `fxcm:market_status` | `_publish_market_status` | При зміні стану або раз на ≤30 c | `type="market_status"`, `state=open/closed`, `ts`, `next_open_{utc,ms,in_seconds}`, `session` (тег, таймзона, вікна, статистика). |
 | `fxcm:heartbeat` | `_publish_heartbeat` / AsyncSupervisor | Кожен цикл + idle/ warmup | `type="heartbeat"`, `state`, `last_bar_close_ms`, `sleep_seconds`, `context` (Redis, `stream_targets`, `lag_seconds`, `context.history`, `context.tick_cadence`, `context.diag.backoff`, `session`). |
 | `fxcm:price_tik` | `PriceSnapshotWorker` | Кожні `stream.price_snap_interval_seconds` сек | `symbol`, `bid`, `ask`, `mid`, `tick_ts`, `snap_ts`; канал вказаний у `stream.price_snap_channel`. |
 | `fxcm:status` | `_publish_public_status` | Разом із heartbeat/market_status (~5–10 с) | `ts`, `process`, `market`, `price`, `ohlcv`, `session`, `note`; призначений для зовнішніх споживачів (див. §1.2). |
 
 > Детальні JSON-приклади для heartbeat/market-status див. §9.1, а інгістор очікує рівно ці ключі під час HMAC-перевірки.
+
+> **Повний опис всіх контрактів/TypedDict та каналів:** `docs/contracts.md`.
+
+### 1.1.1 Швидка інтеграція для UDS/SMC (ohlcv / tik / status)
+
+Найчастіший сценарій для UDS/SMC — підписатися на 3 канали й застосувати однакові правила фрешності/ідемпотентності:
+
+| Канал | TypedDict (контракт) | Для чого в UDS/SMC | Критичні правила споживання |
+| --- | --- | --- | --- |
+| `fxcm:ohlcv` | `OhlcvPayload` / `OhlcvBarPayload` | OHLCV для стратегій/індикаторів, запис у сховище, синхронізація з баровим тактом | Ідемпотентність: ключ бару — `(symbol, tf, open_time)`; часові поля **в мс**; якщо `complete=false` — бар **не фінальний** (можна пропускати, так робить інгістор); `sig` (якщо є) перевіряється HMAC над базовим payload `{symbol, tf, bars}`. |
+| `fxcm:price_tik` | `PriceTickSnapPayload` | Жива ціна (mid/bid/ask), “останній тик” для UI/алертів, швидкі перевірки spread | Фрешність: використовуй `tick_ts` як “час останнього тика” (event-time), а `snap_ts` як “коли сформовано/опубліковано” (publish-time); допускай пропуски (це снепшоти, не повний tick-stream). |
+| `fxcm:status` | `PublicStatusPayload` | Єдина точка truth про готовність конектора: чи ринок open, чи ціна жива, чи OHLCV ок | Не плутай `session.state` і `market`: `market=open/closed/unknown` — агрегований стан; `session.state_detail` з’являється **лише** коли `session.state=closed` і має `intrabreak`/`overnight`/`weekend`; для “можна торгувати?” в першу чергу орієнтуйся на `market` + `price` + `ohlcv`. |
+
+Мінімальна логіка “OK to use data” для UDS/SMC зазвичай виглядає так: `status.market == "open"` і `status.price == "ok"` і `status.ohlcv == "ok"`. Деталі полів та всі опційні ключі — у `docs/contracts.md`.
 
 ### 1.2 Публічний статус-канал `fxcm:status`
 
@@ -65,7 +79,6 @@ Stage 3 закрито повністю: усі три підпроекти пр
     "name": "Tokyo",
     "tag": "TOKYO",
     "state": "open",
-    "state_detail": "active",
     "current_open_utc": "2025-12-05T00:00:00Z",
     "current_close_utc": "2025-12-05T09:00:00Z",
     "next_open_utc": "2025-12-05T09:00:00Z",
@@ -80,7 +93,7 @@ Stage 3 закрито повністю: усі три підпроекти пр
 - `market`: `open`, `closed`, `unknown` (якщо ще не отримали FXCM статус).
 - `price`: `ok`, `stale` (тиків давно не було), `down` (price feed відсутній).
 - `ohlcv`: `ok`, `delayed` (лаг >60 с), `down` (барів немає або процес у паузі).
-- `session`: структурований зріз активної сесії (людська назва, тег, відкриття/закриття, таймери до подій) та `state_detail` (`active`, `overnight`, `weekend`, `intrabreak`).
+- `session`: структурований зріз активної сесії (людська назва, тег, відкриття/закриття, таймери до подій). `state_detail` з’являється лише коли `session.state=closed` і має значення `intrabreak`/`overnight`/`weekend`.
 - `note`: короткий текст для людей: `ok`, `idle: calendar_closed`, `backoff FXCM 30s`, `price stale` тощо.
 
 Канал можна перевизначити через `FXCM_STATUS_CHANNEL` або `stream.status_channel` у `runtime_settings.json`; дефолт — `fxcm:status`. Усі інші розширені поля (`heartbeat.context`, `diag.backoff`, `history`) залишаються внутрішнім контрактом AiOne/SMC і не потрібні стороннім споживачам.
@@ -110,13 +123,19 @@ Stage 3 закрито повністю: усі три підпроекти пр
 
 ## 4. Архітектура (високий рівень)
 
-```
-ForexConnect → connector.py ─┬─缓存 HistoryCache (CSV+META)
-           ├─Redis publisher (fxcm:ohlcv, fxcm:market_status, heartbeat)
-           ├─Prometheus exporter
-           └─Optional HMAC signing
+```text
+ForexConnect (FXCM SDK)
+  └─ connector.py (головний потік)
+      ├─ history poller → OHLCV batches (source="stream")
+      ├─ OfferTable ticks → PriceSnapshotWorker → price snapshots (fxcm:price_tik)
+      ├─ (опц.) TickOhlcvWorker: tick→bucket→1m (+5m з 1m) → OHLCV (source="tick_agg")
+      ├─ Prometheus exporter (/metrics)
+      └─ Publish layer:
+          ├─ sync publish (напряму в Redis)
+          └─ або AsyncStreamSupervisor (окремий asyncio loop + черги/backpressure)
 
-fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
+fxcm_ingestor → Redis subscriber → (опц.) HMAC verify → UnifiedStore
+tools/debug_viewer.py → Redis subscriber → Live UI/діагностика
 ```
 
 - `connector.py` — CLI + основний цикл (`fetch_history_sample`, `stream_fx_data`).
@@ -128,30 +147,30 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 
 1. **Склонуй репозиторій та підготуй .env:**
 
- ```powershell
- git clone <repo>
- cd fxcm_connector
- copy .env.template .env  # додай власні креденшали FXCM
- ```
+    ```powershell
+    git clone <repo>
+    cd fxcm_connector
+    copy .env.template .env  # додай власні креденшали FXCM
+    ```
 
-2. **Створи Python 3.7 venv і постав залежності:**
+1. **Створи Python 3.7 venv і постав залежності:**
 
- ```powershell
- py -3.7 -m venv .venv_fxcm37
- .\.venv_fxcm37\Scripts\Activate.ps1
- python -m pip install --upgrade pip
- python -m pip install -r requirements.txt
- ```
+    ```powershell
+    py -3.7 -m venv .venv_fxcm37
+    .\.venv_fxcm37\Scripts\Activate.ps1
+    python -m pip install --upgrade pip
+    python -m pip install -r requirements.txt
+    ```
 
-  > `requirements.txt` вже містить `backports.zoneinfo` та `tzdata`, тож після інсталяції не буде помилок `ModuleNotFoundError: zoneinfo` навіть у старих середовищах.
+    > `requirements.txt` вже містить `backports.zoneinfo` та `tzdata`, тож після інсталяції не буде помилок `ModuleNotFoundError: zoneinfo` навіть у старих середовищах.
 
-3. **Переконайся, що ForexConnect SDK доступний** (DLL/pyfxconnect у `PYTHONPATH`).
+1. **Переконайся, що ForexConnect SDK доступний** (DLL/pyfxconnect у `PYTHONPATH`).
 
-4. **POC / warmup-запуск:**
+1. **POC / warmup-запуск:**
 
- ```powershell
- python connector.py  # прогріє кеш і може відправити warmup-пакет
- ```
+    ```powershell
+    python -m connector  # прогріє кеш і може відправити warmup-пакет
+    ```
 
 ## 6. Конфігурація
 
@@ -307,7 +326,16 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 - `stream.price_snap_channel` задає Redis-канал для тик-снепшотів, а `stream.price_snap_interval_seconds` — інтервал між пакетами (3–5 с). Ці значення читає `PriceSnapshotWorker`, що агрегує OfferTable-тикі.
 - `stream.tick_aggregation_enabled` вмикає tick→OHLCV агрегацію (джерело `source="tick_agg"`). Якщо `true`, FXCM history-полінг **не публікує** `1m/5m` у `fxcm:ohlcv`, щоб не змішувати два джерела.
 - `stream.tick_aggregation_max_synth_gap_minutes` задає максимальний розрив (хв), який дозволено заповнювати synthetic-барами в tick-агрегації.
+
+**Tick→bucket (див. docs/TIK_bucket.md):**
+
+- Bucket-семантика: інтервали `[start_ms, end_ms)`, тик із `ts_ms == end_ms` відкриває наступний bucket.
+- Публікуються лише `complete=true` бари; live (`complete=false`) не транслюється у `fxcm:ohlcv`.
+- `5m` формується агрегуванням `complete=true` 1m-барів (1m — шар істини).
+- Довгі gap’и не заповнюються нескінченними synthetic-барами: ліміт контролюється `tick_aggregation_max_synth_gap_minutes`.
+
 - `stream.history_*` контролюють неблокуючий throttle `HistoryQuota` (Stage 3.1):
+
   - `history_max_calls_per_min` / `_per_hour` — глобальні бюджети FXCM-викликів.
   - `history_min_interval_seconds_<tf>` — локальні мінімальні інтервали по таймфреймах (наприклад, `m1`, `m5`).
   - `history_priority_targets` — символи/таймфрейми з пріоритетом (`SYMBOL:tf`).
@@ -361,33 +389,33 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 - Секрети: `/etc/fxcm_connector/<env>/.env` + копія `runtime_settings.json`.
 - Кеш: `/var/lib/fxcm_connector/<env>_cache` (групові права для читання/запису).
 
-2. **Systemd unit** (`/etc/systemd/system/fxcm-connector.service`):
+1. **Systemd unit** (`/etc/systemd/system/fxcm-connector.service`):
 
- ```ini
- [Unit]
- Description=FXCM Connector
- After=network-online.target redis.service
+  ```ini
+  [Unit]
+  Description=FXCM Connector
+  After=network-online.target redis.service
 
- [Service]
- User=fxcm
- WorkingDirectory=/opt/fxcm_connector
- EnvironmentFile=/etc/fxcm_connector/prod/.env
- ExecStart=/opt/fxcm_connector/.venv_fxcm37/bin/python connector.py
- Restart=on-failure
- RestartSec=5s
- TimeoutStopSec=30s
+  [Service]
+  User=fxcm
+  WorkingDirectory=/opt/fxcm_connector
+  EnvironmentFile=/etc/fxcm_connector/prod/.env
+  ExecStart=/opt/fxcm_connector/.venv_fxcm37/bin/python -m connector
+  Restart=on-failure
+  RestartSec=5s
+  TimeoutStopSec=30s
 
- [Install]
- WantedBy=multi-user.target
- ```
+  [Install]
+  WantedBy=multi-user.target
+  ```
 
-3. **Післярелізні перевірки**
+1. **Післярелізні перевірки**
 
 - `journalctl -u fxcm-connector -f` → шукаємо `warmup_cache` → `stream`.
 - `redis-cli SUBSCRIBE fxcm:heartbeat` → `state=stream|idle`, наявність `last_bar_close_ms`.
 - `curl http://127.0.0.1:9200/metrics | grep fxcm_stream_lag_seconds` → <120 сек під час торгів.
 
-4. **Оновлення без простою**
+1. **Оновлення без простою**
 
 - Розгорни нову версію в `releases/<sha>`.
 - Переключи symlink і зроби `systemctl restart fxcm-connector`.
@@ -553,20 +581,22 @@ fxcm_ingestor → Redis subscriber → HMAC verify → UnifiedStore
 - Якщо `FXCM_HMAC_SECRET` задано, `publish_ohlcv_to_redis` додає поле `sig`.
 - Підпис обчислюється як `HMAC(secret, json.dumps(base_payload, sort_keys=True, separators=(",", ":")))`.
 
-2. **Валідація**
+1. **Валідація**
 
 - `fxcm_ingestor` (див. `tests/test_ingestor.py`) очікує `sig`, якщо конфіг має секрет.
 - Невірний/відсутній підпис → `IngestValidationError` та миттєвий дроп payload.
 - Після HMAC інгістор виконує повний чекліст:
+
   1. `symbol` та `tf` повинні входити до whitelists (`FXCM_INGEST_ALLOWED_SYMBOLS` / `FXCM_INGEST_ALLOWED_TIMEFRAMES`, див. §6.1.1).
   2. `len(bars) ≤ max_bars_per_payload` (дефолт `DEFAULT_MAX_BARS_PER_PAYLOAD = 5_000`).
   3. Кожен бар містить `open_time`, `close_time`, `open`, `high`, `low`, `close`, `volume` і всі значення можна привести до int/float.
   4. `close_time ≥ open_time`, `low ≤ high` — інакше payload вважається пошкодженим.
   5. `open_time` ≥ `MIN_ALLOWED_BAR_TIMESTAMP_MS` (UTC 2000-01-01) та ≤ `now + MAX_FUTURE_DRIFT_SECONDS` (дозволяємо дрейф до 86 400 с).
   6. `open_time` суворо зростає в межах одного payload, щоб уникати дубльованих/перемішаних свічок.
+
 - Для синхронізації просто вистав `FXCM_INGEST_HMAC_SECRET=$FXCM_HMAC_SECRET` (алгоритм також можна успадкувати через `FXCM_INGEST_HMAC_ALGO` → `FXCM_HMAC_ALGO`).
 
-3. **Практичні поради**
+1. **Практичні поради**
 
 - Зберігай секрет лише у секрет-сторі, не в CI логах.
 - Для rotation: розгорни новий секрет на інгісторі → онови конектор → перевір heartbeat.
@@ -649,4 +679,4 @@ ruff check .
 
 ### Telegram: `@Std07_1`
 
-### Оновлено: 05.12.2025
+### Оновлено: 13.12.2025

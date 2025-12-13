@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import sys
 import queue
 import random
 import threading
@@ -70,7 +71,13 @@ except ImportError:  # pragma: no cover - SDK може бути не встан�
             )
     Common = None  # type: ignore[assignment]
 
+from rich.console import Console
+from rich.live import Live
 from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.spinner import Spinner
+from rich.table import Table
+from rich.text import Text
 
 from cache_utils import (
     CacheRecord,
@@ -104,7 +111,6 @@ from fxcm_schema import (
     MIN_ALLOWED_BAR_TIMESTAMP_MS,
     MarketStatusPayload,
     SessionContextPayload,
-    RedisBar,
 )
 from tick_ohlcv import (
     FxcmTick,
@@ -116,6 +122,268 @@ from tick_ohlcv import (
 # Налаштування логування
 log: Logger = logging.getLogger("fxcm_connector")
 _LOGGING_CONFIGURED = False
+_RICH_CONSOLE: Optional[Console] = None
+
+
+def _resolve_connector_version() -> Tuple[str, str]:
+    """Повертає офіційну версію конектора та джерело.
+
+    Порядок пріоритетів:
+    1) FXCM_CONNECTOR_VERSION_OVERRIDE (ENV) — для CI/деплою;
+    2) файл VERSION у корені репозиторію;
+    3) fallback "0.0.0".
+    """
+
+    override = os.getenv("FXCM_CONNECTOR_VERSION_OVERRIDE")
+    if override and override.strip():
+        return override.strip(), "env"
+
+    version_path = Path(__file__).resolve().parent / "VERSION"
+    try:
+        if version_path.exists():
+            text = version_path.read_text(encoding="utf-8").strip()
+            if text:
+                return text, "VERSION"
+    except Exception:
+        # Версія не має ламати роботу конектора.
+        pass
+
+    return "0.0.0", "fallback"
+
+
+FXCM_CONNECTOR_VERSION, _FXCM_CONNECTOR_VERSION_SOURCE = _resolve_connector_version()
+
+
+def _enforce_required_connector_version() -> None:
+    """Опційно перевіряє версію конектора (для деплою/контролю сумісності).
+
+    Якщо задано FXCM_CONNECTOR_REQUIRED_VERSION і вона не збігається з поточною,
+    конектор завершується з кодом 2.
+    """
+
+    required = os.getenv("FXCM_CONNECTOR_REQUIRED_VERSION")
+    if not required or not required.strip():
+        return
+    required = required.strip()
+    if required == FXCM_CONNECTOR_VERSION:
+        return
+    log.error(
+        "Невідповідність версії конектора: очікується %s, поточна %s (source=%s).",
+        required,
+        FXCM_CONNECTOR_VERSION,
+        _FXCM_CONNECTOR_VERSION_SOURCE,
+    )
+    raise SystemExit(2)
+
+class ConsoleStatusBar:
+    """Живий status bar у консолі через Rich Live.
+
+    На відміну від `\r` у STDOUT, Rich Live коректно співіснує з
+    `RichHandler` у PowerShell/VS Code: статус оновлюється в одному рядку,
+    а логи друкуються над ним.
+    """
+
+    def __init__(self, *, enabled: bool = True, refresh_per_second: float = 4.0) -> None:
+        global _RICH_CONSOLE
+        console = _RICH_CONSOLE
+        # Вимикаємо bar, якщо stdout не TTY або console ще не готовий.
+        # Логи йдуть у stderr через RichHandler, тому орієнтуємось на stderr.
+        self._enabled = bool(enabled) and sys.stderr.isatty() and console is not None
+        self._console = console
+        self._live: Optional[Live] = None
+        self._refresh_per_second = max(1.0, float(refresh_per_second))
+        self._spinner: Optional[Spinner] = None
+
+    def start(self) -> None:
+        if not self._enabled or self._console is None:
+            return
+        if self._live is not None:
+            return
+        self._spinner = Spinner("dots")
+        self._live = Live(
+            self._render_panel({}),
+            console=self._console,
+            refresh_per_second=self._refresh_per_second,
+            transient=True,
+        )
+        self._live.__enter__()
+
+    def stop(self) -> None:
+        if self._live is None:
+            return
+        try:
+            self._live.__exit__(None, None, None)
+        finally:
+            self._live = None
+            self._spinner = None
+
+    def update(self, snapshot: Mapping[str, Any]) -> None:
+        if self._live is None:
+            return
+        self._live.update(self._render_panel(snapshot))
+
+    @staticmethod
+    def _format_next_open(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, dt.datetime):
+            dt_value = value
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                dt_value = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return value
+        if isinstance(value, str):
+            # unreachable (handled above), лишаємо для ясності
+            return value
+
+        if dt_value.tzinfo is None:
+            dt_value = dt_value.replace(tzinfo=dt.timezone.utc)
+        dt_utc = dt_value.astimezone(dt.timezone.utc).replace(microsecond=0)
+        return dt_utc.strftime("%Y-%m-%d %H:%M UTC")
+
+    @staticmethod
+    def _format_short_duration(seconds: Optional[float]) -> Optional[str]:
+        """Компактний формат тривалості: 59s, 3m07s, 2h05, 3d12."""
+
+        if seconds is None:
+            return None
+        try:
+            seconds_value = float(seconds)
+        except (TypeError, ValueError):
+            return None
+        seconds_value = max(0.0, seconds_value)
+        total = int(seconds_value)
+        if total < 60:
+            return f"{total}s"
+        minutes, secs = divmod(total, 60)
+        if minutes < 60:
+            return f"{minutes}m{secs:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        if hours < 24:
+            return f"{hours}h{minutes:02d}"
+        days, hours = divmod(hours, 24)
+        return f"{days}d{hours:02d}"
+
+    def _render_panel(self, snapshot: Mapping[str, Any]) -> Panel:
+        mode = str(snapshot.get("mode") or "?")
+        market_open = bool(snapshot.get("market_open"))
+        calendar_open = bool(snapshot.get("calendar_open"))
+        ticks_alive = bool(snapshot.get("ticks_alive"))
+        redis_ok = bool(snapshot.get("redis_connected"))
+
+        market_style = "green" if market_open else "yellow"
+        calendar_style = "green" if calendar_open else "yellow"
+        redis_style = "green" if redis_ok else "red"
+        ticks_style = "green" if ticks_alive else "red"
+
+        tick_silence = snapshot.get("tick_silence_seconds")
+        tick_age_value: Optional[float] = None
+        if tick_silence is not None:
+            try:
+                tick_age_value = float(tick_silence)
+            except (TypeError, ValueError):
+                tick_age_value = None
+        if tick_age_value is not None and tick_age_value >= 0:
+            if tick_age_value >= STATUS_PRICE_DOWN_SECONDS:
+                ticks_style = "red"
+            elif tick_age_value >= STATUS_PRICE_STALE_SECONDS:
+                ticks_style = "yellow"
+
+        headline = Text.assemble(
+            ("mode=", "dim"),
+            (mode, "bold"),
+            ("  |  market=", "dim"),
+            ("open" if market_open else "closed", market_style),
+            ("  |  cal=", "dim"),
+            ("open" if calendar_open else "closed", calendar_style),
+            ("  |  ticks=", "dim"),
+            ("alive" if ticks_alive else "down", ticks_style),
+            ("  |  redis=", "dim"),
+            ("ok" if redis_ok else "down", redis_style),
+        )
+
+        rows: List[Tuple[Text, Text]] = []
+
+        if tick_age_value is not None and tick_age_value >= 0:
+            rows.append(
+                (Text("tick_age", style="dim"), Text(f"{tick_age_value:.1f}s", style=ticks_style))
+            )
+
+        lag = snapshot.get("lag_seconds")
+        if lag is not None:
+            try:
+                lag_value = float(lag)
+            except (TypeError, ValueError):
+                lag_value = None
+            if lag_value is not None and lag_value >= 0:
+                lag_label = self._format_short_duration(lag_value) or f"{lag_value:.1f}s"
+                rows.append((Text("lag", style="dim"), Text(lag_label, style="cyan")))
+
+        next_open = self._format_next_open(snapshot.get("next_open"))
+        if next_open:
+            rows.append((Text("next_open", style="dim"), Text(f"≥ {next_open}", style="cyan")))
+
+        idle_reason = snapshot.get("idle_reason")
+        if idle_reason:
+            rows.append((Text("reason", style="dim"), Text(str(idle_reason), style="yellow")))
+
+        sleep_for = snapshot.get("sleep_for")
+        if sleep_for is not None:
+            try:
+                sleep_value = float(sleep_for)
+            except (TypeError, ValueError):
+                sleep_value = None
+            if sleep_value is not None and sleep_value >= 0:
+                # У звичайному режимі poll часто = 5s, щоб не забивати панель — ховаємо.
+                if abs(sleep_value - 5.0) > 0.05:
+                    rows.append((Text("sleep", style="dim"), Text(f"{int(round(sleep_value))}s", style="dim")))
+
+        bars = snapshot.get("cycle_published_bars")
+        if bars is not None:
+            try:
+                bars_value = int(bars)
+            except (TypeError, ValueError):
+                bars_value = None
+            if bars_value is not None and bars_value >= 0:
+                rows.append((Text("published_bars", style="dim"), Text(str(bars_value), style="green")))
+
+        fx_bo = snapshot.get("history_backoff_seconds")
+        if fx_bo is not None:
+            try:
+                fx_bo_value = float(fx_bo)
+            except (TypeError, ValueError):
+                fx_bo_value = None
+            if fx_bo_value is not None and fx_bo_value > 0:
+                rows.append((Text("fxcm_backoff", style="dim"), Text(f"{fx_bo_value:.1f}s", style="yellow")))
+
+        r_bo = snapshot.get("redis_backoff_seconds")
+        if r_bo is not None:
+            try:
+                r_bo_value = float(r_bo)
+            except (TypeError, ValueError):
+                r_bo_value = None
+            if r_bo_value is not None and r_bo_value > 0:
+                rows.append((Text("redis_backoff", style="dim"), Text(f"{r_bo_value:.1f}s", style="yellow")))
+
+        if not rows:
+            rows.append((Text("status", style="dim"), Text("очікуємо оновлення стану…", style="dim")))
+
+        table = Table.grid(expand=True)
+        table.add_column(width=2)
+        table.add_column(width=16)
+        table.add_column(ratio=1)
+        spinner = self._spinner or Text(" ")
+        table.add_row(spinner, Text("FXCM connector", style="bold cyan"), Text("працюємо", style="bold"))
+        table.add_row(Text(""), Text(""), headline)
+        for key, value in rows[:6]:
+            table.add_row(Text(""), key, value)
+
+        border_style = "green" if market_open else "yellow"
+        return Panel.fit(table, title="Стан", title_align="center", padding=(0, 1), border_style=border_style)
 
 
 def setup_logging() -> None:
@@ -126,12 +394,38 @@ def setup_logging() -> None:
     global _LOGGING_CONFIGURED
     if _LOGGING_CONFIGURED:
         return
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[RichHandler(rich_tracebacks=True)],
+
+    global _RICH_CONSOLE
+    if _RICH_CONSOLE is None:
+        # Вивід логів у stderr — стандартний та сумісний з більшістю середовищ.
+        # Force terminal, щоб Rich не вимикав кольори у VS Code/PowerShell.
+        force_terminal = bool(sys.stderr.isatty()) or os.getenv("FXCM_RICH_FORCE_TERMINAL") == "1"
+        _RICH_CONSOLE = Console(
+            stderr=True,
+            force_terminal=force_terminal,
+            color_system="standard" if force_terminal else None,
+        )
+
+    # Важливо: у Python 3.7 `logging.basicConfig(...)` НЕ перезаписує існуючі
+    # root-handlers (і може бути no-op, якщо середовище/IDE вже налаштували логування).
+    # Тому конфігуруємо саме логер `fxcm_connector`, щоб мати стабільний формат.
+    target_logger = logging.getLogger("fxcm_connector")
+    for handler in target_logger.handlers:
+        if isinstance(handler, RichHandler):
+            _LOGGING_CONFIGURED = True
+            return
+
+    handler = RichHandler(
+        console=_RICH_CONSOLE,
+        rich_tracebacks=True,
+        show_path=False,
     )
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(message)s", datefmt="[%X]"))
+
+    target_logger.setLevel(logging.INFO)
+    target_logger.addHandler(handler)
+    target_logger.propagate = False
     _LOGGING_CONFIGURED = True
 
 
@@ -174,9 +468,9 @@ else:
         version = getattr(fxcorepy, "__version__", None)
 
     if version:
-        log.info("fxcorepy імпортовано успішно, версія %s", version)
+        log.debug("fxcorepy імпортовано успішно, версія %s", version)
     else:
-        log.info("fxcorepy імпортовано успішно, версію визначити не вдалося")
+        log.debug("fxcorepy імпортовано успішно, версію визначити не вдалося")
 
 
 # Константи конектора
@@ -192,6 +486,55 @@ PRICE_SNAPSHOT_QUEUE_MAXSIZE = 5_000
 _LAST_MARKET_STATUS: Optional[Tuple[str, Optional[int]]] = None  # останній статус ринку для приглушення спаму
 _LAST_MARKET_STATUS_TS: Optional[float] = None  # час останньої трансляції статусу
 _STATUS_CHANNEL = STATUS_CHANNEL_DEFAULT
+_LAST_STATUS_PUBLISHED_TS: Optional[float] = None
+_LAST_STATUS_PUBLISHED_KEY: Optional[Tuple[Any, ...]] = None
+_LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL: Dict[str, float] = {}
+
+# Мінімальний інтервал між публікаціями fxcm:status (anti-flood).
+# Важливо: це публічний канал для зовнішніх консюмерів, не дебаг-лог.
+STATUS_PUBLISH_MIN_INTERVAL_SECONDS = 1.0
+
+
+def _telemetry_rate_limited(channel: str, *, now_ts: float) -> bool:
+    """Повертає True, якщо публікацію в цей канал треба приглушити (anti-flood)."""
+
+    interval = float(STATUS_PUBLISH_MIN_INTERVAL_SECONDS)
+    if interval <= 0.0:
+        return False
+    last_ts = _LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL.get(channel)
+    return last_ts is not None and now_ts - last_ts < interval
+
+
+def _telemetry_mark_published(channel: str, *, now_ts: float) -> None:
+    _LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL[channel] = now_ts
+
+
+def _status_publish_key(snapshot: Mapping[str, Any]) -> Tuple[Any, ...]:
+    """Будує ключ стану без полів, що часто змінюються (лічильники/ts).
+
+    Використовується тільки для rate-limit fxcm:status, щоб не спамити Redis.
+    """
+
+    session = snapshot.get("session")
+    if isinstance(session, Mapping):
+        session_key = (
+            session.get("name"),
+            session.get("tag"),
+            session.get("state"),
+            session.get("current_open_utc"),
+            session.get("current_close_utc"),
+            session.get("next_open_utc"),
+        )
+    else:
+        session_key = None
+    return (
+        snapshot.get("process"),
+        snapshot.get("market"),
+        snapshot.get("price"),
+        snapshot.get("ohlcv"),
+        snapshot.get("note"),
+        session_key,
+    )
 _LAST_STATUS_SNAPSHOT: Optional[Dict[str, Any]] = None
 _LAST_SESSION_CONTEXT: Optional[Dict[str, Any]] = None
 _CURRENT_MARKET_STATE = "unknown"
@@ -868,7 +1211,7 @@ def _login_fxcm_once(config: FXCMConfig) -> ForexConnect:
         "",  # session_id
         "",  # pin
     )
-    log.info("Успішний логін до FXCM через ForexConnect.")
+    log.debug("Успішний логін до FXCM через ForexConnect.")
     return fx
 
 
@@ -1212,7 +1555,7 @@ def _log_market_closed_once(now: dt.datetime, *, next_open: Optional[dt.datetime
         return next_notice
 
     next_open_dt = next_open or next_trading_open(now)
-    log.info(
+    log.debug(
         "FXCM: ринок закритий (%s UTC). Наступне торгове вікно ≥ %s UTC.",
         now.replace(microsecond=0).isoformat(),
         next_open_dt.replace(microsecond=0).isoformat(),
@@ -1244,6 +1587,7 @@ def _publish_market_status(
 
     next_open_key = int(next_open.timestamp() * 1000) if next_open else None
     status_key = (state, next_open_key)
+    is_state_change = _LAST_MARKET_STATUS != status_key
     now_monotonic = time.monotonic()
     if (
         _LAST_MARKET_STATUS == status_key
@@ -1273,10 +1617,17 @@ def _publish_market_status(
     status_snapshot = _build_status_snapshot_from_market(payload)
     success = False
     try:
+        now_ts = time.time()
+        if _telemetry_rate_limited(REDIS_STATUS_CHANNEL, now_ts=now_ts):
+            return True
         redis_client.publish(REDIS_STATUS_CHANNEL, message)
+        _telemetry_mark_published(REDIS_STATUS_CHANNEL, now_ts=now_ts)
         _LAST_MARKET_STATUS = status_key
         _LAST_MARKET_STATUS_TS = now_monotonic
-        log.info("Статус ринку → %s", state)
+        if is_state_change:
+            log.debug("Статус ринку → %s", state)
+        else:
+            log.debug("Статус ринку (refresh) → %s", state)
         PROM_MARKET_STATUS.set(1 if state == "open" else 0)
         success = True
     except Exception as exc:  # noqa: BLE001
@@ -1623,9 +1974,21 @@ def _publish_public_status(redis_client: Optional[Any], snapshot: Optional[Dict[
     _LAST_STATUS_SNAPSHOT = copy_payload
     if redis_client is None or not _STATUS_CHANNEL:
         return
+
+    global _LAST_STATUS_PUBLISHED_TS
+    global _LAST_STATUS_PUBLISHED_KEY
+    now_ts = time.time()
+    publish_key = _status_publish_key(copy_payload)
+    if _LAST_STATUS_PUBLISHED_TS is not None:
+        # Захист від flood: не публікуємо частіше за мін-інтервал незалежно
+        # від дрібних змін у snapshot (наприклад, лічильники або секунди до close).
+        if now_ts - _LAST_STATUS_PUBLISHED_TS < STATUS_PUBLISH_MIN_INTERVAL_SECONDS:
+            return
     message = json.dumps(copy_payload, separators=(",", ":"), ensure_ascii=False)
     try:
         redis_client.publish(_STATUS_CHANNEL, message)
+        _LAST_STATUS_PUBLISHED_TS = now_ts
+        _LAST_STATUS_PUBLISHED_KEY = publish_key
     except Exception as exc:  # noqa: BLE001
         log.debug("Не вдалося надіслати статус у Redis: %s", exc)
 
@@ -1659,9 +2022,14 @@ def _publish_heartbeat(
     if redis_client is None or not channel:
         _publish_public_status(redis_client, status_snapshot)
         return False
+    now_ts = time.time()
+    if _telemetry_rate_limited(channel, now_ts=now_ts):
+        _publish_public_status(redis_client, status_snapshot)
+        return True
     success = False
     try:
         redis_client.publish(channel, message)
+        _telemetry_mark_published(channel, now_ts=now_ts)
         PROM_HEARTBEAT_TS.set(_now_utc().timestamp())
         success = True
     except Exception as exc:  # noqa: BLE001
@@ -2663,6 +3031,8 @@ class TickOhlcvWorker:
             symbol=symbol,
             ts_ms=int(tick.tick_ts * 1000),
             price=float(tick.mid),
+            bid=float(tick.bid),
+            ask=float(tick.ask),
             volume=0.0,
         )
 
@@ -2687,6 +3057,13 @@ class TickOhlcvWorker:
                     "low": float(bar.low),
                     "close": float(bar.close),
                     "volume": float(bar.volume),
+                    "tick_count": int(getattr(bar, "tick_count", 0) or 0),
+                    "bar_range": float(getattr(bar, "bar_range", 0.0) or 0.0),
+                    "body_size": float(getattr(bar, "body_size", 0.0) or 0.0),
+                    "upper_wick": float(getattr(bar, "upper_wick", 0.0) or 0.0),
+                    "lower_wick": float(getattr(bar, "lower_wick", 0.0) or 0.0),
+                    "avg_spread": float(getattr(bar, "avg_spread", 0.0) or 0.0),
+                    "max_spread": float(getattr(bar, "max_spread", 0.0) or 0.0),
                     "complete": bool(bar.complete),
                     "synthetic": bool(bar.synthetic),
                     "source": str(bar.source),
@@ -2739,7 +3116,7 @@ class FXCMOfferSubscription:
             return
         self._table = offers_table
         self._active = True
-        log.info("FXCM OfferTable підписка активована для %d символів.", len(self._symbols) or -1)
+        log.debug("FXCM OfferTable підписка активована для %d символів.", len(self._symbols) or -1)
 
     def close(self) -> None:
         if not self._active:
@@ -3358,12 +3735,11 @@ def _create_redis_client(settings: RedisSettings) -> Optional[Any]:
             decode_responses=True,
         )
         client.ping()
-        log.info(
-            "Підключено до Redis %s:%s для каналу %s.",
-            settings.host,
-            settings.port,
-            REDIS_CHANNEL,
-        )
+        log.info("Redis-клієнт версія: %s, %s:%s.",
+                 redis.__version__, 
+                 settings.host, 
+                 settings.port)
+
         return client
     except Exception as exc:  # noqa: BLE001
         log.exception("Не вдалося підключитись до Redis: %s", exc)
@@ -3386,18 +3762,18 @@ def publish_ohlcv_to_redis(
     """Серіалізує OHLCV у JSON і публікує до Redis."""
 
     if redis_client is None:
-        log.info("Redis-клієнт не ініціалізовано — пропускаю публікацію.")
+        log.debug("Redis-клієнт не ініціалізовано — пропускаю публікацію.")
         return False
 
     if df_ohlcv.empty:
-        log.info("Немає OHLCV-барів для публікації.")
+        log.debug("Немає OHLCV-барів для публікації.")
         return False
 
     df_to_publish = df_ohlcv
     if data_gate is not None:
         df_to_publish = data_gate.filter_new_bars(df_ohlcv, symbol=symbol, timeframe=timeframe)
         if df_to_publish.empty:
-            log.info("Data gate: немає нових барів для %s %s.", symbol, timeframe)
+            log.debug("Data gate: немає нових барів для %s %s.", symbol, timeframe)
             return False
 
     base_cols = [
@@ -3409,12 +3785,24 @@ def publish_ohlcv_to_redis(
         "close",
         "volume",
     ]
+    quality_cols = [
+        "tick_count",
+        "bar_range",
+        "body_size",
+        "upper_wick",
+        "lower_wick",
+        "avg_spread",
+        "max_spread",
+    ]
+    include_quality = all(col in df_to_publish.columns for col in quality_cols)
     include_complete = "complete" in df_to_publish.columns
     include_synthetic = "synthetic" in df_to_publish.columns
     include_source = "source" in df_to_publish.columns
     include_tf = "tf" in df_to_publish.columns
 
     cols = list(base_cols)
+    if include_quality:
+        cols.extend(quality_cols)
     if include_complete:
         cols.append("complete")
     if include_synthetic:
@@ -3439,6 +3827,21 @@ def publish_ohlcv_to_redis(
             "volume": float(row[6]),
         }
         idx = len(base_cols)
+        if include_quality:
+            bar_payload["tick_count"] = int(row[idx])
+            idx += 1
+            bar_payload["bar_range"] = float(row[idx])
+            idx += 1
+            bar_payload["body_size"] = float(row[idx])
+            idx += 1
+            bar_payload["upper_wick"] = float(row[idx])
+            idx += 1
+            bar_payload["lower_wick"] = float(row[idx])
+            idx += 1
+            bar_payload["avg_spread"] = float(row[idx])
+            idx += 1
+            bar_payload["max_spread"] = float(row[idx])
+            idx += 1
         if include_complete:
             bar_payload["complete"] = bool(row[idx])
             idx += 1
@@ -3480,7 +3883,7 @@ def publish_ohlcv_to_redis(
         redis_client.publish(REDIS_CHANNEL, message)
         if publish_rate_limit is not None:
             publish_rate_limit[rate_limit_key] = time.monotonic()
-        log.info(
+        log.debug(
             "Опубліковано %d барів у Redis канал %s (%s %s).",
             len(bars),
             REDIS_CHANNEL,
@@ -3691,7 +4094,7 @@ def run_redis_healthcheck(redis_client: Optional[Any]) -> bool:
         log.exception("Redis health-check: publish неуспішний: %s", exc)
 
     if ping_ok and publish_ok:
-        log.info("Redis health-check: OK (ping + publish).")
+        log.debug("Redis health-check: OK (ping + publish).")
     else:
         log.error("Redis health-check: FAILED (ping=%s, publish=%s).", ping_ok, publish_ok)
 
@@ -3902,6 +4305,7 @@ def stream_fx_data(
     tick_cadence: Optional[TickCadenceController] = None,
     tick_aggregation_enabled: bool = False,
     tick_aggregation_timeframes: Optional[Sequence[str]] = None,
+    status_bar: Optional[ConsoleStatusBar] = None,
 ) -> None:
     """Безкінечний цикл стрімінгу OHLCV у Redis.
 
@@ -4038,8 +4442,8 @@ def stream_fx_data(
             _sink(batch)
 
         ohlcv_sink_effective = _rate_limited_sink
-    log.info(
-        "Старт стрімінгу FXCM: %s, інтервал опитування %ss, вікно %s хв.",
+    log.debug(
+        "Запуск циклу конектора FXCM: %s, інтервал опитування %ss, вікно %s хв.",
         ", ".join(f"{sym} {tf}" for sym, tf in config),
         poll_seconds,
         lookback_minutes,
@@ -4063,6 +4467,10 @@ def stream_fx_data(
             price_stream_metadata = price_stream.snapshot_metadata() if price_stream is not None else None
             ticks_alive = _tick_stream_alive(price_stream_metadata, tick_cadence=tick_cadence)
             market_open = calendar_open or ticks_alive
+
+            tick_silence_seconds = None
+            if isinstance(price_stream_metadata, Mapping):
+                tick_silence_seconds = _float_or_none(price_stream_metadata.get("tick_silence_seconds"))
 
             PROM_CALENDAR_OPEN.set(1 if calendar_open else 0)
             PROM_TICK_STREAM_ALIVE.set(1 if ticks_alive else 0)
@@ -4356,10 +4764,15 @@ def stream_fx_data(
                     session_stats=stats_snapshot,
                 )
                 base_sleep = max(0.0, poll_seconds - elapsed)
-                sleep_for = (
-                    cadence_sleep_seconds if cadence_sleep_seconds is not None else base_sleep
-                )
+                if cadence_sleep_seconds is None or cadence_sleep_seconds <= 0.0:
+                    sleep_for = base_sleep
+                else:
+                    sleep_for = cadence_sleep_seconds
                 sleep_for = max(0.0, sleep_for)
+                # Захист від busy-loop: інколи cadence може повернути 0,
+                # тоді цикл починає спамити heartbeat/status без пауз.
+                if max_cycles is None and sleep_for <= 0.0:
+                    sleep_for = 0.2
                 _emit_heartbeat_event(
                     state="stream",
                     last_bar_close_ms=last_published_close_ms,
@@ -4375,6 +4788,25 @@ def stream_fx_data(
                     sleep_for = max(sleep_for, history_backoff_remaining)
                 if redis_backoff_remaining > 0.0:
                     sleep_for = max(sleep_for, redis_backoff_remaining)
+
+            if status_bar is not None:
+                status_bar.update(
+                    {
+                        "mode": "idle" if market_pause else "stream",
+                        "market_open": market_open,
+                        "calendar_open": calendar_open,
+                        "ticks_alive": ticks_alive,
+                        "tick_silence_seconds": tick_silence_seconds,
+                        "next_open": last_idle_next_open,
+                        "idle_reason": idle_reason,
+                        "lag_seconds": lag_seconds,
+                        "redis_connected": current_redis is not None,
+                        "sleep_for": sleep_for,
+                        "cycle_published_bars": cycle_published_bars,
+                        "history_backoff_seconds": history_backoff_remaining,
+                        "redis_backoff_seconds": redis_backoff_remaining,
+                    }
+                )
 
             last_ticks_alive = ticks_alive
 
@@ -4399,10 +4831,12 @@ def main() -> None:
     - POC-запит історії свічок та нормалізація у OHLCV;
     - коректний логаут.
     """
+    _enforce_required_connector_version()
+    log.info("Запуск FXCM Connector %s", FXCM_CONNECTOR_VERSION)
     setup_logging()
     load_dotenv()
 
-    log.info("Зчитуємо конфігурацію FXCM з ENV...")
+    log.debug("Зчитуємо конфігурацію FXCM з ENV...")
     try:
         config: FXCMConfig = load_config()
     except ValueError as exc:
@@ -4412,7 +4846,12 @@ def main() -> None:
     global _STATUS_CHANNEL
     _STATUS_CHANNEL = config.observability.status_channel or STATUS_CHANNEL_DEFAULT
 
-    log.info(
+    global STATUS_PUBLISH_MIN_INTERVAL_SECONDS
+    STATUS_PUBLISH_MIN_INTERVAL_SECONDS = float(
+        config.observability.telemetry_min_publish_interval_seconds
+    )
+
+    log.debug(
         "Креденшали зчитано. Спроба логіну через %s (%s).",
         config.connection,
         config.host_url,
@@ -4575,8 +5014,8 @@ def main() -> None:
                     last_bar_close_ms=last_close_ms,
                     context=warmup_context,
                 )
-                log.info(
-                    "Warmup із кешу: %s %s → %d барів",
+                log.debug(
+                    "Warmup із локального кешу: %s %s → %d барів",
                     symbol,
                     tf_raw,
                     len(warmup_slice),
@@ -4614,8 +5053,8 @@ def main() -> None:
                 ),
             )
             price_worker.start()
-            log.info(
-                "Tick снепшоти: канал %s, інтервал %.1f с.",
+            log.debug(
+                "Tick-снепшоти: канал %s, інтервал %.1f с.",
                 config.price_stream.channel,
                 config.price_stream.interval_seconds,
             )
@@ -4687,6 +5126,9 @@ def main() -> None:
             )
             tick_ohlcv_worker.start()
 
+            status_bar = ConsoleStatusBar(enabled=True, refresh_per_second=4.0)
+            status_bar.start()
+
             def _refresh_price_subscription(target_fx: ForexConnect) -> None:
                 if price_worker is None:
                     return
@@ -4739,8 +5181,10 @@ def main() -> None:
                     tick_cadence=tick_cadence_controller,
                     tick_aggregation_enabled=config.tick_aggregation_enabled,
                     tick_aggregation_timeframes=("1m", "5m"),
+                    status_bar=status_bar,
                 )
             finally:
+                status_bar.stop()
                 offer_subscription = subscription_holder.get("instance")
                 if offer_subscription is not None:
                     offer_subscription.close()

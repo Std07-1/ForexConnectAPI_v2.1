@@ -116,6 +116,16 @@ class BackoffConfigTest(unittest.TestCase):
         cfg_env = self._load_with_payload({}, {"FXCM_STATUS_CHANNEL": "fxcm:env:status"})
         self.assertEqual(cfg_env.observability.status_channel, "fxcm:env:status")
 
+    def test_telemetry_min_publish_interval_defaults_and_override(self) -> None:
+        cfg_default = self._load_with_payload({})
+        self.assertAlmostEqual(cfg_default.observability.telemetry_min_publish_interval_seconds, 1.0)
+
+        cfg_runtime = self._load_with_payload({"stream": {"telemetry_min_publish_interval_seconds": 5}})
+        self.assertAlmostEqual(cfg_runtime.observability.telemetry_min_publish_interval_seconds, 5.0)
+
+        cfg_alias = self._load_with_payload({"stream": {"status_publish_min_interval_seconds": 2}})
+        self.assertAlmostEqual(cfg_alias.observability.telemetry_min_publish_interval_seconds, 2.0)
+
     def test_tick_cadence_defaults_and_override(self) -> None:
         cfg_default = self._load_with_payload({})
         self.assertAlmostEqual(cfg_default.tick_cadence.live_threshold_seconds, 30.0)

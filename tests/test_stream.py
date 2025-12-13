@@ -179,6 +179,10 @@ class FailingOnceRedis(FakeRedis):
 class WarmupStreamTest(unittest.TestCase):
     def setUp(self) -> None:
         connector._LAST_MARKET_STATUS = None
+        connector._LAST_MARKET_STATUS_TS = None
+        connector._LAST_STATUS_PUBLISHED_TS = None
+        connector._LAST_STATUS_PUBLISHED_KEY = None
+        connector._LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL.clear()
 
     def _build_df(self, start: dt.datetime, count: int) -> pd.DataFrame:
         return _make_sample_df(start, count)
@@ -265,6 +269,10 @@ class WarmupStreamTest(unittest.TestCase):
 class SessionAwareStreamTest(unittest.TestCase):
     def setUp(self) -> None:
         connector._LAST_MARKET_STATUS = None
+        connector._LAST_MARKET_STATUS_TS = None
+        connector._LAST_STATUS_PUBLISHED_TS = None
+        connector._LAST_STATUS_PUBLISHED_KEY = None
+        connector._LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL.clear()
 
     def test_calendar_closed_but_ticks_alive_keeps_streaming(self) -> None:
         fixed_now = dt.datetime(2025, 5, 5, 12, 0, tzinfo=dt.timezone.utc)
@@ -381,6 +389,10 @@ class SessionAwareStreamTest(unittest.TestCase):
 class TickAggregationIsolationTest(unittest.TestCase):
     def setUp(self) -> None:
         connector._LAST_MARKET_STATUS = None
+        connector._LAST_MARKET_STATUS_TS = None
+        connector._LAST_STATUS_PUBLISHED_TS = None
+        connector._LAST_STATUS_PUBLISHED_KEY = None
+        connector._LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL.clear()
 
     def test_tick_aggregation_disables_history_stream_for_m1(self) -> None:
         fixed_now = dt.datetime(2025, 5, 5, 12, 0, tzinfo=dt.timezone.utc)
@@ -632,6 +644,10 @@ class TickCadenceControllerTest(unittest.TestCase):
 class TickCadenceAutosleepTest(unittest.TestCase):
     def setUp(self) -> None:
         connector._LAST_MARKET_STATUS = None
+        connector._LAST_MARKET_STATUS_TS = None
+        connector._LAST_STATUS_PUBLISHED_TS = None
+        connector._LAST_STATUS_PUBLISHED_KEY = None
+        connector._LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL.clear()
         self.fixed_now = dt.datetime(2025, 5, 6, 10, 0, tzinfo=dt.timezone.utc)
         self.stream_config = [("XAU/USD", "m1")]
 
@@ -727,6 +743,10 @@ class TickCadenceAutosleepTest(unittest.TestCase):
 class TickCadenceFairnessTest(unittest.TestCase):
     def setUp(self) -> None:
         connector._LAST_MARKET_STATUS = None
+        connector._LAST_MARKET_STATUS_TS = None
+        connector._LAST_STATUS_PUBLISHED_TS = None
+        connector._LAST_STATUS_PUBLISHED_KEY = None
+        connector._LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL.clear()
         self.fixed_now = dt.datetime(2025, 5, 6, 10, 0, tzinfo=dt.timezone.utc)
 
     def test_cadence_slot_applies_to_all_symbols_with_same_tf(self) -> None:
@@ -768,6 +788,10 @@ class TickCadenceFairnessTest(unittest.TestCase):
 class HeartbeatContractTest(unittest.TestCase):
     def setUp(self) -> None:
         connector._LAST_MARKET_STATUS = None
+        connector._LAST_MARKET_STATUS_TS = None
+        connector._LAST_STATUS_PUBLISHED_TS = None
+        connector._LAST_STATUS_PUBLISHED_KEY = None
+        connector._LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL.clear()
         self.fixed_now = dt.datetime(2025, 5, 5, 12, 0, tzinfo=dt.timezone.utc)
 
     def _extract_channel_messages(self, redis_client: FakeRedis, channel: str) -> list[dict[str, Any]]:
@@ -995,6 +1019,10 @@ class HistoryQuotaTest(unittest.TestCase):
 class HistoryThrottleIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         connector._LAST_MARKET_STATUS = None
+        connector._LAST_MARKET_STATUS_TS = None
+        connector._LAST_STATUS_PUBLISHED_TS = None
+        connector._LAST_STATUS_PUBLISHED_KEY = None
+        connector._LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL.clear()
         self.fixed_now = dt.datetime(2025, 5, 5, 12, 0, tzinfo=dt.timezone.utc)
 
     def _extract_channel_messages(self, redis_client: FakeRedis, channel: str) -> list[dict[str, Any]]:
@@ -1148,6 +1176,11 @@ class HistoryThrottleIntegrationTest(unittest.TestCase):
 
 class ReconnectLogicTest(unittest.TestCase):
     def setUp(self) -> None:
+        connector._LAST_MARKET_STATUS = None
+        connector._LAST_MARKET_STATUS_TS = None
+        connector._LAST_STATUS_PUBLISHED_TS = None
+        connector._LAST_STATUS_PUBLISHED_KEY = None
+        connector._LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL.clear()
         self.fixed_now = dt.datetime(2025, 5, 5, 12, 0, tzinfo=dt.timezone.utc)
 
     def test_stream_recovers_from_fxcm_failure(self) -> None:
@@ -1250,6 +1283,9 @@ class AsyncSupervisorTest(unittest.TestCase):
     def setUp(self) -> None:
         connector._LAST_MARKET_STATUS = None
         connector._LAST_MARKET_STATUS_TS = None
+        connector._LAST_STATUS_PUBLISHED_TS = None
+        connector._LAST_STATUS_PUBLISHED_KEY = None
+        connector._LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL.clear()
         self.redis = FakeRedis()
         self.gate = PublishDataGate()
         self.supervisor = AsyncStreamSupervisor(

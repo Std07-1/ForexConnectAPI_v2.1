@@ -20,6 +20,23 @@ def make_tick_at(
     return FxcmTick(symbol=symbol, ts_ms=ts_seconds * MS, price=price, volume=volume)
 
 
+def make_tick_with_spread(
+    *, minute: int, second: int, bid: float, ask: float, volume: float = 0.0, symbol: str = "XAUUSD"
+) -> FxcmTick:
+    """Будує тик із bid/ask (mid=середина), щоб тестувати spread-метрики."""
+
+    mid = (bid + ask) / 2.0
+    ts_seconds = minute * 60 + second
+    return FxcmTick(
+        symbol=symbol,
+        ts_ms=ts_seconds * MS,
+        price=mid,
+        bid=bid,
+        ask=ask,
+        volume=volume,
+    )
+
+
 class TestTickOhlcvAggregator1m:
     def test_single_minute_three_ticks_no_gap(self) -> None:
         # docs/TIK_bucket.md §1.1: bucket семантика `[start_ms, end_ms)`.
@@ -99,6 +116,39 @@ class TestTickOhlcvAggregator1m:
         assert closed.low == 200.0
         assert closed.close == 200.0
         assert closed.volume == 4.0
+
+    def test_microstructure_fields_tick_count_spread_and_geometry(self) -> None:
+        aggregator = TickOhlcvAggregator("XAUUSD", tf_seconds=60)
+
+        aggregator.ingest_tick(
+            make_tick_with_spread(minute=0, second=1, bid=99.9, ask=100.1)
+        )
+        aggregator.ingest_tick(
+            make_tick_with_spread(minute=0, second=10, bid=100.0, ask=100.3)
+        )
+        aggregator.ingest_tick(
+            make_tick_with_spread(minute=0, second=59, bid=99.7, ask=100.0)
+        )
+
+        r_close = aggregator.ingest_tick(
+            make_tick_with_spread(minute=1, second=0, bid=100.0, ask=100.2)
+        )
+        assert len(r_close.closed_bars) == 1
+        closed = r_close.closed_bars[0]
+
+        assert closed.complete is True
+        assert closed.synthetic is False
+        assert closed.tick_count == 3
+
+        # Спреди: 0.2, 0.3, 0.3
+        assert round(closed.avg_spread, 6) == round((0.2 + 0.3 + 0.3) / 3.0, 6)
+        assert round(closed.max_spread, 6) == round(0.3, 6)
+
+        # Геометрія: bar_range = high-low, body_size = |close-open|, wick-и.
+        assert round(closed.bar_range, 6) == round(closed.high - closed.low, 6)
+        assert round(closed.body_size, 6) == round(abs(closed.close - closed.open), 6)
+        assert round(closed.upper_wick, 6) == round(closed.high - max(closed.open, closed.close), 6)
+        assert round(closed.lower_wick, 6) == round(min(closed.open, closed.close) - closed.low, 6)
 
 
 class TestTickOhlcvAggregatorGaps:
@@ -246,6 +296,46 @@ class TestOhlcvFromLowerTfAggregator5m:
         assert agg_bar.high == max(b.high for b in base_bars)
         assert agg_bar.low == min(b.low for b in base_bars)
         assert agg_bar.volume == sum(b.volume for b in base_bars)
+
+    def test_5m_aggregator_propagates_tick_count_and_spread(self) -> None:
+        higher = OhlcvFromLowerTfAggregator(
+            "XAUUSD", target_tf_seconds=300, lower_tf_seconds=60
+        )
+
+        base_bars: list[OhlcvBar] = []
+        for i in range(5):
+            start_ms = i * MINUTE_MS
+            base_bars.append(
+                OhlcvBar(
+                    symbol="XAUUSD",
+                    tf="1m",
+                    start_ms=start_ms,
+                    end_ms=start_ms + MINUTE_MS,
+                    open=100.0,
+                    high=101.0,
+                    low=99.0,
+                    close=100.0,
+                    volume=0.0,
+                    complete=True,
+                    synthetic=False,
+                    source="tick_agg",
+                    tick_count=10,
+                    avg_spread=0.2,
+                    max_spread=0.3,
+                )
+            )
+
+        for bar in base_bars[:-1]:
+            r = higher.ingest_bar(bar)
+            assert r.closed_bars == []
+
+        r5 = higher.ingest_bar(base_bars[-1])
+        assert len(r5.closed_bars) == 1
+        closed = r5.closed_bars[0]
+
+        assert closed.tick_count == 50
+        assert round(closed.avg_spread, 6) == round(0.2, 6)
+        assert round(closed.max_spread, 6) == round(0.3, 6)
 
     def test_5m_aggregator_with_synthetic_1m(self) -> None:
         # docs/TIK_bucket.md §1.6: synthetic для 5m лише коли всі 1m synthetic.

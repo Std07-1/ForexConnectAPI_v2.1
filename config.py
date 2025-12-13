@@ -167,6 +167,7 @@ class ObservabilitySettings:
     metrics_port: int
     heartbeat_channel: str
     status_channel: str
+    telemetry_min_publish_interval_seconds: float
 
 
 @dataclass(frozen=True)
@@ -514,6 +515,17 @@ def load_config() -> FXCMConfig:
         status_channel = str(status_cfg_raw).strip() if isinstance(status_cfg_raw, str) else None
     status_channel = status_channel or STATUS_CHANNEL_DEFAULT
 
+    # Єдиний тюнінг для всіх Redis-каналів телеметрії (status/heartbeat/market_status).
+    # Підтримуємо два ключі для зворотної сумісності.
+    telemetry_interval_raw = stream_cfg.get("telemetry_min_publish_interval_seconds")
+    if telemetry_interval_raw is None:
+        telemetry_interval_raw = stream_cfg.get("status_publish_min_interval_seconds")
+    telemetry_min_publish_interval_seconds = _coerce_float(
+        telemetry_interval_raw,
+        1.0,
+        min_value=0.0,
+    )
+
     observability = ObservabilitySettings(
         metrics_enabled=_get_bool_env("FXCM_METRICS_ENABLED", True),
         metrics_port=_get_int_env(
@@ -526,6 +538,7 @@ def load_config() -> FXCMConfig:
             HEARTBEAT_DEFAULT_CHANNEL,
         ).strip(),
         status_channel=status_channel,
+        telemetry_min_publish_interval_seconds=telemetry_min_publish_interval_seconds,
     )
 
     calendar_settings = _load_calendar_settings()

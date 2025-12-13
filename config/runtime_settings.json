@@ -10,6 +10,7 @@
         "poll_seconds": 5,
         "fetch_interval_seconds": 5,
         "publish_interval_seconds": 5,
+        "telemetry_min_publish_interval_seconds": 5,
         "lookback_minutes": 5,
         "config": "XAU/USD:m1,XAU/USD:m5",
         "price_snap_channel": "fxcm:price_tik",

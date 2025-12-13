@@ -35,7 +35,6 @@
     "name": "Tokyo",          // Назва сесії (Tokyo / London / New York / ...)
     "tag": "TOKYO",           // Машинний тег (як у FXCM sessions)
     "state": "open",          // open | closed | preopen
-    "state_detail": "active", // active | intrabreak | overnight | weekend
 
     "current_open_utc": "2025-12-05T00:00:00Z",
     "current_close_utc": "2025-12-05T09:00:00Z",
@@ -81,7 +80,7 @@
 * `session`
 
   * `name/state` → яка сесія зараз і чи вона відкрита;
-  * `state_detail` → тип закриття: `active` (нормальна робота), `intrabreak` (коротка пауза в межах дня), `overnight` (нічна перерва), `weekend` (довгий геп до неділі/свята);
+  * `state_detail` → тип закриття (поле зʼявляється лише коли `state=closed`): `intrabreak` (коротка пауза в межах дня), `overnight` (нічна перерва), `weekend` (довгий геп до неділі/свята);
   * `seconds_to_close` → скільки часу до закриття поточної;
   * `seconds_to_next_open` → скільки до наступної сесії;
   * ці поля зручно показувати окремою колонкою типу:

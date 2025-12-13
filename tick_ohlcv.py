@@ -35,8 +35,19 @@ class FxcmTick:
 
     symbol: str
     ts_ms: int
+    # `price` історично означає mid-ціну; лишаємо для сумісності в тестах/інтеграції.
     price: float
+    bid: float | None = None
+    ask: float | None = None
     volume: float = 0.0
+
+
+def _tick_spread(tick: FxcmTick) -> float:
+    """Повертає спред `ask-bid` або 0.0, якщо bid/ask відсутні."""
+
+    if tick.bid is None or tick.ask is None:
+        return 0.0
+    return float(tick.ask) - float(tick.bid)
 
 
 @dataclass
@@ -56,6 +67,16 @@ class OhlcvBar:
     synthetic: bool
     source: str = DEFAULT_SOURCE
 
+    # Опційні «мікроструктурні» метрики (Phase B+):
+    # Конектор не приймає трейдинг-рішень — лише рахує сирі величини.
+    tick_count: int = 0
+    bar_range: float = 0.0
+    body_size: float = 0.0
+    upper_wick: float = 0.0
+    lower_wick: float = 0.0
+    avg_spread: float = 0.0
+    max_spread: float = 0.0
+
 
 @dataclass
 class CurrentBar:
@@ -70,6 +91,9 @@ class CurrentBar:
     close: float
     volume: float
     synthetic: bool = False
+    tick_count: int = 0
+    sum_spread: float = 0.0
+    max_spread: float = 0.0
 
     @property
     def end_ms(self) -> int:
@@ -80,8 +104,23 @@ class CurrentBar:
         self.low = min(self.low, tick.price)
         self.close = tick.price
         self.volume += tick.volume
+        self.tick_count += 1
+        spread = _tick_spread(tick)
+        self.sum_spread += spread
+        if spread > self.max_spread:
+            self.max_spread = spread
 
     def to_ohlcv(self, tf_label: str, source: str, complete: bool) -> OhlcvBar:
+        bar_range = float(self.high) - float(self.low)
+        body_size = abs(float(self.close) - float(self.open))
+        upper_wick = float(self.high) - max(float(self.open), float(self.close))
+        lower_wick = min(float(self.open), float(self.close)) - float(self.low)
+        if self.tick_count > 0:
+            avg_spread = float(self.sum_spread) / float(self.tick_count)
+            max_spread = float(self.max_spread)
+        else:
+            avg_spread = 0.0
+            max_spread = 0.0
         return OhlcvBar(
             symbol=self.symbol,
             tf=tf_label,
@@ -95,6 +134,13 @@ class CurrentBar:
             complete=complete,
             synthetic=self.synthetic,
             source=source,
+            tick_count=int(self.tick_count),
+            bar_range=bar_range,
+            body_size=body_size,
+            upper_wick=upper_wick,
+            lower_wick=lower_wick,
+            avg_spread=avg_spread,
+            max_spread=max_spread,
         )
 
     @classmethod
@@ -111,6 +157,9 @@ class CurrentBar:
             close=price,
             volume=0.0,
             synthetic=True,
+            tick_count=0,
+            sum_spread=0.0,
+            max_spread=0.0,
         )
 
 
@@ -195,6 +244,7 @@ class TickOhlcvAggregator:
         return AggregationResult(closed, live_bar)
 
     def _start_new_bar(self, bucket_start: int, tick: FxcmTick) -> CurrentBar:
+        spread = _tick_spread(tick)
         bar = CurrentBar(
             symbol=self.symbol,
             tf_ms=self.tf_ms,
@@ -204,6 +254,9 @@ class TickOhlcvAggregator:
             low=tick.price,
             close=tick.price,
             volume=tick.volume,
+            tick_count=1,
+            sum_spread=spread,
+            max_spread=spread,
         )
         return bar
 
@@ -308,6 +361,29 @@ class OhlcvFromLowerTfAggregator:
         low_price = min(bar.low for bar in self.window_bars)
         volume = sum(bar.volume for bar in self.window_bars)
         synthetic = all(bar.synthetic for bar in self.window_bars)
+
+        tick_count = sum(int(getattr(bar, "tick_count", 0) or 0) for bar in self.window_bars)
+        if tick_count > 0:
+            sum_spread = 0.0
+            max_spread = 0.0
+            for bar in self.window_bars:
+                bar_ticks = int(getattr(bar, "tick_count", 0) or 0)
+                if bar_ticks <= 0:
+                    continue
+                bar_avg_spread = float(getattr(bar, "avg_spread", 0.0) or 0.0)
+                bar_max_spread = float(getattr(bar, "max_spread", 0.0) or 0.0)
+                sum_spread += bar_avg_spread * float(bar_ticks)
+                if bar_max_spread > max_spread:
+                    max_spread = bar_max_spread
+            avg_spread = sum_spread / float(tick_count)
+        else:
+            avg_spread = 0.0
+            max_spread = 0.0
+
+        bar_range = float(high_price) - float(low_price)
+        body_size = abs(float(close_price) - float(open_price))
+        upper_wick = float(high_price) - max(float(open_price), float(close_price))
+        lower_wick = min(float(open_price), float(close_price)) - float(low_price)
         return OhlcvBar(
             symbol=self.symbol,
             tf=self.tf_label,
@@ -321,6 +397,13 @@ class OhlcvFromLowerTfAggregator:
             complete=True,
             synthetic=synthetic,
             source=self.source,
+            tick_count=tick_count,
+            bar_range=bar_range,
+            body_size=body_size,
+            upper_wick=upper_wick,
+            lower_wick=lower_wick,
+            avg_spread=avg_spread,
+            max_spread=max_spread,
         )
 
     def _build_live_bar(self) -> OhlcvBar | None:
@@ -340,6 +423,29 @@ class OhlcvFromLowerTfAggregator:
         low_price = min(bar.low for bar in live_components)
         volume = sum(bar.volume for bar in live_components)
         synthetic = all(bar.synthetic for bar in live_components)
+
+        tick_count = sum(int(getattr(bar, "tick_count", 0) or 0) for bar in live_components)
+        if tick_count > 0:
+            sum_spread = 0.0
+            max_spread = 0.0
+            for bar in live_components:
+                bar_ticks = int(getattr(bar, "tick_count", 0) or 0)
+                if bar_ticks <= 0:
+                    continue
+                bar_avg_spread = float(getattr(bar, "avg_spread", 0.0) or 0.0)
+                bar_max_spread = float(getattr(bar, "max_spread", 0.0) or 0.0)
+                sum_spread += bar_avg_spread * float(bar_ticks)
+                if bar_max_spread > max_spread:
+                    max_spread = bar_max_spread
+            avg_spread = sum_spread / float(tick_count)
+        else:
+            avg_spread = 0.0
+            max_spread = 0.0
+
+        bar_range = float(high_price) - float(low_price)
+        body_size = abs(float(close_price) - float(open_price))
+        upper_wick = float(high_price) - max(float(open_price), float(close_price))
+        lower_wick = min(float(open_price), float(close_price)) - float(low_price)
         return OhlcvBar(
             symbol=self.symbol,
             tf=self.tf_label,
@@ -353,4 +459,11 @@ class OhlcvFromLowerTfAggregator:
             complete=False,
             synthetic=synthetic,
             source=self.source,
+            tick_count=tick_count,
+            bar_range=bar_range,
+            body_size=body_size,
+            upper_wick=upper_wick,
+            lower_wick=lower_wick,
+            avg_spread=avg_spread,
+            max_spread=max_spread,
         )
