@@ -90,6 +90,7 @@ python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 - Панель `Top 10 largest gaps` аналізує прогалини між OHLCV-чанками за `open_time/close_time` та показує найбільші розриви (оцінка `missing_bars`/`missing_min`).
 - Колонка `sleep_model` класифікує gap як `sleep` або `awake` за порогом `viewer.sleep_model_gap_threshold_minutes`.
 - `synth_min` показує, скільки хвилин у межах gap було заповнено synthetic-барами (рахується по `bar.synthetic=true`). Якщо продьюсер не надсилає `synthetic`, значення буде 0.
+- Під `Top 10 largest gaps` є компактна панель `S2/S3 статистика`: вона агрегує команди з каналу `fxcm:commands` (warmup/backfill/set_universe) і підтягує короткий зріз `history/backoff/cadence` з heartbeat.
 
 #### Увімкнення tick aggregation (Phase B)
 
@@ -120,6 +121,7 @@ Viewer відстежує кілька ключових ситуацій:
 | Ключ | Опис |
 | --- | --- |
 | `heartbeat_channel`, `market_status_channel`, `ohlcv_channel` | Назви Redis-каналів для підписки. Порожній `ohlcv_channel` вимикає каналу. |
+| `commands_channel` | (optional) Канал команд (за замовчуванням `fxcm:commands`). Порожній рядок вимикає підписку. |
 | `redis_health_interval` | Як часто викликати `INFO`/`PING` для панелі Redis (секунди). |
 | `lag_spike_threshold` | Межа (сек) для інциденту `lag_spike`. |
 | `heartbeat_alert_seconds` | Поріг віку heartbeat для алерта `heartbeat_stale`. |
@@ -138,6 +140,7 @@ Viewer відстежує кілька ключових ситуацій:
     "heartbeat_channel": "fxcm:heartbeat",
     "market_status_channel": "fxcm:market_status",
     "ohlcv_channel": "fxcm:ohlcv",
+    "commands_channel": "fxcm:commands",
     "redis_health_interval": 8,
     "lag_spike_threshold": 180,
     "heartbeat_alert_seconds": 45,

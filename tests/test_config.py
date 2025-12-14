@@ -116,6 +116,17 @@ class BackoffConfigTest(unittest.TestCase):
         cfg_env = self._load_with_payload({}, {"FXCM_STATUS_CHANNEL": "fxcm:env:status"})
         self.assertEqual(cfg_env.observability.status_channel, "fxcm:env:status")
 
+    def test_commands_channel_defaults_and_override(self) -> None:
+        cfg_default = self._load_with_payload({})
+        self.assertEqual(cfg_default.commands_channel, config.COMMANDS_CHANNEL_DEFAULT)
+
+        runtime_payload = {"stream": {"commands_channel": "fxcm:test:commands"}}
+        cfg_runtime = self._load_with_payload(runtime_payload)
+        self.assertEqual(cfg_runtime.commands_channel, "fxcm:test:commands")
+
+        cfg_env = self._load_with_payload({}, {"FXCM_COMMANDS_CHANNEL": "fxcm:env:commands"})
+        self.assertEqual(cfg_env.commands_channel, "fxcm:env:commands")
+
     def test_telemetry_min_publish_interval_defaults_and_override(self) -> None:
         cfg_default = self._load_with_payload({})
         self.assertAlmostEqual(cfg_default.observability.telemetry_min_publish_interval_seconds, 1.0)
@@ -148,6 +159,19 @@ class BackoffConfigTest(unittest.TestCase):
         self.assertAlmostEqual(cfg_override.tick_cadence.idle_threshold_seconds, 240.0)
         self.assertAlmostEqual(cfg_override.tick_cadence.live_multiplier, 1.4)
         self.assertAlmostEqual(cfg_override.tick_cadence.idle_multiplier, 3.2)
+
+    def test_tick_aggregation_live_publish_interval_defaults_and_override(self) -> None:
+        cfg_default = self._load_with_payload({})
+        self.assertAlmostEqual(cfg_default.tick_aggregation_live_publish_interval_seconds, 0.25)
+
+        cfg_override = self._load_with_payload(
+            {
+                "stream": {
+                    "tick_aggregation_live_publish_interval_seconds": 0.4,
+                }
+            }
+        )
+        self.assertAlmostEqual(cfg_override.tick_aggregation_live_publish_interval_seconds, 0.4)
 
     def test_history_quota_settings_defaults_and_override(self) -> None:
         cfg_default = self._load_with_payload({})

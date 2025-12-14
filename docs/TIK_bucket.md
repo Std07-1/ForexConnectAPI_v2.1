@@ -78,7 +78,8 @@
   - `bar_range`, `body_size`, `upper_wick`, `lower_wick` — геометрія свічки;
   - `avg_spread`, `max_spread` — середній/максимальний спред усередині бару (за bid/ask з OfferTable).
 - У поточній реалізації Phase B публікуються лише `complete=true` бари; live (`complete=false`) не транслюється.
-- Поле `source` використовується для діагностики походження даних (наприклад, `tick_agg` vs `stream`). У стрім-режимі з `tick_aggregation_enabled=true` конектор **не змішує** FXCM history та tick-агрегацію для `1m/5m`: history-полінг для цих TF не публікується у `fxcm:ohlcv`.
+- Поле `source` використовується для діагностики походження даних. Фактичні значення в поточному коді: `tick_agg`, `stream`, `history_s3`.
+- У стрім-режимі з `tick_aggregation_enabled=true` конектор **не змішує** FXCM history та tick-агрегацію для `1m/5m`: history-полінг для цих TF не публікується у `fxcm:ohlcv`.
 
 ## 3. Деталізований план робіт (Фази A–D)
 

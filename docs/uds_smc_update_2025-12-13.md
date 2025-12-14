@@ -92,6 +92,7 @@
 - `tf` (string, required): нормалізований timeframe (`1m`, `5m`, ...).
 - `bars` (array, required): список барів (див. нижче).
 - `source` (string, optional): джерело батчу (наприклад, `"stream"`, `"tick_agg"`).
+- `source` (string, optional): джерело батчу (наприклад, `"stream"`, `"tick_agg"`, `"history_s3"`).
 - `sig` (string, optional): hex HMAC-підпис батчу (див. §2.6).
 
 ### 2.5 Поля бару

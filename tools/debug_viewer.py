@@ -183,6 +183,7 @@ def _cfg_dict_str(key: str) -> Dict[str, str]:
 HEARTBEAT_CHANNEL_DEFAULT = _cfg_str("heartbeat_channel", "fxcm:heartbeat")
 MARKET_STATUS_CHANNEL_DEFAULT = _cfg_str("market_status_channel", "fxcm:market_status")
 OHLCV_CHANNEL_DEFAULT = _cfg_str("ohlcv_channel", "fxcm:ohlcv")
+COMMANDS_CHANNEL_DEFAULT = _cfg_str("commands_channel", "fxcm:commands")
 REDIS_HEALTH_INTERVAL = _cfg_float("redis_health_interval", 8.0, min_value=1.0)
 LAG_SPIKE_THRESHOLD = _cfg_float("lag_spike_threshold", 180.0, min_value=1.0)
 FXCM_PAUSE_REASONS = {"fxcm_temporarily_unavailable", "fxcm_unavailable"}
@@ -419,6 +420,11 @@ class ViewerState:
     tick_cadence: Dict[str, Any] = field(default_factory=dict)
     tick_cadence_updated: Optional[float] = None
     ohlcv_gap_events: Deque["OhlcvGapEvent"] = field(default_factory=lambda: deque(maxlen=220))
+    commands_total: int = 0
+    commands_by_type: Counter = field(default_factory=Counter)
+    commands_last_seen: Dict[str, float] = field(default_factory=dict)
+    commands_feed: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=50))
+    commands_updated: Optional[float] = None
 
     def note_heartbeat(self, payload: Dict[str, Any]) -> None:
         """Оновлює кеші та діагностику згідно з новим heartbeat payload."""
@@ -484,6 +490,34 @@ class ViewerState:
         self.last_market_status = payload
         self.last_message_ts = time.time()
         self._add_timeline_event(source="MS", state=str(payload.get("state", "?")), ts=payload.get("ts"))
+
+    def note_command(self, payload: Dict[str, Any]) -> None:
+        """Фіксує SMC-команди (S2/S3) для локальної статистики viewer."""
+
+        now_ts = time.time()
+        self.last_message_ts = now_ts
+        raw_type = payload.get("type") or payload.get("cmd") or payload.get("command") or "unknown"
+        cmd_type = str(raw_type).strip() or "unknown"
+        self.commands_total += 1
+        self.commands_by_type[cmd_type] += 1
+        self.commands_last_seen[cmd_type] = now_ts
+
+        targets_count = None
+        targets = payload.get("targets")
+        if isinstance(targets, list):
+            targets_count = len([t for t in targets if isinstance(t, dict)])
+
+        self.commands_feed.appendleft(
+            {
+                "ts": now_ts,
+                "type": cmd_type,
+                "symbol": payload.get("symbol"),
+                "tf": payload.get("tf"),
+                "lookback_minutes": payload.get("lookback_minutes"),
+                "targets_count": targets_count,
+            }
+        )
+        self.commands_updated = now_ts
 
     def note_ohlcv(self, payload: Dict[str, Any]) -> None:
         """Фіксує OHLCV-повідомлення та відокремлює Lag vs Msg age.
@@ -1469,6 +1503,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heartbeat-channel", default=HEARTBEAT_CHANNEL_DEFAULT)
     parser.add_argument("--market-status-channel", default=MARKET_STATUS_CHANNEL_DEFAULT)
     parser.add_argument("--ohlcv-channel", default=OHLCV_CHANNEL_DEFAULT, help="канал OHLCV (порожній рядок = вимкнено)")
+    parser.add_argument(
+        "--commands-channel",
+        default=COMMANDS_CHANNEL_DEFAULT,
+        help="канал команд SMC (порожній рядок = вимкнено)",
+    )
     parser.add_argument("--refresh", default=2.0, type=float, help="частота оновлення UI (сек)")
     return parser.parse_args()
 
@@ -1680,6 +1719,71 @@ def build_ohlcv_gaps_panel(state: ViewerState) -> Panel:
 
     border = "red" if any((not ev.filled and not ev.sleep_model) for ev in top) else "cyan"
     return Panel(table, title="Top 10 largest gaps", border_style=border, box=box.ROUNDED)
+
+
+def build_s23_stats_panel(state: ViewerState) -> Panel:
+    """Компактна статистика Stage2/Stage3: команди, history/backoff та cadence."""
+
+    heartbeat = state.last_heartbeat or {}
+    context = heartbeat.get("context") or {}
+
+    table = Table.grid(padding=(0, 1))
+    table.add_column(style="bold cyan", justify="right", overflow="fold")
+    table.add_column(overflow="fold")
+
+    table.add_row("Команди (всього)", str(state.commands_total))
+    if state.commands_updated is not None:
+        table.add_row("Остання команда", _format_duration(max(0.0, time.time() - state.commands_updated)))
+    else:
+        table.add_row("Остання команда", "—")
+
+    history_state = context.get("history_state")
+    if history_state:
+        table.add_row("History state", str(history_state))
+
+    throttle_state = state.history_quota.get("throttle_state") if isinstance(state.history_quota, dict) else None
+    if throttle_state:
+        table.add_row("History throttle", str(throttle_state))
+
+    next_slot = _coerce_float(state.history_quota.get("next_slot_seconds")) if isinstance(state.history_quota, dict) else None
+    if next_slot is not None:
+        table.add_row("Next slot", _format_diag_duration(next_slot))
+
+    active_backoffs = 0
+    if isinstance(state.backoff_diag, dict):
+        for _, payload in state.backoff_diag.items():
+            if isinstance(payload, dict) and payload.get("active") is True:
+                active_backoffs += 1
+    table.add_row("Backoff active", str(active_backoffs))
+
+    cadence_state = None
+    cadence_reason = None
+    cadence_multiplier = None
+    if isinstance(state.tick_cadence, dict):
+        cadence_state = state.tick_cadence.get("state")
+        cadence_reason = state.tick_cadence.get("reason")
+        cadence_multiplier = _coerce_float(state.tick_cadence.get("multiplier"))
+    if cadence_state is not None:
+        table.add_row("Cadence", str(cadence_state))
+    if cadence_multiplier is not None:
+        table.add_row("Cadence x", f"{cadence_multiplier:.2f}")
+    if cadence_reason is not None:
+        table.add_row("Cadence reason", str(cadence_reason))
+
+    cmd_table = Table(box=box.SIMPLE, expand=True)
+    cmd_table.add_column("Type", style="bold", overflow="fold")
+    cmd_table.add_column("Count", justify="right", overflow="fold")
+    cmd_table.add_column("Last", justify="right", overflow="fold")
+
+    if state.commands_by_type:
+        for cmd_type, count in state.commands_by_type.most_common(6):
+            last_seen = state.commands_last_seen.get(cmd_type)
+            last_age = None if last_seen is None else max(0.0, time.time() - last_seen)
+            cmd_table.add_row(cmd_type, str(count), "—" if last_age is None else _format_duration(last_age))
+    else:
+        cmd_table.add_row("—", "0", "—")
+
+    return Panel(Group(table, cmd_table), title="S2/S3 статистика", border_style="cyan", box=box.ROUNDED)
 
 
 def build_incidents_panel(state: ViewerState) -> Panel:
@@ -2848,10 +2952,12 @@ def _render_mode_body(state: ViewerState) -> Union[Layout, Panel]:
         left = Layout(name="stats_left")
         left.split_column(
             Layout(name="s1", size=14, minimum_size=8),
-            Layout(name="gaps", ratio=1, minimum_size=10),
+            Layout(name="gaps", size=8, minimum_size=6),
+            Layout(name="s23", ratio=1, minimum_size=8),
         )
         left["s1"].update(build_s1_stats_panel(state))
         left["gaps"].update(build_ohlcv_gaps_panel(state))
+        left["s23"].update(build_s23_stats_panel(state))
         layout["left"].update(left)
 
         right = Layout(name="stats_right")
@@ -2898,6 +3004,8 @@ def run_viewer(args: argparse.Namespace) -> None:
     channels = [args.heartbeat_channel, args.market_status_channel]
     if args.ohlcv_channel:
         channels.append(args.ohlcv_channel)
+    if args.commands_channel:
+        channels.append(args.commands_channel)
     pubsub.subscribe(*channels)
 
     state = ViewerState()
@@ -2937,6 +3045,8 @@ def run_viewer(args: argparse.Namespace) -> None:
                             state.note_market_status(payload)
                         elif args.ohlcv_channel and channel == args.ohlcv_channel:
                             state.note_ohlcv(payload)
+                        elif args.commands_channel and channel == args.commands_channel:
+                            state.note_command(payload)
                         force_render = True
 
                     # Перевіряємо натискання клавіш користувача.

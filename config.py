@@ -12,10 +12,14 @@ STREAM_DEFAULT_CONFIG = "XAU/USD:m1,XAU/USD:m5"  # Цільові інструм
 CACHE_DEFAULT_DIR = "cache"  # Каталог для збереження кешу
 CACHE_DEFAULT_MAX_BARS = 3_000  # Максимальна кількість барів у кеші
 CACHE_DEFAULT_WARMUP_BARS = 1_000  # Кількість барів для "прогріву" кешу
+STREAM_DYNAMIC_UNIVERSE_DEFAULT_MAX_TARGETS = 20
+STREAM_BACKFILL_MIN_MINUTES_DEFAULT = 10
+STREAM_BACKFILL_MAX_MINUTES_DEFAULT = 360
 METRICS_DEFAULT_PORT = 9200
 HEARTBEAT_DEFAULT_CHANNEL = "fxcm:heartbeat"
 STATUS_CHANNEL_DEFAULT = "fxcm:status"
 PRICE_SNAPSHOT_CHANNEL_DEFAULT = "fxcm:price_tik"
+COMMANDS_CHANNEL_DEFAULT = "fxcm:commands"
 CALENDAR_OVERRIDES_FILE = Path("config/calendar_overrides.json")
 RUNTIME_SETTINGS_FILE = Path("config/runtime_settings.json")
 
@@ -109,6 +113,41 @@ def _parse_priority_targets_setting(value: Any) -> List[Tuple[str, str]]:
     if value is None:
         return []
     return _parse_stream_targets_config(value)
+
+
+def _normalize_symbol_raw(symbol_raw: str) -> str:
+    raw = (symbol_raw or "").strip()
+    if not raw:
+        return ""
+    if "/" in raw:
+        return raw
+    upper = raw.upper()
+    if len(upper) <= 3:
+        return upper
+    return f"{upper[:-3]}/{upper[-3:]}"
+
+
+def _normalize_timeframe_raw(tf_raw: str) -> str:
+    raw = (tf_raw or "").strip().lower()
+    if not raw:
+        return "m1"
+
+    mapping = {
+        "1m": "m1",
+        "5m": "m5",
+        "15m": "m15",
+        "30m": "m30",
+        "1h": "m60",
+        "4h": "h4",
+        "1d": "d1",
+    }
+    if raw in mapping:
+        return mapping[raw]
+    return raw
+
+
+def _normalize_target_pair(symbol_raw: str, tf_raw: str) -> Tuple[str, str]:
+    return (_normalize_symbol_raw(symbol_raw), _normalize_timeframe_raw(tf_raw))
 
 
 def _coerce_float(value: Any, default: float, *, min_value: float = 0.1) -> float:
@@ -364,6 +403,13 @@ class FXCMConfig:
     redis_required: bool
     tick_aggregation_enabled: bool
     tick_aggregation_max_synth_gap_minutes: int
+    tick_aggregation_live_publish_interval_seconds: float
+    commands_channel: str
+    dynamic_universe_enabled: bool
+    dynamic_universe_default_targets: List[Tuple[str, str]]
+    dynamic_universe_max_targets: int
+    backfill_min_minutes: int
+    backfill_max_minutes: int
 
 
 def load_config() -> FXCMConfig:
@@ -419,6 +465,50 @@ def load_config() -> FXCMConfig:
     )
     lookback_minutes = _coerce_int(stream_cfg.get("lookback_minutes"), 5, min_value=1)
     stream_targets = _parse_stream_targets_config(stream_cfg.get("config"))
+
+    dynamic_universe_enabled = _get_bool_env(
+        "FXCM_DYNAMIC_UNIVERSE_ENABLED",
+        _coerce_bool(stream_cfg.get("dynamic_universe_enabled"), False),
+    )
+    dynamic_universe_max_targets = _get_int_env(
+        "FXCM_DYNAMIC_UNIVERSE_MAX_TARGETS",
+        _coerce_int(
+            stream_cfg.get("dynamic_universe_max_targets"),
+            STREAM_DYNAMIC_UNIVERSE_DEFAULT_MAX_TARGETS,
+            min_value=1,
+        ),
+        min_value=1,
+    )
+    dynamic_default_raw = stream_cfg.get("dynamic_universe_default_targets")
+    if dynamic_default_raw is None:
+        dynamic_universe_default_targets = _parse_stream_targets(STREAM_DEFAULT_CONFIG)
+    else:
+        dynamic_universe_default_targets = _parse_stream_targets_config(dynamic_default_raw)
+    # Нормалізуємо у FXCM-формат, щоб дефолти збігалися з stream_targets.
+    dynamic_universe_default_targets = [
+        _normalize_target_pair(symbol, tf) for symbol, tf in dynamic_universe_default_targets
+    ]
+
+    backfill_min_minutes = _get_int_env(
+        "FXCM_BACKFILL_MIN_MINUTES",
+        _coerce_int(
+            stream_cfg.get("backfill_min_minutes"),
+            STREAM_BACKFILL_MIN_MINUTES_DEFAULT,
+            min_value=0,
+        ),
+        min_value=0,
+    )
+    backfill_max_minutes = _get_int_env(
+        "FXCM_BACKFILL_MAX_MINUTES",
+        _coerce_int(
+            stream_cfg.get("backfill_max_minutes"),
+            STREAM_BACKFILL_MAX_MINUTES_DEFAULT,
+            min_value=1,
+        ),
+        min_value=1,
+    )
+    if backfill_max_minutes < backfill_min_minutes:
+        backfill_max_minutes = backfill_min_minutes
     price_stream = PriceStreamSettings(
         channel=str(
             stream_cfg.get("price_snap_channel", PRICE_SNAPSHOT_CHANNEL_DEFAULT)
@@ -497,6 +587,11 @@ def load_config() -> FXCMConfig:
         60,
         min_value=0,
     )
+    tick_aggregation_live_publish_interval_seconds = _coerce_float(
+        stream_cfg.get("tick_aggregation_live_publish_interval_seconds"),
+        0.25,
+        min_value=0.05,
+    )
 
     sample_cfg_raw = runtime_settings.get("sample_request")
     sample_cfg = sample_cfg_raw if isinstance(sample_cfg_raw, dict) else {}
@@ -514,6 +609,15 @@ def load_config() -> FXCMConfig:
         status_cfg_raw = stream_cfg.get("status_channel")
         status_channel = str(status_cfg_raw).strip() if isinstance(status_cfg_raw, str) else None
     status_channel = status_channel or STATUS_CHANNEL_DEFAULT
+
+    commands_channel_env = os.environ.get("FXCM_COMMANDS_CHANNEL")
+    commands_channel: Optional[str]
+    if isinstance(commands_channel_env, str) and commands_channel_env.strip():
+        commands_channel = commands_channel_env.strip()
+    else:
+        commands_cfg_raw = stream_cfg.get("commands_channel")
+        commands_channel = str(commands_cfg_raw).strip() if isinstance(commands_cfg_raw, str) else None
+    commands_channel = commands_channel or COMMANDS_CHANNEL_DEFAULT
 
     # Єдиний тюнінг для всіх Redis-каналів телеметрії (status/heartbeat/market_status).
     # Підтримуємо два ключі для зворотної сумісності.
@@ -608,4 +712,11 @@ def load_config() -> FXCMConfig:
         redis_required=redis_required,
         tick_aggregation_enabled=tick_aggregation_enabled,
         tick_aggregation_max_synth_gap_minutes=tick_aggregation_max_synth_gap_minutes,
+        tick_aggregation_live_publish_interval_seconds=tick_aggregation_live_publish_interval_seconds,
+        commands_channel=commands_channel,
+        dynamic_universe_enabled=dynamic_universe_enabled,
+        dynamic_universe_default_targets=dynamic_universe_default_targets,
+        dynamic_universe_max_targets=dynamic_universe_max_targets,
+        backfill_min_minutes=backfill_min_minutes,
+        backfill_max_minutes=backfill_max_minutes,
     )

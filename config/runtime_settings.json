@@ -12,9 +12,15 @@
         "publish_interval_seconds": 5,
         "telemetry_min_publish_interval_seconds": 5,
         "lookback_minutes": 5,
-        "config": "XAU/USD:m1,XAU/USD:m5",
+        "config": "XAU/USD:m1,XAU/USD:m5,EUR/USD:m1,EUR/USD:m5,GBP/USD:m1,GBP/USD:m5,USD/JPY:m1,USD/JPY:m5,USD/CHF:m1,USD/CHF:m5",
         "price_snap_channel": "fxcm:price_tik",
         "price_snap_interval_seconds": 3,
+        "commands_channel": "fxcm:commands",
+        "dynamic_universe_enabled": false,
+        "dynamic_universe_default_targets": "XAU/USD:m1,XAU/USD:m5",
+        "dynamic_universe_max_targets": 20,
+        "backfill_min_minutes": 10,
+        "backfill_max_minutes": 360,
         "tick_cadence": {
             "live_threshold_seconds": 45,
             "idle_threshold_seconds": 180,
@@ -49,7 +55,8 @@
             "jitter": 0.25
         },
         "tick_aggregation_enabled": true,
-        "tick_aggregation_max_synth_gap_minutes": 60
+        "tick_aggregation_max_synth_gap_minutes": 60,
+        "tick_aggregation_live_publish_interval_seconds": 0.25
     },
     "sample_request": {
         "symbol": "XAU/USD",

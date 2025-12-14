@@ -19,6 +19,8 @@ Stage 3 закрито повністю: усі три підпроекти пр
 - **Stage 3.1 — HistoryQuota / неблокуючий throttle.** Квоти на `get_history` тепер запобігають бурстам без зупинки стріму: ковзні вікна, `history_priority_targets`, мінімальні інтервали по TF та резерв пріоритетів конфігуруються у `runtime_settings.json`, а телеметрія (`context.history`, viewer HIST-панель) показує `throttle_state`, причини deny й `skipped_polls`.
 - **Stage 3.2 — Backoff для FXCM / Redis.** FxcmBackoffController і Redis-backoff сповільнюють лише проблемні підсистеми: history-полер чекає без блокування heartbeat, supervisor паузить publish-и при помилках Redis, а стан видно у `diag.backoff` і viewer Backoff-панелі. Тести покривають state/ceil та інтеграцію в стрім.
 - **Stage 3.3 — Tick-driven cadence + auto-sleep.** TickCadenceController підлаштовує `poll_seconds` і `sleep_seconds` під реальну тикову активність: режими live/idle, множники та причини (`reason`) передаються в heartbeat (`context.tick_cadence`) і виводяться у viewer (Adaptive cadence у PRICE/SUPR). HistoryQuota працює поверх адаптивного cadence, а fairness-планувальник гарантує, що жоден TF чи символ не голодує навіть під високим навантаженням, тож latency <200 мс/бар зберігається без ручних втручань.
+- **SMC-команди — `fxcm:commands` (warmup/backfill).** Конектор підписується на канал команд і виконує `fxcm_warmup`/`fxcm_backfill` за політикою SMC; інваріант збережено: **1m/5m live OHLCV — лише з tick_agg**, history-публікація для `1m/5m` не вмикається.
+- **Dynamic stream universe v1.** Конектор може працювати або зі статичним `stream.config`, або в режимі “SMC-driven universe”, коли SMC надсилає `fxcm_set_universe` і задає ефективний піднабір `(symbol, tf)` для live-стріму.
 
 ## 1. Призначення
 
@@ -29,11 +31,13 @@ Stage 3 закрито повністю: усі три підпроекти пр
 - `fxcm:heartbeat` (налаштовується) — технічний стан процесу з розширеним `context` (канал, Redis-стан, лаг, стрім-таргети, причина паузи, тривалість циклу тощо).
 - `fxcm:price_tik` — снепшоти останнього bid/ask/mid по кожному символу зі штампами `tick_ts` (останній тик) та `snap_ts` (час формування пакета).
 - `fxcm:status` — публічний агрегований стан для зовнішніх систем (process / market / price / ohlcv / session / note), щоб консюмери бачили готовність конектора без знання heartbeat.
+- `fxcm:commands` — **канал керування (SMC)**: конектор лише **споживає** команди `fxcm_warmup`/`fxcm_backfill` (див. `docs/contracts.md`).
+  Також підтримується команда `fxcm_set_universe` (dynamic universe v1), яка задає ефективний список таргетів для live-стріму.
 
   Формат повідомлення:
 
   ```json
-  {"symbol":"XAUUSD","bid":2045.1,"ask":2045.3,"mid":2045.2,"tick_ts":1701600000.0,"snap_ts":1701600003.0}
+  {"type":"fxcm_warmup","symbol":"XAUUSD","tf":"1m","min_history_bars":1000}
   ```
 
 Локальний файловий кеш (`cache/` або зовнішня директорія) мінімізує холодний старт, а Prometheus-метрики дають спостережність.
@@ -42,15 +46,18 @@ Stage 3 закрито повністю: усі три підпроекти пр
 
 | Канал | Producer | Частота | Основні поля |
 | --- | --- | --- | --- |
-| `fxcm:ohlcv` | `connector.publish_ohlcv_to_redis` | За кожен цикл per `stream.config` | `symbol`, `tf`, `bars` (масив `open_time/close_time/open/high/low/close/volume` у мс, float), опційно `sig` (HMAC). |
+| `fxcm:ohlcv` | `connector.publish_ohlcv_to_redis` | За кожен цикл per `stream.config` | `symbol`, `tf`, `bars` (масив `open_time/close_time/open/high/low/close/volume` у мс, float), опційно `source` (`stream`/`tick_agg`/`history_s3`) і `sig` (HMAC). |
 | `fxcm:market_status` | `_publish_market_status` | При зміні стану або раз на ≤30 c | `type="market_status"`, `state=open/closed`, `ts`, `next_open_{utc,ms,in_seconds}`, `session` (тег, таймзона, вікна, статистика). |
 | `fxcm:heartbeat` | `_publish_heartbeat` / AsyncSupervisor | Кожен цикл + idle/ warmup | `type="heartbeat"`, `state`, `last_bar_close_ms`, `sleep_seconds`, `context` (Redis, `stream_targets`, `lag_seconds`, `context.history`, `context.tick_cadence`, `context.diag.backoff`, `session`). |
 | `fxcm:price_tik` | `PriceSnapshotWorker` | Кожні `stream.price_snap_interval_seconds` сек | `symbol`, `bid`, `ask`, `mid`, `tick_ts`, `snap_ts`; канал вказаний у `stream.price_snap_channel`. |
 | `fxcm:status` | `_publish_public_status` | Разом із heartbeat/market_status (~5–10 с) | `ts`, `process`, `market`, `price`, `ohlcv`, `session`, `note`; призначений для зовнішніх споживачів (див. §1.2). |
+| `fxcm:commands` | SMC (producer) → `FxcmCommandWorker` (consumer) | За потреби | `type` = `fxcm_warmup` / `fxcm_backfill` / `fxcm_set_universe`. Для `1m/5m` (tick_agg) — warmup лише кеш, backfill ігнорується. |
 
 > Детальні JSON-приклади для heartbeat/market-status див. §9.1, а інгістор очікує рівно ці ключі під час HMAC-перевірки.
 
 > **Повний опис всіх контрактів/TypedDict та каналів:** `docs/contracts.md`.
+
+Додатково: перед публікацією конектор робить runtime-валідацію схеми (див. `validate_*_payload_contract` у `fxcm_schema.py`), щоб під час оновлень не можна було «випадково» змінити формат повідомлень без оновлення контрактів і тестів.
 
 ### 1.1.1 Швидка інтеграція для UDS/SMC (ohlcv / tik / status)
 
@@ -129,6 +136,7 @@ ForexConnect (FXCM SDK)
       ├─ history poller → OHLCV batches (source="stream")
       ├─ OfferTable ticks → PriceSnapshotWorker → price snapshots (fxcm:price_tik)
       ├─ (опц.) TickOhlcvWorker: tick→bucket→1m (+5m з 1m) → OHLCV (source="tick_agg")
+      ├─ (опц.) FxcmCommandWorker: subscribe `fxcm:commands` → warmup/backfill тригери (з інваріантом 1m/5m)
       ├─ Prometheus exporter (/metrics)
       └─ Publish layer:
           ├─ sync publish (напряму в Redis)
@@ -189,6 +197,11 @@ tools/debug_viewer.py → Redis subscriber → Live UI/діагностика
 | `FXCM_METRICS_PORT` | `9200` | Порт `/metrics`. |
 | `FXCM_HEARTBEAT_CHANNEL` | `fxcm:heartbeat` | Куди шлеться heartbeat. |
 | `FXCM_STATUS_CHANNEL` | `fxcm:status` | Канал публічного статусу (process/market/price/ohlcv/session). |
+| `FXCM_COMMANDS_CHANNEL` | `fxcm:commands` | Канал команд від SMC (S3): `fxcm_warmup`/`fxcm_backfill`. |
+| `FXCM_DYNAMIC_UNIVERSE_ENABLED` | `false` | Якщо `true`, ефективні `stream_targets` беруться з `fxcm_set_universe` (якщо SMC вже задав), інакше з `dynamic_universe_default_targets`. |
+| `FXCM_DYNAMIC_UNIVERSE_MAX_TARGETS` | `20` | Верхня межа кількості активних таргетів у dynamic режимі. |
+| `FXCM_BACKFILL_MIN_MINUTES` | `10` | Мінімальне значення `lookback_minutes` для `fxcm_backfill` (clamp). |
+| `FXCM_BACKFILL_MAX_MINUTES` | `360` | Максимальне значення `lookback_minutes` для `fxcm_backfill` (clamp). |
 | `FXCM_SESSION_TAG` | `AUTO` | Якщо `AUTO` — тег визначається за `session_windows`; можна вказати фіксований (наприклад, `LDN_METALS`). |
 | `FXCM_HMAC_SECRET` | – | Секрет для `sig`. Якщо задано — `fxcm_ingestor` вимагає підпис. |
 | `FXCM_HMAC_ALGO` | `sha256` | Алгоритм (`sha256`, `sha512`, ...). |
@@ -250,6 +263,12 @@ tools/debug_viewer.py → Redis subscriber → Live UI/діагностика
     "price_snap_channel": "fxcm:price_tik",
     "price_snap_interval_seconds": 3,
     "status_channel": "fxcm:status",
+    "commands_channel": "fxcm:commands",
+    "dynamic_universe_enabled": false,
+    "dynamic_universe_default_targets": "XAU/USD:m1,XAU/USD:m5",
+    "dynamic_universe_max_targets": 20,
+    "backfill_min_minutes": 10,
+    "backfill_max_minutes": 360,
     "tick_aggregation_enabled": false,
     "tick_aggregation_max_synth_gap_minutes": 60,
     "history_max_calls_per_min": 360,
@@ -326,6 +345,7 @@ tools/debug_viewer.py → Redis subscriber → Live UI/діагностика
 - `stream.price_snap_channel` задає Redis-канал для тик-снепшотів, а `stream.price_snap_interval_seconds` — інтервал між пакетами (3–5 с). Ці значення читає `PriceSnapshotWorker`, що агрегує OfferTable-тикі.
 - `stream.tick_aggregation_enabled` вмикає tick→OHLCV агрегацію (джерело `source="tick_agg"`). Якщо `true`, FXCM history-полінг **не публікує** `1m/5m` у `fxcm:ohlcv`, щоб не змішувати два джерела.
 - `stream.tick_aggregation_max_synth_gap_minutes` задає максимальний розрив (хв), який дозволено заповнювати synthetic-барами в tick-агрегації.
+- `stream.tick_aggregation_live_publish_interval_seconds` задає тротлінг live-оновлень `complete=false` (типово `0.25`), щоб не публікувати кожен тик.
 
 **Tick→bucket (див. docs/TIK_bucket.md):**
 

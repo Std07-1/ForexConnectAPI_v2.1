@@ -38,6 +38,20 @@ def test_note_ohlcv_tracks_latest_bar() -> None:
     assert list(state.ohlcv_lag_history[key])  # history populated
 
 
+def test_note_command_tracks_counters() -> None:
+    state = dv.ViewerState()
+
+    state.note_command({"type": "fxcm_warmup", "symbol": "XAU/USD", "tf": "m1"})
+    state.note_command({"type": "fxcm_warmup"})
+    state.note_command({"type": "fxcm_set_universe", "targets": [{"symbol": "XAU/USD", "tf": "m1"}]})
+
+    assert state.commands_total == 3
+    assert state.commands_by_type["fxcm_warmup"] == 2
+    assert state.commands_by_type["fxcm_set_universe"] == 1
+    assert state.commands_updated is not None
+    assert state.commands_feed
+
+
 def test_refresh_ohlcv_alerts_sets_missing_before_messages() -> None:
     state = dv.ViewerState()
 

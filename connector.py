@@ -25,7 +25,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from concurrent.futures import TimeoutError as FutureTimeout
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from logging import Logger
 from pathlib import Path
@@ -113,6 +113,8 @@ from fxcm_schema import (
     MIN_ALLOWED_BAR_TIMESTAMP_MS,
     MarketStatusPayload,
     SessionContextPayload,
+    validate_ohlcv_payload_contract,
+    validate_price_tik_payload_contract,
 )
 from fxcm_security import compute_payload_hmac
 from rich.console import Console
@@ -649,6 +651,22 @@ PROM_STREAM_LAG_SECONDS = Gauge(
     "Лаг між поточним часом та close_time останнього бару",
     ["symbol", "tf"],
 )
+
+PROM_TICK_AGG_TICKS_TOTAL = Counter(
+    "fxcm_tick_agg_ticks_total",
+    "Сумарна кількість тиків, оброблених TickOhlcvWorker",
+    ["symbol"],
+)
+PROM_TICK_AGG_BARS_TOTAL = Counter(
+    "fxcm_tick_agg_bars_total",
+    "Кількість згенерованих барів TickOhlcvWorker (complete bars)",
+    ["symbol", "tf", "synthetic"],
+)
+PROM_TICK_AGG_AVG_SPREAD = Gauge(
+    "fxcm_tick_agg_avg_spread",
+    "Оцінка avg spread (ask-bid) для закритих барів tick-agg",
+    ["symbol", "tf"],
+)
 PROM_STREAM_STALENESS_SECONDS = Gauge(
     "fxcm_stream_staleness_seconds",
     "Час у секундах від останнього опублікованого close_time",
@@ -700,6 +718,16 @@ PROM_DROPPED_BARS = Counter(
 PROM_PRICE_HISTORY_NOT_READY = Counter(
     "fxcm_pricehistory_not_ready_total",
     "Скільки разів FXCM повернув 'PriceHistoryCommunicator is not ready'",
+)
+
+PROM_COMMANDS_TOTAL = Counter(
+    "fxcm_commands_total",
+    "Скільки команд з `fxcm:commands` було оброблено",
+    ["type", "result"],
+)
+PROM_COMMANDS_LAST_TS_SECONDS = Gauge(
+    "fxcm_commands_last_ts_seconds",
+    "UNIX-час (seconds) останньої обробленої команди з `fxcm:commands`",
 )
 
 
@@ -2288,6 +2316,573 @@ def _normalize_symbol(raw_symbol: str) -> str:
     return raw_symbol.replace("/", "").upper()
 
 
+def _denormalize_symbol(symbol_norm: str) -> str:
+    """Перетворює нормалізований символ (без `/`) у FXCM-формат.
+
+    Приклади:
+    - `XAUUSD` -> `XAU/USD`
+    - `EURUSD` -> `EUR/USD`
+
+    Якщо у рядку вже є `/`, повертаємо як є.
+    """
+
+    raw = (symbol_norm or "").strip()
+    if not raw:
+        return ""
+    if "/" in raw:
+        return raw
+    upper = raw.upper()
+    if len(upper) <= 3:
+        return upper
+    # Базове правило для FX/металів: XXXYYY -> XXX/YYY.
+    return f"{upper[:-3]}/{upper[-3:]}"
+
+
+def _to_fxcm_timeframe(tf_norm: str) -> str:
+    """Перетворює нормалізований timeframe (`1m`, `1h`) у FXCM tf (`m1`, `m60`)."""
+
+    raw = (tf_norm or "").strip().lower()
+    if not raw:
+        return "m1"
+
+    explicit = {
+        "1m": "m1",
+        "5m": "m5",
+        "15m": "m15",
+        "30m": "m30",
+        "1h": "m60",
+        "4h": "h4",
+        "1d": "d1",
+    }
+    if raw in explicit:
+        return explicit[raw]
+
+    if raw.endswith("m") and raw[:-1].isdigit():
+        return f"m{int(raw[:-1])}"
+    if raw.endswith("h") and raw[:-1].isdigit():
+        hours = int(raw[:-1])
+        if hours == 1:
+            return "m60"
+        return f"h{hours}"
+
+    return tf_norm
+
+
+@dataclass
+class StreamUniverse:
+    """Динамічний universe таргетів для стріму (v1).
+
+    - base_targets: дозволений список `(symbol_raw, timeframe_raw)` з конфігу.
+    - dynamic_enabled: якщо False — працюємо як раніше (весь base).
+    - default_targets: мінімальний fallback, якщо SMC ще не задав universe.
+    - max_targets: верхня межа активних таргетів у dynamic режимі.
+    """
+
+    base_targets: List[Tuple[str, str]]
+    dynamic_enabled: bool
+    default_targets: List[Tuple[str, str]]
+    max_targets: int
+
+    _active_from_smc: List[Tuple[str, str]] = field(default_factory=list)
+    _dirty: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _base_norm_set: Set[Tuple[str, str]] = field(default_factory=set, init=False)
+
+    def __post_init__(self) -> None:
+        self.base_targets = [(sym, tf) for sym, tf in (self.base_targets or []) if sym and tf]
+        self.default_targets = [(sym, tf) for sym, tf in (self.default_targets or []) if sym and tf]
+        self.max_targets = max(1, int(self.max_targets or 1))
+
+        self._base_norm_set = {
+            (_normalize_symbol(sym), _map_timeframe_label(tf)) for sym, tf in self.base_targets
+        }
+        # Гарантуємо підмножину base_targets (вимога U1).
+        filtered_default: List[Tuple[str, str]] = []
+        seen: Set[Tuple[str, str]] = set()
+        for sym, tf in self.default_targets:
+            key = (_normalize_symbol(sym), _map_timeframe_label(tf))
+            if key in seen:
+                continue
+            seen.add(key)
+            if key not in self._base_norm_set:
+                log.warning(
+                    "Dynamic universe: default_targets містить пару поза base_targets, пропускаємо (%s %s)",
+                    sym,
+                    tf,
+                )
+                continue
+            filtered_default.append((sym, tf))
+        self.default_targets = filtered_default
+
+    def has_dynamic_requests(self) -> bool:
+        with self._lock:
+            return bool(self._active_from_smc)
+
+    def mark_dirty(self) -> None:
+        with self._lock:
+            self._dirty = True
+
+    def consume_dirty(self) -> bool:
+        with self._lock:
+            if not self._dirty:
+                return False
+            self._dirty = False
+            return True
+
+    def set_from_smc(self, targets: List[Tuple[str, str]]) -> None:
+        """Оновлює активний universe з команди SMC."""
+
+        normalized: List[Tuple[str, str]] = []
+        seen: Set[Tuple[str, str]] = set()
+        ignored_outside_base = 0
+        for sym, tf in (targets or []):
+            if not sym or not tf:
+                continue
+            key = (_normalize_symbol(sym), _map_timeframe_label(tf))
+            if key in seen:
+                continue
+            seen.add(key)
+            if key not in self._base_norm_set:
+                ignored_outside_base += 1
+                continue
+            normalized.append((sym, tf))
+            if len(normalized) >= self.max_targets:
+                break
+
+        with self._lock:
+            if normalized == self._active_from_smc:
+                return
+            self._active_from_smc = list(normalized)
+            self._dirty = True
+
+        if ignored_outside_base:
+            log.info(
+                "Dynamic universe: проігноровано %d таргет(ів), які не входять у base_targets",
+                ignored_outside_base,
+            )
+
+    def get_effective_targets(self) -> List[Tuple[str, str]]:
+        if not self.dynamic_enabled:
+            return list(self.base_targets)
+
+        with self._lock:
+            active = list(self._active_from_smc)
+
+        if active:
+            return active
+        if self.default_targets:
+            return list(self.default_targets)
+        # Фолбек: перші max_targets з base.
+        return list(self.base_targets[: self.max_targets])
+
+
+class FxcmCommandWorker:
+    """Підписник на `fxcm:commands` для warmup/backfill від SMC (S3).
+
+    Важливо: 1m/5m live OHLCV лишаються лише tick_agg.
+    Команди для цих TF можуть оновлювати кеш (warmup), але не публікують history у `fxcm:ohlcv`.
+    """
+
+    _RATE_LIMIT_SECONDS = 2.0
+
+    def __init__(
+        self,
+        *,
+        redis_client: Optional[Any],
+        fx_holder: Dict[str, Optional[ForexConnect]],
+        cache_manager: Optional[HistoryCache],
+        tick_aggregation_enabled: bool,
+        tick_agg_timeframes: Sequence[str] = ("m1", "m5"),
+        channel: str,
+        stream_targets: Sequence[Tuple[str, str]] = (),
+        universe: Optional[StreamUniverse] = None,
+        backfill_min_minutes: int = 0,
+        backfill_max_minutes: int = 360,
+        hmac_secret: Optional[str] = None,
+        hmac_algo: str = "sha256",
+    ) -> None:
+        self._redis_client = redis_client
+        self._fx_holder = fx_holder
+        self._cache_manager = cache_manager
+        self._tick_aggregation_enabled = bool(tick_aggregation_enabled)
+        self._tick_tf_norm: Set[str] = {
+            _map_timeframe_label(tf) for tf in (tick_agg_timeframes or ())
+        }
+        self._channel = str(channel or "").strip()
+        self._universe = universe
+        self._backfill_min_minutes = max(0, int(backfill_min_minutes))
+        self._backfill_max_minutes = max(self._backfill_min_minutes, int(backfill_max_minutes) or 0)
+        self._hmac_secret = hmac_secret
+        self._hmac_algo = (hmac_algo or "sha256").strip().lower() or "sha256"
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._pubsub: Optional[Any] = None
+        self._last_cmd_ts: Dict[Tuple[str, str, str], float] = {}
+        self._targets: Set[Tuple[str, str]] = {
+            (_normalize_symbol(symbol), _map_timeframe_label(tf_raw))
+            for symbol, tf_raw in (stream_targets or ())
+        }
+
+    def start(self) -> None:
+        if self._redis_client is None:
+            log.info("S3: канал команд не запущено — Redis недоступний.")
+            return
+        if not self._channel:
+            log.info("S3: канал команд не запущено — channel порожній.")
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="FxcmCommandWorker", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        pubsub = self._pubsub
+        if pubsub is not None and hasattr(pubsub, "close"):
+            try:
+                pubsub.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        self._pubsub = None
+
+    def _run(self) -> None:
+        assert self._redis_client is not None
+        try:
+            pubsub = self._redis_client.pubsub(ignore_subscribe_messages=True)
+            self._pubsub = pubsub
+            pubsub.subscribe(self._channel)
+            log.info("S3: підписано канал команд: %s", self._channel)
+        except Exception as exc:  # noqa: BLE001
+            PROM_COMMANDS_TOTAL.labels(type="subscribe", result="error").inc()
+            log.exception("S3: не вдалося підписатися на канал команд %s: %s", self._channel, exc)
+            return
+
+        last_poll_error_ts = 0.0
+
+        def _should_reconnect(exc: Exception) -> bool:
+            text = str(exc).lower()
+            needles = (
+                "i/o operation on closed file",
+                "closed file",
+                "connection",
+                "broken pipe",
+                "connection reset",
+                "connection error",
+                "timeout",
+            )
+            return any(needle in text for needle in needles)
+
+        def _reconnect() -> Optional[Any]:
+            if self._stop_event.is_set():
+                return None
+            client = self._redis_client
+            if client is None:
+                log.warning(
+                    "S3: Redis-клієнт відсутній, перепідписання каналу %s неможливе.",
+                    self._channel,
+                )
+                return None
+            try:
+                if pubsub is not None and hasattr(pubsub, "close"):
+                    try:
+                        pubsub.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                new_pubsub = client.pubsub(ignore_subscribe_messages=True)
+                self._pubsub = new_pubsub
+                new_pubsub.subscribe(self._channel)
+                log.info("S3: перепідписано канал команд: %s", self._channel)
+                return new_pubsub
+            except Exception as reconnect_exc:  # noqa: BLE001
+                now = time.time()
+                if now - last_poll_error_ts >= self._RATE_LIMIT_SECONDS:
+                    log.warning(
+                        "S3: не вдалося перепідписатися на канал команд %s: %s",
+                        self._channel,
+                        reconnect_exc,
+                    )
+                return None
+
+        while not self._stop_event.is_set():
+            try:
+                message = pubsub.get_message(timeout=1.0)
+            except Exception as exc:  # noqa: BLE001
+                if self._stop_event.is_set():
+                    break
+                PROM_COMMANDS_TOTAL.labels(type="poll", result="error").inc()
+                now = time.time()
+                if now - last_poll_error_ts >= self._RATE_LIMIT_SECONDS:
+                    log.warning("S3: помилка читання pubsub (%s): %s", self._channel, exc)
+                    last_poll_error_ts = now
+                if _should_reconnect(exc):
+                    new_pubsub = _reconnect()
+                    if new_pubsub is not None:
+                        pubsub = new_pubsub
+                time.sleep(1.0)
+                continue
+            if not message:
+                continue
+            raw = message.get("data")
+            try:
+                payload = json.loads(raw)
+            except Exception as exc:  # noqa: BLE001
+                PROM_COMMANDS_TOTAL.labels(type="parse", result="error").inc()
+                log.warning("S3: некоректний JSON у команді: %s", exc)
+                continue
+            try:
+                self._handle_command(payload)
+            except Exception as exc:  # noqa: BLE001
+                cmd_type = str(payload.get("type") or "unknown")
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+                log.exception("S3: помилка обробки команди %s: %s", cmd_type, exc)
+
+    def _handle_command(self, payload: Mapping[str, Any]) -> None:
+        cmd_type = str(payload.get("type") or "").strip()
+        if cmd_type == "fxcm_set_universe":
+            universe = self._universe
+            if universe is None or not universe.dynamic_enabled:
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+                log.info("S3: fxcm_set_universe — dynamic_universe вимкнено, ігноруємо")
+                return
+
+            targets_raw = payload.get("targets")
+            if not isinstance(targets_raw, list):
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+                log.warning("S3: fxcm_set_universe: поле targets має бути списком")
+                return
+
+            parsed: List[Tuple[str, str]] = []
+            for entry in targets_raw:
+                if not isinstance(entry, Mapping):
+                    continue
+                sym_in = entry.get("symbol")
+                tf_in = entry.get("tf")
+                if not isinstance(sym_in, str) or not isinstance(tf_in, str):
+                    continue
+                sym_raw = sym_in.strip()
+                tf_raw = tf_in.strip()
+                if not sym_raw or not tf_raw:
+                    continue
+                # Приймаємо `XAUUSD` і `XAU/USD`, а також `1m` і `m1`.
+                sym_fxcm = _denormalize_symbol(sym_raw)
+                tf_fxcm = _to_fxcm_timeframe(_map_timeframe_label(tf_raw))
+                parsed.append((sym_fxcm, tf_fxcm))
+
+            universe.set_from_smc(parsed)
+            effective = universe.get_effective_targets()
+            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+            log.info(
+                "S3: fxcm_set_universe застосовано, активних таргетів: %d, список: %s",
+                len(effective),
+                ", ".join(f"{sym}:{tf}" for sym, tf in effective) or "<empty>",
+            )
+            return
+
+        if cmd_type not in {"fxcm_warmup", "fxcm_backfill"}:
+            if cmd_type:
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+            log.info("S3: невідома команда type=%s — ігноруємо", cmd_type or "<empty>")
+            return
+
+        symbol_in = payload.get("symbol")
+        tf_in = payload.get("tf")
+        if not isinstance(symbol_in, str) or not isinstance(tf_in, str):
+            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+            log.warning("S3: %s: відсутні або некоректні поля symbol/tf", cmd_type)
+            return
+
+        symbol_raw = symbol_in.strip()
+        tf_raw = tf_in.strip()
+        tf_norm = _map_timeframe_label(tf_raw)
+
+        symbol_fxcm = _denormalize_symbol(symbol_raw)
+        symbol_norm = _normalize_symbol(symbol_fxcm)
+
+        if self._targets and (symbol_norm, tf_norm) not in self._targets:
+            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+            log.info(
+                "S3: команда для нецільового інструменту, ігноруємо (%s %s)",
+                symbol_norm,
+                tf_norm,
+            )
+            return
+
+        key = (symbol_norm, tf_norm, cmd_type)
+        now = time.monotonic()
+        last_ts = self._last_cmd_ts.get(key)
+        if last_ts is not None and now - last_ts < self._RATE_LIMIT_SECONDS:
+            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+            return
+        self._last_cmd_ts[key] = now
+
+        PROM_COMMANDS_LAST_TS_SECONDS.set(time.time())
+
+        min_history_bars = 0
+        lookback_minutes = 0
+        try:
+            min_history_bars = int(payload.get("min_history_bars") or 0)
+        except Exception:  # noqa: BLE001
+            min_history_bars = 0
+        try:
+            lookback_minutes = int(payload.get("lookback_minutes") or 0)
+        except Exception:  # noqa: BLE001
+            lookback_minutes = 0
+
+        tick_tf = self._tick_aggregation_enabled and tf_norm in self._tick_tf_norm
+
+        if cmd_type == "fxcm_warmup":
+            fx = self._fx_holder.get("client")
+            if fx is None or self._cache_manager is None:
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+                log.warning(
+                    "S3: fxcm_warmup %s %s — FXCM або кеш недоступні",
+                    symbol_norm,
+                    tf_norm,
+                )
+                return
+
+            fx_tf_raw = _to_fxcm_timeframe(tf_norm)
+            try:
+                self._cache_manager.ensure_ready(
+                    fx,
+                    symbol_raw=symbol_fxcm,
+                    timeframe_raw=fx_tf_raw,
+                )
+            except Exception as exc:  # noqa: BLE001
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+                log.exception(
+                    "S3: fxcm_warmup помилка ensure_ready(%s, %s): %s",
+                    symbol_fxcm,
+                    fx_tf_raw,
+                    exc,
+                )
+                return
+
+            if tick_tf:
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+                log.info(
+                    "S3: fxcm_warmup виконано для %s %s (tick TF, кеш оновлено, без публікації)",
+                    symbol_norm,
+                    tf_norm,
+                )
+                return
+
+            if self._redis_client is None:
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+                log.info(
+                    "S3: fxcm_warmup %s %s — Redis недоступний, оновлено лише кеш",
+                    symbol_norm,
+                    tf_norm,
+                )
+                return
+
+            limit = min_history_bars or self._cache_manager.warmup_bars
+            warmup_slice = self._cache_manager.get_bars_to_publish(
+                symbol_raw=symbol_fxcm,
+                timeframe_raw=fx_tf_raw,
+                limit=limit,
+                force=False,
+            )
+            if warmup_slice.empty:
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+                log.info(
+                    "S3: fxcm_warmup %s %s — warmup_slice порожній",
+                    symbol_norm,
+                    tf_norm,
+                )
+                return
+
+            publish_ohlcv_to_redis(
+                warmup_slice,
+                symbol=symbol_fxcm,
+                timeframe=tf_norm,
+                redis_client=self._redis_client,
+                data_gate=None,
+                hmac_secret=self._hmac_secret,
+                hmac_algo=self._hmac_algo,
+                source="history_s3",
+            )
+            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+            log.info(
+                "S3: fxcm_warmup опубліковано %d барів для %s %s",
+                int(len(warmup_slice)),
+                symbol_norm,
+                tf_norm,
+            )
+            return
+
+        # fxcm_backfill
+        if tick_tf:
+            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+            log.info(
+                "S3: fxcm_backfill %s %s (tick TF) поки не підтримано, пропускаємо",
+                symbol_norm,
+                tf_norm,
+            )
+            return
+
+        fx = self._fx_holder.get("client")
+        if fx is None or self._redis_client is None:
+            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+            log.warning(
+                "S3: fxcm_backfill %s %s — FXCM або Redis недоступні",
+                symbol_norm,
+                tf_norm,
+            )
+            return
+
+        lookback_raw = int(lookback_minutes or 60)
+        lookback = lookback_raw
+        if self._backfill_max_minutes > 0:
+            lookback = min(lookback, self._backfill_max_minutes)
+        if self._backfill_min_minutes > 0:
+            lookback = max(lookback, self._backfill_min_minutes)
+        if lookback != lookback_raw:
+            log.info(
+                "S3: fxcm_backfill lookback скориговано з %d до %d хв",
+                lookback_raw,
+                lookback,
+            )
+        fx_tf_raw = _to_fxcm_timeframe(tf_norm)
+        try:
+            _fetch_and_publish_recent(
+                fx,
+                symbol=symbol_fxcm,
+                timeframe_raw=fx_tf_raw,
+                redis_client=self._redis_client,
+                lookback_minutes=lookback,
+                last_open_time_ms={},
+                data_gate=None,
+                min_publish_interval=0.0,
+                publish_rate_limit=None,
+                hmac_secret=self._hmac_secret,
+                hmac_algo=self._hmac_algo,
+                session_stats=None,
+                ohlcv_sink=None,
+                market_status_sink=None,
+                allow_calendar_closed=True,
+            )
+            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+            log.info(
+                "S3: fxcm_backfill виконано для %s %s (lookback=%d)",
+                symbol_norm,
+                tf_norm,
+                lookback,
+            )
+        except Exception as exc:  # noqa: BLE001
+            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+            log.exception(
+                "S3: fxcm_backfill помилка для %s %s: %s",
+                symbol_fxcm,
+                fx_tf_raw,
+                exc,
+            )
+
+
 class PriceTick(NamedTuple):
     symbol: str
     bid: float
@@ -2964,6 +3559,13 @@ class PriceSnapshotWorker:
         )
         self._thread.start()
 
+    def set_symbols(self, symbols: Sequence[str]) -> None:
+        """Оновлює фільтр символів без перезапуску воркера (dynamic universe v1)."""
+
+        new_set = {_normalize_symbol(sym) for sym in symbols if sym}
+        with self._lock:
+            self._symbols = new_set
+
     def stop(self) -> None:
         self._stop.set()
         if self._thread and self._thread.is_alive():
@@ -3097,16 +3699,18 @@ class PriceSnapshotWorker:
             return
         try:
             for tick in ticks:
-                payload = {
-                    "symbol": tick.symbol,
-                    "bid": tick.bid,
-                    "ask": tick.ask,
-                    "mid": tick.mid,
-                    "tick_ts": tick.tick_ts,
-                    "snap_ts": snap_ts,
-                }
-                message = json.dumps(payload, separators=(",", ":"))
-                redis_client.publish(self._channel, message)
+                _publish_price_snapshot(
+                    redis_client,
+                    channel=self._channel,
+                    snapshot=PriceTickSnap(
+                        symbol=tick.symbol,
+                        bid=tick.bid,
+                        ask=tick.ask,
+                        mid=tick.mid,
+                        tick_ts=tick.tick_ts,
+                        snap_ts=snap_ts,
+                    ),
+                )
         except Exception as exc:  # noqa: BLE001
             PROM_ERROR_COUNTER.labels(type="redis").inc()
             log.debug("Публікація price snapshot неуспішна: %s", exc)
@@ -3130,6 +3734,7 @@ class TickOhlcvWorker:
         enabled: bool,
         symbols: Sequence[str],
         max_synth_gap_minutes: int,
+        live_publish_min_interval_seconds: float = 0.25,
         ohlcv_sink: Callable[[OhlcvBatch], None],
     ) -> None:
         self._enabled = bool(enabled)
@@ -3143,6 +3748,13 @@ class TickOhlcvWorker:
         self._stop = threading.Event()
         self._agg_1m: Dict[str, TickOhlcvAggregator] = {}
         self._agg_5m: Dict[str, OhlcvFromLowerTfAggregator] = {}
+
+        # Live-оновлення (complete=false) у `fxcm:ohlcv` мають бути частими,
+        # але не кожен тик. Тримаємо тротлінг на рівні worker-а.
+        self._live_publish_min_interval_seconds = max(
+            0.05, float(live_publish_min_interval_seconds)
+        )
+        self._last_live_publish_ts: Dict[Tuple[str, str], float] = {}
 
     def start(self) -> None:
         if not self._enabled:
@@ -3159,6 +3771,19 @@ class TickOhlcvWorker:
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
+
+    def set_symbols(self, symbols: Sequence[str]) -> None:
+        """Оновлює список символів, які агрегуються (dynamic universe v1)."""
+
+        self._symbols = {_normalize_symbol(sym) for sym in symbols if sym}
+        # Легка зачистка агрегаторів, щоб не накопичувати стан по неактивних.
+        active = set(self._symbols)
+        for sym in list(self._agg_1m.keys()):
+            if sym not in active:
+                self._agg_1m.pop(sym, None)
+        for sym in list(self._agg_5m.keys()):
+            if sym not in active:
+                self._agg_5m.pop(sym, None)
 
     def enqueue_tick(self, symbol: str, bid: float, ask: float, tick_ts: float) -> None:
         if not self._enabled:
@@ -3206,6 +3831,7 @@ class TickOhlcvWorker:
 
     def _process_tick(self, tick: PriceTick) -> None:
         symbol = tick.symbol
+        PROM_TICK_AGG_TICKS_TOTAL.labels(symbol=symbol).inc()
         agg_1m = self._agg_1m.get(symbol)
         if agg_1m is None:
             agg_1m = TickOhlcvAggregator(
@@ -3236,6 +3862,10 @@ class TickOhlcvWorker:
         )
 
         result_1m = agg_1m.ingest_tick(fx_tick)
+
+        if result_1m.live_bar is not None:
+            self._publish_tick_bar(result_1m.live_bar)
+
         for bar in result_1m.closed_bars:
             self._publish_tick_bar(bar)
             result_5m = agg_5m.ingest_bar(bar)
@@ -3243,9 +3873,29 @@ class TickOhlcvWorker:
                 self._publish_tick_bar(higher_bar)
 
     def _publish_tick_bar(self, bar: TickOhlcvBar) -> None:
-        # Публікуємо тільки complete бари.
         if not bar.complete:
-            return
+            key = (str(bar.symbol), str(bar.tf))
+            now = time.monotonic()
+            last = self._last_live_publish_ts.get(key)
+            if (
+                last is not None
+                and now - last < self._live_publish_min_interval_seconds
+            ):
+                return
+            self._last_live_publish_ts[key] = now
+        else:
+            PROM_TICK_AGG_BARS_TOTAL.labels(
+                symbol=str(bar.symbol),
+                tf=str(bar.tf),
+                synthetic="1" if bool(bar.synthetic) else "0",
+            ).inc()
+            try:
+                PROM_TICK_AGG_AVG_SPREAD.labels(
+                    symbol=str(bar.symbol),
+                    tf=str(bar.tf),
+                ).set(float(getattr(bar, "avg_spread", 0.0) or 0.0))
+            except Exception:  # noqa: BLE001 - метрика не критична
+                pass
         df = pd.DataFrame(
             [
                 {
@@ -4117,6 +4767,13 @@ def publish_ohlcv_to_redis(
             hmac_algo,
         )
 
+    try:
+        validate_ohlcv_payload_contract(payload)
+    except ValueError as exc:
+        PROM_ERROR_COUNTER.labels(type="contract").inc()
+        log.error("Порушено контракт fxcm:ohlcv — публікацію скасовано: %s", exc)
+        return False
+
     message = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
     try:
@@ -4161,6 +4818,9 @@ def _publish_price_snapshot(
         "tick_ts": snapshot.tick_ts,
         "snap_ts": snapshot.snap_ts,
     }
+
+    validate_price_tik_payload_contract(payload)
+
     message = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     try:
         redis_client.publish(channel, message)
@@ -4437,6 +5097,7 @@ def fetch_history_sample(
             data_gate=data_gate,
             hmac_secret=hmac_secret,
             hmac_algo=hmac_algo,
+            source="stream",
         )
     except RedisRetryableError as exc:
         PROM_ERROR_COUNTER.labels(type="redis").inc()
@@ -4566,6 +5227,8 @@ def stream_fx_data(
     tick_aggregation_enabled: bool = False,
     tick_aggregation_timeframes: Optional[Sequence[str]] = None,
     status_bar: Optional[ConsoleStatusBar] = None,
+    universe: Optional[StreamUniverse] = None,
+    universe_update_callback: Optional[Callable[[List[Tuple[str, str]]], None]] = None,
 ) -> None:
     """Безкінечний цикл стрімінгу OHLCV у Redis.
 
@@ -4728,6 +5391,14 @@ def stream_fx_data(
 
     try:
         while True:
+            if universe is not None and universe.consume_dirty():
+                try:
+                    config = universe.get_effective_targets()
+                    if universe_update_callback is not None:
+                        universe_update_callback(list(config))
+                except Exception:  # noqa: BLE001
+                    log.exception("Dynamic universe: не вдалося застосувати оновлення")
+
             cycle_start = time.monotonic()
             restart_cycle = False
             market_pause = False
@@ -5205,11 +5876,18 @@ def main() -> None:
     offer_subscription: Optional[FXCMOfferSubscription] = None
     supervisor: Optional[AsyncStreamSupervisor] = None
     tick_cadence_controller: Optional[TickCadenceController] = None
+    commands_worker: Optional[FxcmCommandWorker] = None
 
     stream_mode = config.stream_mode
     poll_seconds = config.poll_seconds
     lookback_minutes = config.lookback_minutes
-    stream_config = config.stream_targets
+    universe = StreamUniverse(
+        base_targets=config.stream_targets,
+        dynamic_enabled=bool(config.dynamic_universe_enabled),
+        default_targets=list(config.dynamic_universe_default_targets),
+        max_targets=int(config.dynamic_universe_max_targets),
+    )
+    stream_config = universe.get_effective_targets()
 
     primary_backoff = BackoffController(config.backoff.fxcm_login)
     fx_holder: Dict[str, Optional[ForexConnect]] = {
@@ -5375,7 +6053,8 @@ def main() -> None:
             tick_cadence_controller = TickCadenceController(
                 tuning=config.tick_cadence,
                 base_poll_seconds=poll_seconds,
-                timeframes=[tf for _, tf in stream_config],
+                # Беремо базові TF, щоб cadence мав ключі для будь-яких dynamic підмножин.
+                timeframes=[tf for _, tf in config.stream_targets],
             )
 
             min_interval_map: Dict[str, float] = {}
@@ -5437,9 +6116,39 @@ def main() -> None:
                 enabled=config.tick_aggregation_enabled,
                 symbols=[symbol for symbol, _ in stream_config],
                 max_synth_gap_minutes=config.tick_aggregation_max_synth_gap_minutes,
+                live_publish_min_interval_seconds=config.tick_aggregation_live_publish_interval_seconds,
                 ohlcv_sink=ohlcv_sink,
             )
             tick_ohlcv_worker.start()
+
+            def _on_universe_update(new_targets: List[Tuple[str, str]]) -> None:
+                nonlocal stream_config
+                stream_config = list(new_targets)
+                new_symbols = [symbol for symbol, _ in stream_config]
+                if price_worker is not None:
+                    price_worker.set_symbols(new_symbols)
+                tick_ohlcv_worker.set_symbols(new_symbols)
+                fx_active_inner = fx_holder.get("client")
+                if isinstance(fx_active_inner, ForexConnect):
+                    _refresh_price_subscription(fx_active_inner)
+
+            if config.commands_channel and redis_holder["client"] is not None:
+                commands_worker = FxcmCommandWorker(
+                    redis_client=redis_holder["client"],
+                    fx_holder=fx_holder,
+                    cache_manager=cache_manager,
+                    tick_aggregation_enabled=config.tick_aggregation_enabled,
+                    tick_agg_timeframes=("m1", "m5"),
+                    channel=config.commands_channel,
+                    stream_targets=config.stream_targets,
+                    universe=universe,
+                    backfill_min_minutes=int(config.backfill_min_minutes),
+                    backfill_max_minutes=int(config.backfill_max_minutes),
+                    hmac_secret=config.hmac_secret,
+                    hmac_algo=config.hmac_algo,
+                )
+                commands_worker.start()
+                log.info("S3: FxcmCommandWorker запущено, канал команд: %s", config.commands_channel)
 
             status_bar = ConsoleStatusBar(enabled=True, refresh_per_second=4.0)
             status_bar.start()
@@ -5506,6 +6215,8 @@ def main() -> None:
                     tick_aggregation_enabled=config.tick_aggregation_enabled,
                     tick_aggregation_timeframes=("1m", "5m"),
                     status_bar=status_bar,
+                    universe=universe,
+                    universe_update_callback=_on_universe_update,
                 )
             finally:
                 status_bar.stop()
@@ -5515,6 +6226,8 @@ def main() -> None:
                 if price_worker is not None:
                     price_worker.stop()
                 tick_ohlcv_worker.stop()
+                if commands_worker is not None:
+                    commands_worker.stop()
                 if supervisor is not None:
                     supervisor.stop()
         else:
