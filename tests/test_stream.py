@@ -394,7 +394,7 @@ class TickAggregationIsolationTest(unittest.TestCase):
         connector._LAST_STATUS_PUBLISHED_KEY = None
         connector._LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL.clear()
 
-    def test_tick_aggregation_disables_history_stream_for_m1(self) -> None:
+    def test_tick_aggregation_keeps_history_stream_for_complete_m1(self) -> None:
         fixed_now = dt.datetime(2025, 5, 5, 12, 0, tzinfo=dt.timezone.utc)
         df = _make_sample_df(fixed_now - dt.timedelta(minutes=4), 4)
         fx = FakeForexConnect(df)
@@ -416,13 +416,13 @@ class TickAggregationIsolationTest(unittest.TestCase):
                     tick_aggregation_timeframes=("1m", "5m"),
                 )
 
-        history_mock.assert_not_called()
+        history_mock.assert_called()
         ohlcv_messages = [
             json.loads(payload)
             for channel, payload in redis_client.messages
             if channel == connector.REDIS_CHANNEL
         ]
-        self.assertFalse(ohlcv_messages)
+        self.assertTrue(ohlcv_messages)
 
 
 class MarketStatusSyncTest(unittest.TestCase):
@@ -557,6 +557,269 @@ class PriceSnapshotWorkerTest(unittest.TestCase):
         metadata = worker.snapshot_metadata()
         self.assertEqual(metadata["channel"], "fxcm:test:ticks")
         self.assertTrue(metadata["symbols"])
+
+
+class PublishDataGateFutureCutoffTest(unittest.TestCase):
+    def test_record_publish_ignores_future_timestamps(self) -> None:
+        gate = PublishDataGate()
+        fixed_now = dt.datetime(2025, 12, 15, 13, 0, tzinfo=dt.timezone.utc)
+        now_ms = int(fixed_now.timestamp() * 1000.0)
+        future_open = now_ms + 3_600_000
+        df_future = pd.DataFrame(
+            [
+                {
+                    "open_time": future_open,
+                    "close_time": future_open + 60_000,
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "volume": 1,
+                    "complete": True,
+                }
+            ]
+        )
+
+        with mock.patch("connector._now_utc", return_value=fixed_now):
+            gate.record_publish(df_future, symbol="XAU/USD", timeframe="1m")
+
+        key = ("XAUUSD", "1m")
+        self.assertNotIn(key, gate._last_open)
+        self.assertNotIn(key, gate._last_close)
+
+    def test_filter_new_bars_resets_future_cutoff(self) -> None:
+        gate = PublishDataGate()
+        fixed_now = dt.datetime(2025, 12, 15, 13, 0, tzinfo=dt.timezone.utc)
+        now_ms = int(fixed_now.timestamp() * 1000.0)
+        key = ("XAUUSD", "1m")
+        gate._last_open[key] = now_ms + 3_600_000
+        gate._last_close[key] = now_ms + 3_600_000
+
+        df_valid = pd.DataFrame(
+            [
+                {
+                    "open_time": now_ms - 60_000,
+                    "close_time": now_ms,
+                    "open": 1.0,
+                    "high": 1.1,
+                    "low": 0.9,
+                    "close": 1.0,
+                    "volume": 1,
+                    "complete": True,
+                }
+            ]
+        )
+
+        with mock.patch("connector._now_utc", return_value=fixed_now):
+            filtered = gate.filter_new_bars(df_valid, symbol="XAU/USD", timeframe="1m")
+
+        self.assertFalse(filtered.empty)
+        self.assertNotIn(key, gate._last_open)
+
+    def test_gate_reports_max_last_close_ms(self) -> None:
+        gate = PublishDataGate()
+        now_ms = 1_765_832_100_000
+        df = pd.DataFrame(
+            [
+                {
+                    "open_time": now_ms - 60_000,
+                    "close_time": now_ms,
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "volume": 1,
+                    "complete": True,
+                }
+            ]
+        )
+        gate.record_publish(df, symbol="XAU/USD", timeframe="m1")
+        self.assertEqual(gate.max_last_close_ms([("XAU/USD", "m1")]), now_ms)
+
+
+class TickAggFutureTickSkewTest(unittest.TestCase):
+    def setUp(self) -> None:
+        connector._VOLUME_CALIBRATOR.reset()
+
+    def test_tick_worker_clamps_future_tick_ts_for_aggregation(self) -> None:
+        captured: list[OhlcvBatch] = []
+        worker = connector.TickOhlcvWorker(
+            enabled=True,
+            symbols=["XAU/USD"],
+            max_synth_gap_minutes=0,
+            live_publish_min_interval_seconds=0.0,
+            ohlcv_sink=captured.append,
+        )
+
+        fixed_now_sec = 1_700_000_060.0
+        now_ms = int(fixed_now_sec * 1000)
+        future_tick_sec = fixed_now_sec + 120.0
+        tick = connector.PriceTick(
+            symbol="XAUUSD",
+            bid=2000.0,
+            ask=2000.2,
+            mid=2000.1,
+            tick_ts=future_tick_sec,
+        )
+
+        with mock.patch("connector.time.time", return_value=fixed_now_sec), mock.patch(
+            "connector.time.monotonic", return_value=123.0
+        ):
+            worker._process_tick(tick)  # type: ignore[attr-defined]
+
+        self.assertTrue(captured)
+        last = captured[-1]
+        open_time = int(last.data["open_time"].iloc[0])
+        self.assertLessEqual(open_time, now_ms)
+
+    def test_tick_worker_sets_volume_as_tick_volume(self) -> None:
+        captured: list[OhlcvBatch] = []
+        worker = connector.TickOhlcvWorker(
+            enabled=True,
+            symbols=["XAU/USD"],
+            max_synth_gap_minutes=0,
+            live_publish_min_interval_seconds=0.0,
+            ohlcv_sink=captured.append,
+        )
+
+        fixed_now_sec = 1_700_000_000.0
+        tick1 = connector.PriceTick(
+            symbol="XAUUSD",
+            bid=2000.0,
+            ask=2000.2,
+            mid=2000.1,
+            tick_ts=fixed_now_sec,
+        )
+        tick2 = connector.PriceTick(
+            symbol="XAUUSD",
+            bid=2000.1,
+            ask=2000.3,
+            mid=2000.2,
+            tick_ts=fixed_now_sec + 1.0,
+        )
+
+        with mock.patch("connector.time.time", return_value=fixed_now_sec), mock.patch(
+            "connector.time.monotonic", side_effect=[1.0, 1.5, 2.0, 2.5, 3.0]
+        ):
+            worker._process_tick(tick1)  # type: ignore[attr-defined]
+            worker._process_tick(tick2)  # type: ignore[attr-defined]
+
+        self.assertTrue(captured)
+        last = captured[-1]
+        payload_volume = float(last.data["volume"].iloc[0])
+        payload_ticks = int(last.data["tick_count"].iloc[0])
+        self.assertEqual(payload_ticks, 2)
+        self.assertEqual(payload_volume, 2.0)
+
+    def test_tick_worker_calibrates_preview_volume_from_history(self) -> None:
+        captured: list[OhlcvBatch] = []
+        worker = connector.TickOhlcvWorker(
+            enabled=True,
+            symbols=["XAU/USD"],
+            max_synth_gap_minutes=0,
+            live_publish_min_interval_seconds=0.0,
+            ohlcv_sink=captured.append,
+        )
+
+        # Бар1: 2 тики у 1-й хвилині, потім тик у наступній хвилині закриває бар1.
+        base = 1_700_000_000.0
+        tick1 = connector.PriceTick(
+            symbol="XAUUSD",
+            bid=2000.0,
+            ask=2000.2,
+            mid=2000.1,
+            tick_ts=base + 0.0,
+        )
+        tick2 = connector.PriceTick(
+            symbol="XAUUSD",
+            bid=2000.0,
+            ask=2000.2,
+            mid=2000.1,
+            tick_ts=base + 10.0,
+        )
+        tick3 = connector.PriceTick(
+            symbol="XAUUSD",
+            bid=2000.1,
+            ask=2000.3,
+            mid=2000.2,
+            tick_ts=base + 61.0,
+        )
+
+        with mock.patch("connector.time.monotonic", side_effect=[
+            1.0,
+            1.1,
+            1.2,
+            1.3,
+            1.4,
+            1.5,
+            1.6,
+        ]):
+            with mock.patch("connector.time.time", return_value=base):
+                worker._process_tick(tick1)  # type: ignore[attr-defined]
+                worker._process_tick(tick2)  # type: ignore[attr-defined]
+                worker._process_tick(tick3)  # type: ignore[attr-defined]
+
+        # Обчислюємо open_time першого бару (bucket старт у ms).
+        bar1_open_ms = int(base * 1000) - (int(base * 1000) % 60_000)
+
+        # Калібруємо: history Volume=10 при tick_count=2 → k=5.
+        df_history = pd.DataFrame(
+            [
+                {
+                    "open_time": bar1_open_ms,
+                    "close_time": bar1_open_ms + 60_000 - 1,
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "volume": 10.0,
+                }
+            ]
+        )
+        connector._VOLUME_CALIBRATOR.update_from_history_bar(
+            symbol_norm="XAUUSD",
+            tf_norm="1m",
+            open_time_ms=bar1_open_ms,
+            history_volume=10.0,
+            tick_count=2,
+        )
+
+        # Новий live preview бар (1 тик) має мати volume≈5.0.
+        captured.clear()
+        tick4 = connector.PriceTick(
+            symbol="XAUUSD",
+            bid=2000.2,
+            ask=2000.4,
+            mid=2000.3,
+            tick_ts=base + 62.0,
+        )
+        with mock.patch("connector.time.time", return_value=base + 62.0), mock.patch(
+            "connector.time.monotonic", side_effect=[2.0, 2.1, 2.2]
+        ):
+            worker._process_tick(tick4)  # type: ignore[attr-defined]
+
+        self.assertTrue(captured)
+        last = captured[-1]
+        payload_ticks = int(last.data["tick_count"].iloc[0])
+        payload_volume = float(last.data["volume"].iloc[0])
+        self.assertEqual(payload_ticks, 1)
+        self.assertEqual(payload_volume, 5.0)
+
+
+class NormalizeHistoryDropsIncompleteTest(unittest.TestCase):
+    def test_normalize_history_drops_incomplete_bar_with_future_close_time(self) -> None:
+        # Бар відкривається рівно на межі 5m, але "зараз" лише через 7 секунд.
+        # За нашою формулою close_time буде open+5m-1, тобто у майбутньому → має бути відкинутий.
+        open_dt = dt.datetime(2025, 12, 15, 22, 0, 0, tzinfo=dt.timezone.utc)
+        now_dt = open_dt + dt.timedelta(seconds=7)
+        df_raw = _make_sample_df(open_dt, 1)
+        with mock.patch("connector._now_utc", return_value=now_dt):
+            out = connector._normalize_history_to_ohlcv(  # type: ignore[attr-defined]
+                df_raw,
+                symbol="XAU/USD",
+                timeframe="5m",
+            )
+        self.assertTrue(out.empty)
 
 
 class TickCadenceControllerTest(unittest.TestCase):
@@ -1522,6 +1785,25 @@ class FileOnlyModeTest(unittest.TestCase):
 
         staleness = gate.staleness_seconds(symbol="XAU/USD", timeframe="m1")
         self.assertIsNotNone(staleness)
+
+
+class OfferTimeCoercionTest(unittest.TestCase):
+    def test_offer_time_accepts_epoch_milliseconds(self) -> None:
+        # 2025-12-15T17:20:00Z приблизно
+        epoch_seconds = 1765828800
+        epoch_ms = epoch_seconds * 1000
+
+        dt_from_seconds = connector.FXCMOfferSubscription._coerce_datetime(epoch_seconds)
+        dt_from_ms = connector.FXCMOfferSubscription._coerce_datetime(epoch_ms)
+
+        self.assertIsNotNone(dt_from_seconds)
+        self.assertIsNotNone(dt_from_ms)
+        assert dt_from_seconds is not None
+        assert dt_from_ms is not None
+        self.assertEqual(dt_from_seconds.tzinfo, dt.timezone.utc)
+        self.assertEqual(dt_from_ms.tzinfo, dt.timezone.utc)
+        self.assertEqual(int(dt_from_seconds.timestamp()), epoch_seconds)
+        self.assertEqual(int(dt_from_ms.timestamp()), epoch_seconds)
 
 
 class DataQualityTest(unittest.TestCase):

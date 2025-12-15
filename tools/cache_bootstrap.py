@@ -18,6 +18,10 @@ from typing import List, Optional, Sequence
 import pandas as pd
 from dotenv import load_dotenv
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from config import load_config
 from connector import (
     BackoffController,
@@ -27,9 +31,6 @@ from connector import (
     _normalize_symbol,
     _obtain_fxcm_session,
 )
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
 
 def _forexconnect_available() -> bool:

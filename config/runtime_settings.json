@@ -2,7 +2,7 @@
     "cache": {
         "dir": "cache",
         "max_bars": 3000,
-        "warmup_bars": 1000
+        "warmup_bars": 1600
     },
     "stream": {
         "mode": 1,

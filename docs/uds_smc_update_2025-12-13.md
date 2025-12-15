@@ -340,7 +340,7 @@ redis-cli PUBLISH fxcm:commands "{\"type\":\"fxcm_set_universe\",\"targets\":[{\
 Запустіть утиліту bootstrap (приклад для XAU/USD):
 
 ```powershell
-C:/Aione_projects/fxcm_connector/.venv_fxcm37/Scripts/python.exe tools/cache_bootstrap.py --symbol XAU/USD --timeframes m1 m5 --min-bars 1600
+C:/Aione_projects/fxcm_connector/.venv_fxcm37/Scripts/python.exe -m tools.cache_bootstrap --symbol XAU/USD --timeframes m1 m5 --min-bars 1600
 ```
 
 Для “мінімального старту” замініть `1600` на `300`.

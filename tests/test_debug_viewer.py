@@ -296,6 +296,51 @@ def test_build_price_stream_panel_embeds_special_channels(monkeypatch: pytest.Mo
     assert "Viewer snapshots" in render_str
 
 
+def test_handle_keypress_switches_to_volume_calibration_mode() -> None:
+    state = dv.ViewerState()
+
+    should_quit = dv.handle_keypress("9", state)
+
+    assert should_quit is False
+    assert state.active_mode == dv.DashboardMode.VOLUME_CAL
+
+
+def test_build_volume_calibration_panel_renders_rows() -> None:
+    state = dv.ViewerState()
+    state.last_heartbeat = {
+        "state": "stream",
+        "context": {
+            "tick_agg": {
+                "volume_calibration": {
+                    "EUR/USD": {
+                        "1m": {
+                            "k": 2.5,
+                            "samples": 3,
+                            "last": {
+                                "open_time": 1_700_000_000_000,
+                                "history_volume": 100.0,
+                                "tick_count": 40,
+                                "ratio": 2.5,
+                                "samples": 3,
+                            },
+                        }
+                    }
+                }
+            }
+        },
+    }
+
+    panel = dv.build_volume_calibration_panel(state)
+
+    assert isinstance(panel, Panel)
+    console = Console(record=True, width=140)
+    console.print(panel)
+    render_str = console.export_text()
+    assert "EUR/USD" in render_str
+    assert "1m" in render_str
+    assert "tick_count" in render_str
+
+
 def test_special_channels_panel_shows_price_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     diag = {"publish_counts": {}}
     monkeypatch.setattr(dv, "SUPERVISOR_CHANNELS", ("price",))

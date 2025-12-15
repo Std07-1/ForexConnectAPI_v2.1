@@ -215,7 +215,7 @@ _IDLE_THRESHOLD_OVERRIDES: Dict[str, Tuple[float, float]] = {
 }
 ALERT_SEVERITY_ORDER = {"danger": 0, "warning": 1, "info": 2}
 ALERT_SEVERITY_COLORS = {"danger": "red", "warning": "yellow", "info": "cyan"}
-MENU_TEXT = "[P] пауза  [C] очистити  [Q] вихід  [0] TL  [1] SUM  [2] SES  [3] ALERT  [4] STREAM  [5] PRICE  [6] SUPR  [7] HIST  [8] STAT"
+MENU_TEXT = "[P] пауза  [C] очистити  [Q] вихід  [0] TL  [1] SUM  [2] SES  [3] ALERT  [4] STREAM  [5] PRICE  [6] SUPR  [7] HIST  [8] STAT  [9] VCAL"
 TIMELINE_MATRIX_ROWS = _cfg_int("timeline_matrix_rows", 10, min_value=2)
 TIMELINE_MAX_COLUMNS = _cfg_int("timeline_max_columns", 120, min_value=10)
 _TIMELINE_HISTORY_DEFAULT = max(240, TIMELINE_MATRIX_ROWS * TIMELINE_MAX_COLUMNS * 2)
@@ -319,6 +319,7 @@ class DashboardMode(Enum):
     SUPERVISOR = 6
     HISTORY = 7
     STATS = 8
+    VOLUME_CAL = 9
 
 
 @dataclass
@@ -1235,6 +1236,7 @@ def handle_keypress(key: str, state: ViewerState) -> bool:
         "6": DashboardMode.SUPERVISOR,
         "7": DashboardMode.HISTORY,
         "8": DashboardMode.STATS,
+        "9": DashboardMode.VOLUME_CAL,
     }
     if normalized in mode_map:
         new_mode = mode_map[normalized]
@@ -1606,6 +1608,80 @@ def build_fxcm_diag_panel(state: ViewerState) -> Panel:
         table.add_row(label, str(value))
 
     return Panel(table, title="FXCM diagnostics", border_style="cyan", box=box.ROUNDED)
+
+
+def build_volume_calibration_panel(state: ViewerState) -> Panel:
+    """Відображає калібрування preview volume для tick-agg (mode 9).
+
+    Дані беруться з `heartbeat.context.tick_agg.volume_calibration`.
+    """
+
+    heartbeat = state.last_heartbeat or {}
+    context = heartbeat.get("context") or {}
+    tick_ctx = context.get("tick_agg")
+    if not isinstance(tick_ctx, dict):
+        return Panel(
+            "Очікуємо tick_agg контекст у heartbeat…",
+            title="Калібрування volume (tick_agg → history)",
+            border_style="yellow",
+            box=box.ROUNDED,
+        )
+
+    calibration = tick_ctx.get("volume_calibration")
+    if not isinstance(calibration, dict) or not calibration:
+        return Panel(
+            "Очікуємо volume_calibration у heartbeat.context.tick_agg…",
+            title="Калібрування volume (tick_agg → history)",
+            border_style="yellow",
+            box=box.ROUNDED,
+        )
+
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("Symbol", style="bold", overflow="fold")
+    table.add_column("TF", overflow="fold")
+    table.add_column("k", justify="right", overflow="fold")
+    table.add_column("samples", justify="right", overflow="fold")
+    table.add_column("last_open", overflow="fold")
+    table.add_column("history_vol", justify="right", overflow="fold")
+    table.add_column("tick_count", justify="right", overflow="fold")
+    table.add_column("ratio", justify="right", overflow="fold")
+
+    rows: List[Tuple[str, str, Dict[str, Any]]] = []
+    for symbol, tf_map in calibration.items():
+        if not isinstance(tf_map, dict):
+            continue
+        for tf, payload in tf_map.items():
+            if not isinstance(payload, dict):
+                continue
+            rows.append((str(symbol), str(tf), payload))
+
+    rows.sort(key=lambda item: (item[0], item[1]))
+    for symbol, tf, payload in rows:
+        k = _coerce_float(payload.get("k"))
+        samples = _coerce_int(payload.get("samples"))
+        last_raw = payload.get("last")
+        last: Dict[str, Any] = last_raw if isinstance(last_raw, dict) else {}
+        open_time = last.get("open_time")
+        history_vol = _coerce_float(last.get("history_volume"))
+        tick_count = _coerce_int(last.get("tick_count"))
+        ratio = _coerce_float(last.get("ratio"))
+
+        table.add_row(
+            symbol,
+            tf,
+            _format_float(k, digits=4),
+            "—" if samples is None else str(samples),
+            _format_epoch_ms_compact(open_time),
+            _format_float(history_vol, digits=2),
+            "—" if tick_count is None else str(tick_count),
+            _format_float(ratio, digits=4),
+        )
+
+    hint = Text(
+        "Формула preview: volume ≈ tick_count × k (k=median(history_volume/tick_count)).",
+        style="dim",
+    )
+    return Panel(Group(hint, table), title="Калібрування volume (tick_agg → history)", border_style="cyan", box=box.ROUNDED)
 
 
 def build_s1_stats_panel(state: ViewerState) -> Panel:
@@ -2942,6 +3018,8 @@ def _render_mode_body(state: ViewerState) -> Union[Layout, Panel]:
         layout["history_backoff"].update(build_backoff_panel(state))
         layout["history_quota"].update(build_history_quota_panel(state))
         return layout
+    if mode == DashboardMode.VOLUME_CAL:
+        return build_volume_calibration_panel(state)
     if mode == DashboardMode.STATS:
         layout = Layout(name="stats_mode")
         layout.split_row(

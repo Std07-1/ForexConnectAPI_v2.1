@@ -23,6 +23,7 @@ import random
 import sys
 import threading
 import time
+import statistics
 from collections import defaultdict, deque
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
@@ -145,6 +146,106 @@ from tick_ohlcv import (
 log: Logger = logging.getLogger("fxcm_connector")
 _LOGGING_CONFIGURED = False
 _RICH_CONSOLE: Optional[Console] = None
+
+
+class VolumeCalibrator:
+    """Калібрує tick-agg preview volume під FXCM history volume.
+
+    Мета:
+    - `complete=true` бари публікуються з FXCM history (Volume максимально «реальний»);
+    - `complete=false` preview з tick-agg має виглядати реалістично (масштаб/динаміка),
+      тому оцінюємо `volume ≈ tick_count * k`.
+
+    Обмеження:
+    - Це НЕ біржовий volume (для spot FX його немає в OfferTable).
+    - k оцінюється з пар (history_volume, tick_count) по однаковому open_time.
+    """
+
+    def __init__(self, *, max_samples: int = 50) -> None:
+        self._max_samples = max(5, int(max_samples))
+        self._ratios: Dict[Tuple[str, str], Deque[float]] = {}
+        self._last_debug: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def update_from_history_bar(
+        self,
+        *,
+        symbol_norm: str,
+        tf_norm: str,
+        open_time_ms: int,
+        history_volume: float,
+        tick_count: int,
+    ) -> None:
+        if tick_count <= 0:
+            return
+        if history_volume < 0:
+            return
+        ratio = float(history_volume) / float(tick_count)
+        key = (str(symbol_norm), str(tf_norm))
+        with self._lock:
+            buf = self._ratios.get(key)
+            if buf is None:
+                buf = deque(maxlen=self._max_samples)
+                self._ratios[key] = buf
+            buf.append(ratio)
+            self._last_debug[key] = {
+                "open_time": int(open_time_ms),
+                "history_volume": float(history_volume),
+                "tick_count": int(tick_count),
+                "ratio": float(ratio),
+                "samples": int(len(buf)),
+            }
+
+    def estimate_preview_volume(
+        self,
+        *,
+        symbol_norm: str,
+        tf_norm: str,
+        tick_count: int,
+        fallback: float,
+    ) -> float:
+        if tick_count <= 0:
+            return 0.0
+        key = (str(symbol_norm), str(tf_norm))
+        with self._lock:
+            buf = self._ratios.get(key)
+            if not buf:
+                return float(fallback)
+            try:
+                k = float(statistics.median(list(buf)))
+            except Exception:
+                return float(fallback)
+        return float(tick_count) * float(k)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            ratios = {key: list(values) for key, values in self._ratios.items()}
+            last_debug = dict(self._last_debug)
+        summary: Dict[str, Any] = {}
+        for (symbol, tf), values in ratios.items():
+            if not values:
+                continue
+            try:
+                k = float(statistics.median(values))
+            except Exception:
+                continue
+            sym_map = summary.setdefault(symbol, {})
+            sym_map[tf] = {
+                "k": float(k),
+                "samples": int(len(values)),
+                "last": last_debug.get((symbol, tf)),
+            }
+        return summary
+
+    def reset(self) -> None:
+        """Очищає накопичені семпли (переважно для юніт-тестів)."""
+
+        with self._lock:
+            self._ratios.clear()
+            self._last_debug.clear()
+
+
+_VOLUME_CALIBRATOR = VolumeCalibrator(max_samples=50)
 
 
 def _resolve_connector_version() -> Tuple[str, str]:
@@ -3761,12 +3862,14 @@ class PriceSnapshotWorker:
 
 
 class TickOhlcvWorker:
-    """Агрегує live тики у 1m/5m OHLCV та віддає complete-бари у ohlcv sink.
+    """Агрегує live тики у 1m/5m OHLCV та віддає live-бар у ohlcv sink.
 
     Важливо:
     - Вхідні тики приходять з FXCM OfferTable callback у довільному потоці.
     - Агрегатори НЕ thread-safe, тому обробка іде у власному worker thread через чергу.
-    - У Phase B публікуємо лише `complete=True` бари (live-оновлення не шлемо).
+        - Tick-agg використовується як live preview (`complete=false`).
+        - Фінальні бари (`complete=true`) мають приходити з FXCM history, щоб `volume`
+            був максимально звіряємим/«реальним» для трейдера.
     """
 
     def __init__(
@@ -3790,6 +3893,21 @@ class TickOhlcvWorker:
         self._agg_1m: Dict[str, TickOhlcvAggregator] = {}
         self._agg_5m: Dict[str, OhlcvFromLowerTfAggregator] = {}
 
+        # Якщо tick_ts приходить “у майбутньому” відносно локального time.time(),
+        # tick-agg може будувати bucket-и з end_ms > now_ms, і clock-flush не
+        # зможе закривати бари (симптом: only_live_bars_no_complete).
+        self._max_future_tick_skew_seconds = 5.0
+        self._future_tick_clamps_total = 0
+        self._future_tick_clamps_by_symbol: Dict[str, int] = {}
+        self._last_tick_skew_seconds_by_symbol: Dict[str, float] = {}
+        self._last_complete_close_ms: Dict[Tuple[str, str], int] = {}
+
+        # Для калібрування preview volume: зберігаємо tick_count для закритих барів,
+        # щоб зіставити їх із FXCM history Volume по open_time.
+        self._closed_tick_counts: Dict[Tuple[str, str], Dict[int, int]] = {}
+        self._closed_tick_counts_order: Dict[Tuple[str, str], Deque[int]] = {}
+        self._closed_tick_counts_max = 500
+
         # Live-оновлення (complete=false) у `fxcm:ohlcv` мають бути частими,
         # але не кожен тик. Тримаємо тротлінг на рівні worker-а.
         self._live_publish_min_interval_seconds = max(
@@ -3804,6 +3922,57 @@ class TickOhlcvWorker:
         )
         self._last_clock_flush_monotonic: float = 0.0
         self._last_tick_monotonic: Optional[float] = None
+
+    def snapshot_metadata(self) -> Dict[str, Any]:
+        """Легка діагностика tick-agg для heartbeat/status.
+
+        Мета: швидко зрозуміти, чи tick_ts зсунуті у майбутнє та коли востаннє
+        реально виходили `complete=true` бари.
+        """
+
+        thread_alive = bool(self._thread and self._thread.is_alive())
+        now_monotonic = time.monotonic()
+        tick_age = (
+            None
+            if self._last_tick_monotonic is None
+            else max(0.0, now_monotonic - float(self._last_tick_monotonic))
+        )
+        flush_age = (
+            None
+            if self._last_clock_flush_monotonic <= 0.0
+            else max(0.0, now_monotonic - float(self._last_clock_flush_monotonic))
+        )
+
+        last_complete: Dict[str, Dict[str, int]] = {}
+        for (symbol, tf), close_ms in self._last_complete_close_ms.items():
+            sym_map = last_complete.setdefault(symbol, {})
+            sym_map[str(tf)] = int(close_ms)
+
+        volume_calibration = _VOLUME_CALIBRATOR.snapshot()
+
+        return {
+            "enabled": bool(self._enabled),
+            "thread_alive": thread_alive,
+            "queue_depth": self._queue.qsize(),
+            "last_tick_age_seconds": tick_age,
+            "last_clock_flush_age_seconds": flush_age,
+            "max_future_tick_skew_seconds": float(self._max_future_tick_skew_seconds),
+            "future_tick_clamps_total": int(self._future_tick_clamps_total),
+            "future_tick_clamps_by_symbol": dict(self._future_tick_clamps_by_symbol),
+            "last_tick_skew_seconds_by_symbol": dict(self._last_tick_skew_seconds_by_symbol),
+            "last_complete_close_ms": last_complete,
+            "volume_calibration": volume_calibration,
+        }
+
+    def get_closed_tick_count(
+        self, *, symbol_norm: str, tf_norm: str, open_time_ms: int
+    ) -> Optional[int]:
+        key = (str(symbol_norm), str(tf_norm))
+        mapping = self._closed_tick_counts.get(key)
+        if not mapping:
+            return None
+        value = mapping.get(int(open_time_ms))
+        return int(value) if value is not None else None
 
     def start(self) -> None:
         if not self._enabled:
@@ -3908,6 +4077,9 @@ class TickOhlcvWorker:
             except Exception:  # noqa: BLE001 - flush не має валити worker
                 continue
             for bar in result.closed_bars:
+                # Закриті (complete=True) бари від tick-agg не публікуємо назовні.
+                # Вони використовуються лише як внутрішній тригер/агрегаційна база,
+                # а «авторитетний» complete бар (із реальним Volume) має прийти з FXCM history.
                 self._publish_tick_bar(bar)
                 agg_5m = self._agg_5m.get(symbol)
                 if agg_5m is None:
@@ -3923,6 +4095,10 @@ class TickOhlcvWorker:
         symbol = tick.symbol
         PROM_TICK_AGG_TICKS_TOTAL.labels(symbol=symbol).inc()
         self._last_tick_monotonic = time.monotonic()
+
+        now_sec = time.time()
+        skew_sec = float(tick.tick_ts) - float(now_sec)
+        self._last_tick_skew_seconds_by_symbol[symbol] = float(skew_sec)
         agg_1m = self._agg_1m.get(symbol)
         if agg_1m is None:
             agg_1m = TickOhlcvAggregator(
@@ -3943,13 +4119,25 @@ class TickOhlcvWorker:
             )
             self._agg_5m[symbol] = agg_5m
 
+        tick_ms = int(float(tick.tick_ts) * 1000)
+        now_ms = int(float(now_sec) * 1000)
+        if skew_sec > self._max_future_tick_skew_seconds:
+            tick_ms = now_ms
+            self._future_tick_clamps_total += 1
+            self._future_tick_clamps_by_symbol[symbol] = (
+                self._future_tick_clamps_by_symbol.get(symbol, 0) + 1
+            )
+
         fx_tick = FxcmTick(
             symbol=symbol,
-            ts_ms=int(tick.tick_ts * 1000),
+            ts_ms=int(tick_ms),
             price=float(tick.mid),
             bid=float(tick.bid),
             ask=float(tick.ask),
-            volume=0.0,
+            # Для live stream у нас немає "біржового" обсягу з OfferTable.
+            # Натомість використовуємо tick volume: +1 за кожен прийнятий тик.
+            # Це відповідає інтуїції TradingView/CFD-потоків, де volume часто є "tick volume".
+            volume=1.0,
         )
 
         result_1m = agg_1m.ingest_tick(fx_tick)
@@ -3975,6 +4163,24 @@ class TickOhlcvWorker:
                 return
             self._last_live_publish_ts[key] = now
         else:
+            self._last_complete_close_ms[(str(bar.symbol), str(bar.tf))] = int(bar.end_ms)
+
+            key = (str(bar.symbol), str(bar.tf))
+            open_time = int(getattr(bar, "start_ms", 0) or 0)
+            tick_count = int(getattr(bar, "tick_count", 0) or 0)
+            if open_time > 0 and tick_count >= 0:
+                mapping = self._closed_tick_counts.setdefault(key, {})
+                order = self._closed_tick_counts_order.setdefault(
+                    key, deque(maxlen=self._closed_tick_counts_max)
+                )
+                if open_time not in mapping:
+                    order.append(open_time)
+                mapping[open_time] = tick_count
+                # Підчищаємо найстаріше, щоб dict не ріс.
+                while len(mapping) > self._closed_tick_counts_max and order:
+                    old_open = order.popleft()
+                    mapping.pop(int(old_open), None)
+
             PROM_TICK_AGG_BARS_TOTAL.labels(
                 symbol=str(bar.symbol),
                 tf=str(bar.tf),
@@ -3987,6 +4193,11 @@ class TickOhlcvWorker:
                 ).set(float(getattr(bar, "avg_spread", 0.0) or 0.0))
             except Exception:  # noqa: BLE001 - метрика не критична
                 pass
+
+            # Важливо: complete бари з tick-agg НЕ публікуємо в Redis як фінальні.
+            # Це дозволяє тримати фінальний volume «реальним» (із FXCM history),
+            # а tick-agg використовувати лише як live preview (complete=false).
+            return
         df = pd.DataFrame(
             [
                 {
@@ -3996,8 +4207,15 @@ class TickOhlcvWorker:
                     "high": float(bar.high),
                     "low": float(bar.low),
                     "close": float(bar.close),
-                    "volume": float(bar.volume),
                     "tick_count": int(getattr(bar, "tick_count", 0) or 0),
+                    "volume": float(
+                        _VOLUME_CALIBRATOR.estimate_preview_volume(
+                            symbol_norm=str(bar.symbol),
+                            tf_norm=str(bar.tf),
+                            tick_count=int(getattr(bar, "tick_count", 0) or 0),
+                            fallback=float(bar.volume),
+                        )
+                    ),
                     "bar_range": float(getattr(bar, "bar_range", 0.0) or 0.0),
                     "body_size": float(getattr(bar, "body_size", 0.0) or 0.0),
                     "upper_wick": float(getattr(bar, "upper_wick", 0.0) or 0.0),
@@ -4309,7 +4527,13 @@ class FXCMOfferSubscription:
                 return value.replace(tzinfo=dt.timezone.utc)
             return value
         if isinstance(value, (int, float)):
-            return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc)
+            ts = float(value)
+            # У різних обгортках FXCM час може приходити як epoch-seconds або epoch-milliseconds.
+            # Якщо помилково інтерпретувати ms як seconds, tick_ts стане “далеким майбутнім”,
+            # і tick-agg ніколи не зможе закрити бари по clock-flush.
+            if ts > 10_000_000_000:
+                ts = ts / 1000.0
+            return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
         if isinstance(value, str):
             text = value.strip()
             if not text:
@@ -4344,6 +4568,12 @@ class PublishDataGate:
         self._last_live_publish_ts: Dict[Tuple[str, str], float] = {}
         self._lock = threading.Lock()
 
+        # Захист від “майбутніх” timestamp-ів: якщо один бар/тік прийшов з
+        # некоректним часом, data gate може запам'ятати cutoff у майбутньому і
+        # почати відкидати всі реальні complete=true бари, залишаючи лише live
+        # complete=false оновлення (симптом: only_live_bars_no_complete).
+        self._max_future_ms = 120_000
+
     def _key(self, symbol: str, timeframe: str) -> Tuple[str, str]:
         return (_normalize_symbol(symbol), _map_timeframe_label(timeframe))
 
@@ -4372,6 +4602,20 @@ class PublishDataGate:
             cutoff = self._last_open.get(key)
         if cutoff is None:
             return df
+
+        now_ms = int(_now_utc().timestamp() * 1000.0)
+        if cutoff > now_ms + self._max_future_ms:
+            log.warning(
+                "Data gate: cutoff у майбутньому для %s %s (cutoff=%d, now=%d). Скидаю gate.",
+                key[0],
+                key[1],
+                cutoff,
+                now_ms,
+            )
+            with self._lock:
+                self._last_open.pop(key, None)
+                self._last_close.pop(key, None)
+            return df
         filtered = cast(pd.DataFrame, df.loc[df["open_time"] > cutoff])
         dropped = len(df) - len(filtered)
         if dropped > 0:
@@ -4390,6 +4634,18 @@ class PublishDataGate:
         key = self._key(symbol, timeframe)
         newest_open = int(df["open_time"].max())
         newest_close = int(df["close_time"].max())
+
+        now_ms = int(_now_utc().timestamp() * 1000.0)
+        if newest_open > now_ms + self._max_future_ms or newest_close > now_ms + self._max_future_ms:
+            log.warning(
+                "Data gate: ігнорую оновлення last_open/last_close у майбутньому для %s %s (open=%d close=%d now=%d).",
+                key[0],
+                key[1],
+                newest_open,
+                newest_close,
+                now_ms,
+            )
+            return
         with self._lock:
             self._last_open[key] = newest_open
             self._last_close[key] = newest_close
@@ -4413,6 +4669,24 @@ class PublishDataGate:
         if last_ts is None:
             return None
         return max(0.0, time.time() - float(last_ts))
+
+    def last_close_ms(self, *, symbol: str, timeframe: str) -> Optional[int]:
+        """Останній close_time (ms) для complete=true барів по ключу."""
+
+        key = self._key(symbol, timeframe)
+        with self._lock:
+            value = self._last_close.get(key)
+        return int(value) if value is not None else None
+
+    def max_last_close_ms(self, targets: Sequence[Tuple[str, str]]) -> Optional[int]:
+        """Максимальний close_time (ms) серед заданих stream targets."""
+
+        candidates: List[int] = []
+        for symbol, timeframe in targets:
+            value = self.last_close_ms(symbol=symbol, timeframe=timeframe)
+            if value is not None:
+                candidates.append(int(value))
+        return max(candidates) if candidates else None
 
     def staleness_seconds(self, *, symbol: str, timeframe: str) -> Optional[float]:
         key = self._key(symbol, timeframe)
@@ -4668,20 +4942,31 @@ def _normalize_history_to_ohlcv(
     )
 
     # Відкидаємо бари поза дозволеним вікном (анти-1970 та майбутнє).
+    # Важливо: FXCM history може повернути поточний (ще не закритий) бар.
+    # Оскільки ми синтетично обчислюємо close_time як open_time + tf - 1,
+    # такий бар матиме close_time у майбутньому. Для warmup/cache це шкідливо
+    # (SMC все одно потребує лише complete бари), тож відкидаємо його.
     now_ms = int(_now_utc().timestamp() * 1000)
     max_allowed = now_ms + MAX_FUTURE_DRIFT_SECONDS * 1000
-    valid_mask = (ohlcv["open_time"] >= MIN_ALLOWED_BAR_TIMESTAMP_MS) & (
-        ohlcv["open_time"] <= max_allowed
+    # Для close_time робимо значно жорсткіше вікно: інакше поточний (ще не
+    # закритий) бар пройде валідацію, бо його close_time може бути на хвилини
+    # попереду `now_ms` (особливо для 5m/15m і т.д.).
+    close_max_allowed = now_ms + 10_000
+    valid_mask = (
+        (ohlcv["open_time"] >= MIN_ALLOWED_BAR_TIMESTAMP_MS)
+        & (ohlcv["open_time"] <= max_allowed)
+        & (ohlcv["close_time"] <= close_max_allowed)
     )
     if not valid_mask.all():
         dropped = int(len(ohlcv) - int(valid_mask.sum()))
         log.warning(
-            "Відкинуто %d барів з аномальним timestamp для %s %s (вікно %s → %s).",
+            "Відкинуто %d барів з аномальним timestamp для %s %s (open_time вікно %s → %s; close_time max=%s).",
             dropped,
             symbol,
             timeframe,
             MIN_ALLOWED_BAR_TIMESTAMP_MS,
             max_allowed,
+            close_max_allowed,
         )
         PROM_DROPPED_BARS.labels(symbol=symbol_norm, tf=timeframe).inc(dropped)
         ohlcv = ohlcv.loc[valid_mask]
@@ -5324,6 +5609,20 @@ def _attach_price_stream_context(
         context.setdefault("tick_silence_seconds", silence)
 
 
+def _attach_tick_agg_context(
+    context: Dict[str, Any],
+    tick_ohlcv_worker: Optional["TickOhlcvWorker"],
+) -> None:
+    if tick_ohlcv_worker is None:
+        return
+    try:
+        snapshot = tick_ohlcv_worker.snapshot_metadata()
+    except Exception:  # noqa: BLE001 - діагностика не критична
+        return
+    if snapshot:
+        context["tick_agg"] = snapshot
+
+
 def _attach_supervisor_context(
     context: Dict[str, Any],
     supervisor: Optional["AsyncStreamSupervisor"],
@@ -5396,6 +5695,7 @@ def stream_fx_data(
     status_bar: Optional[ConsoleStatusBar] = None,
     universe: Optional[StreamUniverse] = None,
     universe_update_callback: Optional[Callable[[List[Tuple[str, str]]], None]] = None,
+    tick_ohlcv_worker: Optional["TickOhlcvWorker"] = None,
 ) -> None:
     """Безкінечний цикл стрімінгу OHLCV у Redis.
 
@@ -5633,20 +5933,64 @@ def stream_fx_data(
             else:
                 history_call_attempted = False
                 cadence_allowances: Dict[str, bool] = {}
+                # Якщо tick-agg внутрішньо вже закрив бар, але history ще не
+                # опублікував complete=true (з Volume), форсуємо history poll
+                # якнайшвидше для відповідних таргетів.
+                forced_history_targets: Set[Tuple[str, str]] = set()
+                if tick_ohlcv_worker is not None and tick_aggregation_enabled:
+                    try:
+                        tick_meta = tick_ohlcv_worker.snapshot_metadata()
+                        last_complete = tick_meta.get("last_complete_close_ms")
+                        if isinstance(last_complete, Mapping):
+                            for symbol_raw, tf_raw in config:
+                                tf_norm = _map_timeframe_label(tf_raw)
+                                if tf_norm not in tick_agg_timeframes:
+                                    continue
+                                symbol_norm = _normalize_symbol(symbol_raw)
+                                sym_map = last_complete.get(symbol_norm)
+                                if not isinstance(sym_map, Mapping):
+                                    continue
+                                tick_close_ms = sym_map.get(tf_norm)
+                                if tick_close_ms is None:
+                                    continue
+                                published_close_ms = gate.last_close_ms(
+                                    symbol=symbol_raw, timeframe=tf_raw
+                                )
+                                if (
+                                    published_close_ms is None
+                                    or int(tick_close_ms) > int(published_close_ms)
+                                ):
+                                    forced_history_targets.add((symbol_raw, tf_raw))
+                    except Exception:  # noqa: BLE001
+                        # Діагностика не має ламати стрім.
+                        pass
+
                 if history_paused_by_backoff:
                     idle_reason = "fxcm_backoff"
                 else:
-                    for symbol, tf_raw in config:
+                    # Спочатку пробуємо таргети, де tick-agg уже закрив бар,
+                    # щоб швидше підтягнути complete=true з history.
+                    ordered_targets: List[Tuple[str, str]] = []
+                    if forced_history_targets:
+                        ordered_targets.extend(
+                            [item for item in config if item in forced_history_targets]
+                        )
+                        ordered_targets.extend(
+                            [item for item in config if item not in forced_history_targets]
+                        )
+                    else:
+                        ordered_targets = list(config)
+
+                    for symbol, tf_raw in ordered_targets:
                         tf_norm = _map_timeframe_label(tf_raw)
-                        if tick_aggregation_enabled and tf_norm in tick_agg_timeframes:
-                            # Не змішуємо FXCM history-клини з tick-agg у одному каналі.
-                            continue
                         if tick_cadence is not None:
                             allow_cadence = cadence_allowances.get(tf_norm)
                             if allow_cadence is None:
                                 allow_cadence, _ = tick_cadence.should_poll(tf_norm)
                                 cadence_allowances[tf_norm] = allow_cadence
-                            if not allow_cadence:
+                            # Якщо tick-agg вже закрив бар — cadence не має
+                            # затримувати підтягування history для complete=true.
+                            if not allow_cadence and (symbol, tf_raw) not in forced_history_targets:
                                 continue
                         call_started_ts: Optional[float] = None
                         deny_reason = ""
@@ -5678,6 +6022,13 @@ def stream_fx_data(
                                 continue
                         history_call_attempted = True
                         try:
+                            # Для «форсованих» таргетів не чекаємо publish_interval:
+                            # якщо history вже має complete бар — публікуємо відразу.
+                            min_publish_interval_effective = (
+                                0.0
+                                if (symbol, tf_raw) in forced_history_targets
+                                else publish_interval_seconds
+                            )
                             df_new = _fetch_and_publish_recent(
                                 current_fx,
                                 symbol=symbol,
@@ -5686,7 +6037,7 @@ def stream_fx_data(
                                 lookback_minutes=lookback_minutes,
                                 last_open_time_ms=last_open_time_ms,
                                 data_gate=gate,
-                                min_publish_interval=publish_interval_seconds,
+                                min_publish_interval=min_publish_interval_effective,
                                 publish_rate_limit=publish_rate_limit,
                                 hmac_secret=hmac_secret,
                                 hmac_algo=hmac_algo,
@@ -5734,6 +6085,32 @@ def stream_fx_data(
 
                         if df_new.empty:
                             continue
+
+                        # Калібруємо preview volume під FXCM history: зіставляємо
+                        # history Volume із tick_count з tick-agg (по open_time).
+                        if tick_ohlcv_worker is not None and tick_aggregation_enabled:
+                            try:
+                                symbol_norm = _normalize_symbol(symbol)
+                                tf_norm = _map_timeframe_label(tf_raw)
+                                for row in df_new.itertuples(index=False):
+                                    open_time = int(getattr(row, "open_time"))
+                                    history_volume = float(getattr(row, "volume"))
+                                    tick_count = tick_ohlcv_worker.get_closed_tick_count(
+                                        symbol_norm=symbol_norm,
+                                        tf_norm=tf_norm,
+                                        open_time_ms=open_time,
+                                    )
+                                    if tick_count is None:
+                                        continue
+                                    _VOLUME_CALIBRATOR.update_from_history_bar(
+                                        symbol_norm=symbol_norm,
+                                        tf_norm=tf_norm,
+                                        open_time_ms=open_time,
+                                        history_volume=history_volume,
+                                        tick_count=int(tick_count),
+                                    )
+                            except Exception:  # noqa: BLE001
+                                pass
 
                         log.info(
                             "Стрім: %s %s → %d нових барів",
@@ -5812,7 +6189,13 @@ def stream_fx_data(
                         next_open.isoformat() if next_open else "невідомо",
                     )
                 PROM_NEXT_OPEN_SECONDS.set(seconds_to_open)
-                lag_seconds = _calc_lag_seconds(last_published_close_ms)
+                gate_last_close_ms = gate.max_last_close_ms(config)
+                effective_last_close_ms = (
+                    gate_last_close_ms
+                    if gate_last_close_ms is not None
+                    else last_published_close_ms
+                )
+                lag_seconds = _calc_lag_seconds(effective_last_close_ms)
                 idle_context: Dict[str, Any] = {
                     "channel": heartbeat_channel,
                     "mode": "idle",
@@ -5858,6 +6241,7 @@ def stream_fx_data(
                     metadata=price_stream_metadata,
                     cadence_snapshot=cadence_snapshot,
                 )
+                _attach_tick_agg_context(idle_context, tick_ohlcv_worker)
                 _attach_supervisor_context(idle_context, async_supervisor)
                 _attach_history_quota_context(idle_context, history_quota)
                 if history_paused_by_backoff and history_backoff_remaining > 0.0:
@@ -5885,7 +6269,7 @@ def stream_fx_data(
                 )
                 _emit_heartbeat_event(
                     state="idle",
-                    last_bar_close_ms=last_published_close_ms,
+                    last_bar_close_ms=effective_last_close_ms,
                     next_open=next_open,
                     sleep_seconds=planned_sleep,
                     context=idle_context,
@@ -5893,7 +6277,13 @@ def stream_fx_data(
                 gate.update_staleness_metrics()
                 sleep_for = max(0.0, planned_sleep)
             else:
-                lag_seconds = _calc_lag_seconds(last_published_close_ms)
+                gate_last_close_ms = gate.max_last_close_ms(config)
+                effective_last_close_ms = (
+                    gate_last_close_ms
+                    if gate_last_close_ms is not None
+                    else last_published_close_ms
+                )
+                lag_seconds = _calc_lag_seconds(effective_last_close_ms)
                 stream_context: Dict[str, Any] = {
                     "channel": heartbeat_channel,
                     "mode": "stream",
@@ -5937,6 +6327,7 @@ def stream_fx_data(
                     metadata=price_stream_metadata,
                     cadence_snapshot=cadence_snapshot,
                 )
+                _attach_tick_agg_context(stream_context, tick_ohlcv_worker)
                 _attach_supervisor_context(stream_context, async_supervisor)
                 _attach_history_quota_context(stream_context, history_quota)
                 if history_paused_by_backoff and history_backoff_remaining > 0.0:
@@ -5971,7 +6362,7 @@ def stream_fx_data(
                     sleep_for = 0.2
                 _emit_heartbeat_event(
                     state="stream",
-                    last_bar_close_ms=last_published_close_ms,
+                    last_bar_close_ms=effective_last_close_ms,
                     sleep_seconds=sleep_for,
                     context=stream_context,
                 )
@@ -6429,6 +6820,7 @@ def main() -> None:
                     status_bar=status_bar,
                     universe=universe,
                     universe_update_callback=_on_universe_update,
+                    tick_ohlcv_worker=tick_ohlcv_worker,
                 )
             finally:
                 status_bar.stop()
