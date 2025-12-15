@@ -677,6 +677,17 @@ PROM_STREAM_LAST_CLOSE_MS = Gauge(
     "Unix epoch (ms) close_time останнього опублікованого бару",
     ["symbol", "tf"],
 )
+
+PROM_OHLCV_COMPLETE_LAST_TS_SECONDS = Gauge(
+    "fxcm_ohlcv_complete_last_ts_seconds",
+    "UNIX-час (seconds) останньої публікації complete=true бару",
+    ["symbol", "tf"],
+)
+PROM_OHLCV_LIVE_LAST_TS_SECONDS = Gauge(
+    "fxcm_ohlcv_live_last_ts_seconds",
+    "UNIX-час (seconds) останньої публікації live complete=false бару",
+    ["symbol", "tf"],
+)
 PROM_ERROR_COUNTER = Counter(
     "fxcm_connector_errors_total",
     "Кількість помилок FXCM/Redis",
@@ -728,6 +739,20 @@ PROM_COMMANDS_TOTAL = Counter(
 PROM_COMMANDS_LAST_TS_SECONDS = Gauge(
     "fxcm_commands_last_ts_seconds",
     "UNIX-час (seconds) останньої обробленої команди з `fxcm:commands`",
+)
+
+PROM_UNIVERSE_APPLY_TOTAL = Counter(
+    "fxcm_universe_apply_total",
+    "Скільки разів конектор застосував dynamic universe оновлення",
+    ["result"],
+)
+PROM_UNIVERSE_ACTIVE_SYMBOLS = Gauge(
+    "fxcm_universe_active_symbols",
+    "Кількість активних символів у universe (symbols)",
+)
+PROM_UNIVERSE_LAST_APPLY_TS_SECONDS = Gauge(
+    "fxcm_universe_last_apply_ts_seconds",
+    "UNIX-час (seconds) останнього успішного apply universe",
 )
 
 
@@ -2019,9 +2044,15 @@ def _derive_ohlcv_status(
                         lag_candidates.append(value)
             if lag_candidates:
                 lag_seconds = max(lag_candidates)
+    live_age = _float_or_none(context.get("ohlcv_live_age_seconds"))
     if lag_seconds is None:
         return "ok"
     if lag_seconds >= STATUS_OHLCV_DOWN_SECONDS:
+        # Якщо complete-бари не виходять, але live complete=false оновлення є —
+        # це не повний down, а радше partial/delayed стан (downstream все одно
+        # може стояти, але причина інша).
+        if live_age is not None and live_age <= 5.0:
+            return "delayed"
         return "down"
     if lag_seconds >= STATUS_OHLCV_DELAYED_SECONDS:
         return "delayed"
@@ -2051,6 +2082,16 @@ def _derive_status_note(
         if isinstance(session_block, Mapping):
             return _float_or_none(session_block.get("seconds_to_next_open"))
         return None
+
+    live_age = _float_or_none(context.get("ohlcv_live_age_seconds"))
+    if (
+        process_state == "stream"
+        and price_state == "ok"
+        and ohlcv_state in {"delayed", "down"}
+        and live_age is not None
+        and live_age <= 5.0
+    ):
+        return "only_live_bars_no_complete"
 
     if process_state in {"idle", "sleep"} and session_state_detail == "weekend":
         next_open_seconds = _resolve_next_open_seconds()
@@ -3756,6 +3797,14 @@ class TickOhlcvWorker:
         )
         self._last_live_publish_ts: Dict[Tuple[str, str], float] = {}
 
+        # Clock-flush: закриваємо бари по часу, навіть якщо немає тика у наступному bucket.
+        # Інтервал робимо помірним (200–1000мс), щоб не забивати CPU.
+        self._clock_flush_interval_seconds = min(
+            1.0, max(0.2, float(self._live_publish_min_interval_seconds))
+        )
+        self._last_clock_flush_monotonic: float = 0.0
+        self._last_tick_monotonic: Optional[float] = None
+
     def start(self) -> None:
         if not self._enabled:
             return
@@ -3826,12 +3875,54 @@ class TickOhlcvWorker:
                     self._process_tick(tick)
                 finally:
                     self._queue.task_done()
+            self._maybe_clock_flush()
             if not drained:
                 self._stop.wait(0.1)
+
+    def _maybe_clock_flush(self) -> None:
+        if not self._enabled:
+            return
+        if not self._agg_1m:
+            return
+        now_monotonic = time.monotonic()
+        if (
+            self._last_clock_flush_monotonic > 0.0
+            and now_monotonic - self._last_clock_flush_monotonic
+            < self._clock_flush_interval_seconds
+        ):
+            return
+
+        calendar_open = is_trading_time(_now_utc())
+        ticks_recent = (
+            self._last_tick_monotonic is not None
+            and now_monotonic - self._last_tick_monotonic <= 10.0
+        )
+        if not calendar_open and not ticks_recent:
+            return
+
+        self._last_clock_flush_monotonic = now_monotonic
+        now_ms = int(time.time() * 1000)
+        for symbol, agg_1m in list(self._agg_1m.items()):
+            try:
+                result = agg_1m.flush_until(now_ms)
+            except Exception:  # noqa: BLE001 - flush не має валити worker
+                continue
+            for bar in result.closed_bars:
+                self._publish_tick_bar(bar)
+                agg_5m = self._agg_5m.get(symbol)
+                if agg_5m is None:
+                    continue
+                try:
+                    result_5m = agg_5m.ingest_bar(bar)
+                except Exception:  # noqa: BLE001
+                    continue
+                for higher_bar in result_5m.closed_bars:
+                    self._publish_tick_bar(higher_bar)
 
     def _process_tick(self, tick: PriceTick) -> None:
         symbol = tick.symbol
         PROM_TICK_AGG_TICKS_TOTAL.labels(symbol=symbol).inc()
+        self._last_tick_monotonic = time.monotonic()
         agg_1m = self._agg_1m.get(symbol)
         if agg_1m is None:
             agg_1m = TickOhlcvAggregator(
@@ -4250,6 +4341,7 @@ class PublishDataGate:
     def __init__(self) -> None:
         self._last_open: Dict[Tuple[str, str], int] = {}
         self._last_close: Dict[Tuple[str, str], int] = {}
+        self._last_live_publish_ts: Dict[Tuple[str, str], float] = {}
         self._lock = threading.Lock()
 
     def _key(self, symbol: str, timeframe: str) -> Tuple[str, str]:
@@ -4302,6 +4394,25 @@ class PublishDataGate:
             self._last_open[key] = newest_open
             self._last_close[key] = newest_close
         self._update_staleness_metric_for_key(key)
+
+    def record_live_publish(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        published_ts_seconds: float,
+    ) -> None:
+        key = self._key(symbol, timeframe)
+        with self._lock:
+            self._last_live_publish_ts[key] = float(published_ts_seconds)
+
+    def live_age_seconds(self, *, symbol: str, timeframe: str) -> Optional[float]:
+        key = self._key(symbol, timeframe)
+        with self._lock:
+            last_ts = self._last_live_publish_ts.get(key)
+        if last_ts is None:
+            return None
+        return max(0.0, time.time() - float(last_ts))
 
     def staleness_seconds(self, *, symbol: str, timeframe: str) -> Optional[float]:
         key = self._key(symbol, timeframe)
@@ -4481,6 +4592,9 @@ def _stream_targets_summary(
             staleness = gate.staleness_seconds(symbol=symbol, timeframe=tf_raw)
             if staleness is not None:
                 entry["staleness_seconds"] = staleness
+            live_age = gate.live_age_seconds(symbol=symbol, timeframe=tf_raw)
+            if live_age is not None:
+                entry["live_age_seconds"] = live_age
         summary.append(entry)
     return summary
 
@@ -4659,12 +4773,29 @@ def publish_ohlcv_to_redis(
 
     df_to_publish = df_ohlcv
     if data_gate is not None:
-        df_to_publish = data_gate.filter_new_bars(
-            df_ohlcv, symbol=symbol, timeframe=timeframe
-        )
-        if df_to_publish.empty:
-            log.debug("Data gate: немає нових барів для %s %s.", symbol, timeframe)
-            return False
+        # Важливо для live complete=false:
+        # - data gate трекає `open_time` і відкидає повтори;
+        # - live-бар багато разів оновлюється з тим самим open_time;
+        # - downstream (UDS/SMC) все одно ігнорує complete=false, але ці бари
+        #   критичні для діагностики та UI.
+        # Тому gate застосовуємо лише до complete-блоків.
+        if "complete" in df_to_publish.columns:
+            df_complete = cast(pd.DataFrame, df_to_publish.loc[df_to_publish["complete"] == True])
+            df_live = cast(pd.DataFrame, df_to_publish.loc[df_to_publish["complete"] == False])
+            df_complete_filtered = data_gate.filter_new_bars(
+                df_complete, symbol=symbol, timeframe=timeframe
+            )
+            if df_complete_filtered.empty and df_live.empty:
+                log.debug("Data gate: немає нових барів для %s %s.", symbol, timeframe)
+                return False
+            df_to_publish = pd.concat([df_complete_filtered, df_live], ignore_index=True)
+        else:
+            df_to_publish = data_gate.filter_new_bars(
+                df_to_publish, symbol=symbol, timeframe=timeframe
+            )
+            if df_to_publish.empty:
+                log.debug("Data gate: немає нових барів для %s %s.", symbol, timeframe)
+                return False
 
     base_cols = [
         "open_time",
@@ -4789,13 +4920,49 @@ def publish_ohlcv_to_redis(
         )
         PROM_BARS_PUBLISHED.labels(symbol=symbol_norm, tf=timeframe).inc(len(bars))
         if bars:
-            last_close_sec = bars[-1]["close_time"] / 1000.0
-            lag = max(0.0, _now_utc().timestamp() - last_close_sec)
-            PROM_STREAM_LAG_SECONDS.labels(symbol=symbol_norm, tf=timeframe).set(lag)
-            if data_gate is not None:
-                data_gate.record_publish(
-                    df_to_publish, symbol=symbol, timeframe=timeframe
+            now_publish_ts = time.time()
+            # Метрики/стан мають відображати реальність:
+            # - staleness/last_close_ms/lag — тільки по complete=true барах;
+            # - live complete=false — окремо, для діагностики.
+            if "complete" in df_to_publish.columns:
+                df_complete_only = cast(
+                    pd.DataFrame, df_to_publish.loc[df_to_publish["complete"] == True]
                 )
+                df_live_only = cast(
+                    pd.DataFrame, df_to_publish.loc[df_to_publish["complete"] == False]
+                )
+                if not df_live_only.empty:
+                    PROM_OHLCV_LIVE_LAST_TS_SECONDS.labels(
+                        symbol=symbol_norm, tf=timeframe
+                    ).set(now_publish_ts)
+                    if data_gate is not None:
+                        data_gate.record_live_publish(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            published_ts_seconds=now_publish_ts,
+                        )
+                if not df_complete_only.empty:
+                    last_close_sec = float(df_complete_only["close_time"].max()) / 1000.0
+                    lag = max(0.0, _now_utc().timestamp() - last_close_sec)
+                    PROM_STREAM_LAG_SECONDS.labels(symbol=symbol_norm, tf=timeframe).set(lag)
+                    PROM_OHLCV_COMPLETE_LAST_TS_SECONDS.labels(
+                        symbol=symbol_norm, tf=timeframe
+                    ).set(now_publish_ts)
+                    if data_gate is not None:
+                        data_gate.record_publish(
+                            df_complete_only, symbol=symbol, timeframe=timeframe
+                        )
+            else:
+                last_close_sec = bars[-1]["close_time"] / 1000.0
+                lag = max(0.0, _now_utc().timestamp() - last_close_sec)
+                PROM_STREAM_LAG_SECONDS.labels(symbol=symbol_norm, tf=timeframe).set(lag)
+                PROM_OHLCV_COMPLETE_LAST_TS_SECONDS.labels(
+                    symbol=symbol_norm, tf=timeframe
+                ).set(now_publish_ts)
+                if data_gate is not None:
+                    data_gate.record_publish(
+                        df_to_publish, symbol=symbol, timeframe=timeframe
+                    )
         return True
     except Exception as exc:  # noqa: BLE001
         raise RedisRetryableError("Не вдалося надіслати OHLCV у Redis") from exc
@@ -5335,6 +5502,9 @@ def stream_fx_data(
     publish_rate_limit: Dict[Tuple[str, str], float] = {}
     throttle_log_state: Dict[Tuple[str, str, str], float] = {}
 
+    universe_active_symbols_count: Optional[int] = None
+    universe_last_apply_ts: Optional[float] = None
+
     tick_agg_timeframes: Set[str] = set()
     if tick_aggregation_enabled:
         if tick_aggregation_timeframes:
@@ -5396,8 +5566,20 @@ def stream_fx_data(
                     config = universe.get_effective_targets()
                     if universe_update_callback is not None:
                         universe_update_callback(list(config))
+                    universe_active_symbols_count = len(
+                        {str(sym) for sym, _ in config if sym}
+                    )
+                    universe_last_apply_ts = time.time()
+                    PROM_UNIVERSE_APPLY_TOTAL.labels(result="ok").inc()
+                    PROM_UNIVERSE_ACTIVE_SYMBOLS.set(
+                        float(universe_active_symbols_count)
+                    )
+                    PROM_UNIVERSE_LAST_APPLY_TS_SECONDS.set(
+                        float(universe_last_apply_ts)
+                    )
                 except Exception:  # noqa: BLE001
                     log.exception("Dynamic universe: не вдалося застосувати оновлення")
+                    PROM_UNIVERSE_APPLY_TOTAL.labels(result="error").inc()
 
             cycle_start = time.monotonic()
             restart_cycle = False
@@ -5650,6 +5832,21 @@ def stream_fx_data(
                     "published_bars": cycle_published_bars,
                     "cache_enabled": cache_manager is not None,
                 }
+                targets_view = idle_context.get("stream_targets")
+                if isinstance(targets_view, list):
+                    live_ages = [
+                        _float_or_none(entry.get("live_age_seconds"))
+                        for entry in targets_view
+                        if isinstance(entry, Mapping)
+                    ]
+                    live_ages = [value for value in live_ages if value is not None]
+                    if live_ages:
+                        idle_context["ohlcv_live_age_seconds"] = float(min(live_ages))
+                if universe_active_symbols_count is not None:
+                    idle_context["universe"] = {
+                        "active_symbols_count": universe_active_symbols_count,
+                        "last_apply_ts": universe_last_apply_ts,
+                    }
                 if cadence_snapshot:
                     idle_context["tick_cadence"] = cadence_snapshot
                     idle_context["history_state"] = cadence_snapshot.get(
@@ -5714,6 +5911,21 @@ def stream_fx_data(
                     "published_bars": cycle_published_bars,
                     "cache_enabled": cache_manager is not None,
                 }
+                targets_view = stream_context.get("stream_targets")
+                if isinstance(targets_view, list):
+                    live_ages = [
+                        _float_or_none(entry.get("live_age_seconds"))
+                        for entry in targets_view
+                        if isinstance(entry, Mapping)
+                    ]
+                    live_ages = [value for value in live_ages if value is not None]
+                    if live_ages:
+                        stream_context["ohlcv_live_age_seconds"] = float(min(live_ages))
+                if universe_active_symbols_count is not None:
+                    stream_context["universe"] = {
+                        "active_symbols_count": universe_active_symbols_count,
+                        "last_apply_ts": universe_last_apply_ts,
+                    }
                 if cadence_snapshot:
                     stream_context["tick_cadence"] = cadence_snapshot
                     stream_context["history_state"] = cadence_snapshot.get(

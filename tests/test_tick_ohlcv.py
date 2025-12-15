@@ -117,6 +117,27 @@ class TestTickOhlcvAggregator1m:
         assert closed.close == 200.0
         assert closed.volume == 4.0
 
+    def test_clock_flush_closes_bar_without_rollover_tick(self) -> None:
+        # Якщо немає тика у наступному bucket, бар все одно має закриватися по часу.
+        # Це критично для downstream, який ігнорує complete=false.
+        aggregator = TickOhlcvAggregator("XAUUSD", tf_seconds=60)
+
+        r1 = aggregator.ingest_tick(make_tick_at(minute=0, second=10, price=100.0))
+        assert r1.live_bar is not None
+        assert r1.live_bar.complete is False
+
+        # Час перейшов межу 1-ї хвилини (60_000 ms), але нового тика немає.
+        flushed = aggregator.flush_until(MINUTE_MS)
+        assert len(flushed.closed_bars) == 1
+        closed = flushed.closed_bars[0]
+        assert closed.complete is True
+        assert closed.start_ms == 0
+        assert closed.end_ms == MINUTE_MS
+        assert closed.open == 100.0
+        assert closed.high == 100.0
+        assert closed.low == 100.0
+        assert closed.close == 100.0
+
     def test_microstructure_fields_tick_count_spread_and_geometry(self) -> None:
         aggregator = TickOhlcvAggregator("XAUUSD", tf_seconds=60)
 

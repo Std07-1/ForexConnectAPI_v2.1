@@ -1602,6 +1602,49 @@ class DataQualityTest(unittest.TestCase):
         )
         self.assertFalse(second)
         self.assertEqual(len(redis_client.messages), published_before)
+    def test_publish_data_gate_does_not_block_live_incomplete_bars(self) -> None:
+        redis_client = FakeRedis()
+        gate = PublishDataGate()
+
+        # Одна й та сама «жива» хвилина може публікуватися багато разів (complete=false).
+        # Data gate не має блокувати такі дублікати, інакше UI/діагностика втрачаються.
+        df_live = pd.DataFrame(
+            [
+                {
+                    "open_time": 0,
+                    "close_time": 60_000,
+                    "open": 100.0,
+                    "high": 100.0,
+                    "low": 100.0,
+                    "close": 100.0,
+                    "volume": 0.0,
+                    "complete": False,
+                    "synthetic": False,
+                    "source": "tick_agg",
+                    "tf": "1m",
+                }
+            ]
+        )
+
+        first = publish_ohlcv_to_redis(
+            df_live,
+            symbol="XAU/USD",
+            timeframe="1m",
+            redis_client=redis_client,
+            data_gate=gate,
+        )
+        self.assertTrue(first)
+        published_before = len(redis_client.messages)
+
+        second = publish_ohlcv_to_redis(
+            df_live,
+            symbol="XAU/USD",
+            timeframe="1m",
+            redis_client=redis_client,
+            data_gate=gate,
+        )
+        self.assertTrue(second)
+        self.assertEqual(len(redis_client.messages), published_before + 1)
 
 
 class HMACTest(unittest.TestCase):

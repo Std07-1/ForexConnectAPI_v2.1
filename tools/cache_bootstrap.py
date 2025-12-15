@@ -105,6 +105,15 @@ def _parse_args() -> argparse.Namespace:
         help="Тривалість вікон у днях для додаткових CSV",
     )
     parser.add_argument(
+        "--min-bars",
+        type=int,
+        default=0,
+        help=(
+            "Мінімальна кількість барів, яку має містити кеш після ensure_ready. "
+            "Якщо менше — скрипт завершується з кодом 2 (корисно для bootstrap SMC)."
+        ),
+    )
+    parser.add_argument(
         "--export-dir",
         default=None,
         help="Кастомний шлях для CSV; дефолт cache/exports",
@@ -198,9 +207,12 @@ def main() -> None:
         config.cache.warmup_bars,
     )
 
+    min_bars_required = max(0, int(args.min_bars or 0))
+
     backoff = BackoffController(config.backoff.fxcm_login)
     fx_client = _obtain_fxcm_session(config, backoff)
     symbol_norm = _normalize_symbol(args.symbol)
+    missing_min_bars = False
     try:
         for tf_raw in timeframes:
             logger.info("Завантажуємо історію для %s %s", args.symbol, tf_raw)
@@ -219,6 +231,19 @@ def main() -> None:
                     df_cache["open_time"].min(),
                     df_cache["open_time"].max(),
                 )
+
+            if min_bars_required > 0:
+                cached_bars = int(len(df_cache))
+                if cached_bars < min_bars_required:
+                    missing_min_bars = True
+                    logger.error(
+                        "Недостатньо історії для bootstrap: %s %s має лише %d барів, потрібно мінімум %d.",
+                        symbol_norm,
+                        tf_norm,
+                        cached_bars,
+                        min_bars_required,
+                    )
+
             _export_windows(
                 df_cache,
                 export_root=export_root,
@@ -228,6 +253,13 @@ def main() -> None:
             )
     finally:
         _close_fxcm_session(fx_client)
+
+    if missing_min_bars:
+        logger.error(
+            "Bootstrap не пройшов: кеш не набрав мінімум %d барів для всіх TF.",
+            min_bars_required,
+        )
+        sys.exit(2)
 
     logger.info(
         "Кеш готовий: символ %s, TF %s, вікна %s днів",

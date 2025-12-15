@@ -243,6 +243,52 @@ class TickOhlcvAggregator:
         live_bar = self.current_bar.to_ohlcv(self.tf_label, self.source, False)
         return AggregationResult(closed, live_bar)
 
+    def flush_until(self, now_ms: int, *, grace_ms: int = 0) -> AggregationResult:
+        """Примусово закриває бари за часом, навіть якщо не прийшов rollover-тик.
+
+        Навіщо:
+        - У реальному стрімі може бути тиша (дірчасті тики, залипання підписки).
+        - Якщо бар стає complete лише при першому тіку наступного bucket —
+          downstream (UDS/SMC) може «зависати», бо бачить лише complete=false.
+
+        Правила:
+        - Якщо `now_ms < end_ms + grace_ms` — нічого не закриваємо, повертаємо live.
+        - Якщо час перейшов межу поточного bucket — закриваємо current bar.
+        - Якщо проміжок між `last_end_ms` та поточним `now_bucket_start` малий,
+          можемо заповнити gap synthetic flat-ланцюжком (в межах max_synthetic_gap_minutes).
+        - Новий current bar не стартуємо без реального тика (мінімізуємо ризик фейкових live).
+        """
+
+        if self.current_bar is None:
+            return AggregationResult([], None)
+
+        now_ms_int = int(now_ms)
+        grace_ms_int = max(0, int(grace_ms))
+        if now_ms_int < self.current_bar.end_ms + grace_ms_int:
+            return AggregationResult(
+                [], self.current_bar.to_ohlcv(self.tf_label, self.source, False)
+            )
+
+        closed: list[OhlcvBar] = []
+        closed.append(self._close_current_bar())
+
+        # Якщо час пішов далі, ніж просто закриття поточного бару, можемо
+        # (обмежено) добудувати synthetic gap-бари. Важливо: bucket семантика
+        # `[start, end)`, тому для стабільності беремо `now_ms-1`.
+        last_close = float(closed[-1].close)
+        last_end_ms = int(closed[-1].end_ms)
+        safe_now = max(0, now_ms_int - 1)
+        now_bucket_start = _bucket_start(safe_now, self.tf_ms)
+        if now_bucket_start > last_end_ms:
+            closed.extend(
+                self._fill_synthetic_gap(
+                    last_end_ms=last_end_ms,
+                    next_bucket_start=now_bucket_start,
+                    last_price=last_close,
+                )
+            )
+        return AggregationResult(closed, None)
+
     def _start_new_bar(self, bucket_start: int, tick: FxcmTick) -> CurrentBar:
         spread = _tick_spread(tick)
         bar = CurrentBar(
