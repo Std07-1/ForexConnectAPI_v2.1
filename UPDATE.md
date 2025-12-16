@@ -22,4 +22,10 @@
 - History→OHLCV нормалізація: додано фільтр по `close_time` (майбутнє) — поточні незакриті бари з FXCM history відкидаються, щоб не спамити WARNING у `PublishDataGate` під час warmup/cache.
 - Tick-agg: `volume` у live-превʼю (`complete=false`) рахується як tick volume (1.0 за кожен прийнятий тик), а закриті бари (`complete=true`) з tick-agg не публікуються назовні. Коли tick-agg внутрішньо закриває бар, стрім форсує FXCM history poll для відповідного `(symbol, tf)` (без очікування `publish_interval_seconds`), щоб якнайшвидше опублікувати complete=true свічку з «реальним» `Volume`.
 - Tick-agg: додано калібрування preview-обсягу під FXCM history (`volume ≈ tick_count * k`, де `k` оцінюється по зіставлених барах з однаковим `open_time`). У heartbeat `context.tick_agg.volume_calibration` видно поточний `k`, кількість семплів та останню пару (history_volume vs tick_count).
-- Debug viewer: додано режим `[9] VCAL`, який показує `heartbeat.context.tick_agg.volume_calibration` у вигляді таблиці (k, samples, остання пара history_volume/tick_count/ratio), щоб моніторити калібрування в реальному часі.
+- Debug viewer: додано режим `[9] VCAL`, який показує `heartbeat.context.tick_agg.volume_calibration` у вигляді таблиці (k, samples, остання пара history_volume/tick_count/ratio), а також короткі індикатори heartbeat/tick-agg (ts/age, tick age, clock flush age), щоб було видно чи UI реально оновлюється.
+- Логи history→OHLCV: зменшено шум — відкидання поточного незакритого бару (close_time у майбутньому) тепер логиться як `DEBUG` з рейт-лімітом, а `WARNING` лишається лише для справжніх аномалій `open_time`.
+
+## v2.4 (2025-12-16)
+
+- `fxcm:status`: у блоці `session` додано `symbols` з per-(Symbol, TF) статистикою `High/Low/Avg` (те саме, що показує debug viewer у режимі Session), щоб консьюмери могли читати ці значення напряму зі статус-каналу.
+- `fxcm_schema.py`: оновлено TypedDict-контракти для `fxcm:status.session.symbols` та додано runtime-валідацію `validate_status_payload_contract` + контрактний тест.

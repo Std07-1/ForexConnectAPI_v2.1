@@ -1636,6 +1636,17 @@ def build_volume_calibration_panel(state: ViewerState) -> Panel:
             box=box.ROUNDED,
         )
 
+    info = Table.grid(padding=(0, 1))
+    info.add_column(style="bold cyan", justify="right", overflow="fold")
+    info.add_column(overflow="fold")
+    info.add_row("Heartbeat ts", _format_diag_timestamp((state.last_heartbeat or {}).get("ts")))
+    hb_age = state.heartbeat_age()
+    info.add_row("Heartbeat age", "—" if hb_age is None else _format_duration(hb_age))
+    info.add_row("Tick-agg enabled", _format_bool(tick_ctx.get("enabled")))
+    info.add_row("Tick-agg thread", _format_bool(tick_ctx.get("thread_alive")))
+    info.add_row("Tick age", _format_diag_duration(tick_ctx.get("last_tick_age_seconds")))
+    info.add_row("Clock flush age", _format_diag_duration(tick_ctx.get("last_clock_flush_age_seconds")))
+
     table = Table(box=box.SIMPLE_HEAVY, expand=True)
     table.add_column("Symbol", style="bold", overflow="fold")
     table.add_column("TF", overflow="fold")
@@ -1678,10 +1689,11 @@ def build_volume_calibration_panel(state: ViewerState) -> Panel:
         )
 
     hint = Text(
-        "Формула preview: volume ≈ tick_count × k (k=median(history_volume/tick_count)).",
+        "Формула preview: volume ≈ tick_count × k (k=median(history_volume/tick_count)).\n"
+        "k оновлюється лише коли приходить новий complete бар із FXCM history і є tick_count для того ж open_time.",
         style="dim",
     )
-    return Panel(Group(hint, table), title="Калібрування volume (tick_agg → history)", border_style="cyan", box=box.ROUNDED)
+    return Panel(Group(hint, info, table), title="Калібрування volume (tick_agg → history)", border_style="cyan", box=box.ROUNDED)
 
 
 def build_s1_stats_panel(state: ViewerState) -> Panel:

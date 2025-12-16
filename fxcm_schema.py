@@ -73,6 +73,16 @@ class PriceTickSnapPayload(TypedDict):
     snap_ts: float
 
 
+class PublicStatusSessionSymbolStatsPayload(TypedDict, total=False):
+    """Рядок session-таблиці для `fxcm:status` (пер-серія: Symbol+TF)."""
+
+    symbol: str
+    tf: str
+    high: float
+    low: float
+    avg: float
+
+
 class PublicStatusSessionPayload(TypedDict, total=False):
     """Блок `session` для `fxcm:status` (людський, обрізаний зріз)."""
 
@@ -86,6 +96,8 @@ class PublicStatusSessionPayload(TypedDict, total=False):
     seconds_to_next_open: float
     # Додається лише коли `state == "closed"`.
     state_detail: str
+    # Мінімальна табличка per (symbol, tf): High/Low/Avg.
+    symbols: List[PublicStatusSessionSymbolStatsPayload]
 
 
 class PublicStatusPayload(TypedDict, total=False):
@@ -223,6 +235,28 @@ OHLCV_BAR_ALLOWED_KEYS = OHLCV_BAR_REQUIRED_KEYS | OHLCV_BAR_OPTIONAL_KEYS
 PRICE_TIK_REQUIRED_KEYS = frozenset({"symbol", "bid", "ask", "mid", "tick_ts", "snap_ts"})
 PRICE_TIK_ALLOWED_KEYS = PRICE_TIK_REQUIRED_KEYS
 
+STATUS_ROOT_REQUIRED_KEYS = frozenset({"ts", "process", "market", "price", "ohlcv", "note"})
+STATUS_ROOT_OPTIONAL_KEYS = frozenset({"session"})
+STATUS_ROOT_ALLOWED_KEYS = STATUS_ROOT_REQUIRED_KEYS | STATUS_ROOT_OPTIONAL_KEYS
+
+STATUS_SESSION_ALLOWED_KEYS = frozenset(
+    {
+        "name",
+        "tag",
+        "state",
+        "current_open_utc",
+        "current_close_utc",
+        "next_open_utc",
+        "seconds_to_close",
+        "seconds_to_next_open",
+        "state_detail",
+        "symbols",
+    }
+)
+
+STATUS_SESSION_SYMBOL_REQUIRED_KEYS = frozenset({"symbol", "tf", "high", "low", "avg"})
+STATUS_SESSION_SYMBOL_ALLOWED_KEYS = STATUS_SESSION_SYMBOL_REQUIRED_KEYS
+
 
 def validate_ohlcv_payload_contract(payload: Mapping[str, Any]) -> None:
     """Runtime-валідація контракту `fxcm:ohlcv`.
@@ -331,3 +365,85 @@ def validate_price_tik_payload_contract(payload: Mapping[str, Any]) -> None:
         value = payload.get(key)
         if not isinstance(value, (int, float)):
             raise ValueError(f"PriceTick payload: '{key}' має бути числом")
+
+
+def validate_status_payload_contract(payload: Mapping[str, Any]) -> None:
+    """Runtime-валідація контракту `fxcm:status`.
+
+    Мета: зафіксувати публічний SPI та не допустити випадкових змін схеми.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("Status payload має бути mapping (dict)")
+
+    keys = set(payload.keys())
+    missing = STATUS_ROOT_REQUIRED_KEYS - keys
+    if missing:
+        raise ValueError(f"Status payload: бракує полів: {sorted(missing)}")
+    extra = keys - STATUS_ROOT_ALLOWED_KEYS
+    if extra:
+        raise ValueError(f"Status payload: зайві поля (не в контракті): {sorted(extra)}")
+
+    ts = payload.get("ts")
+    if not isinstance(ts, (int, float)):
+        raise ValueError("Status payload: 'ts' має бути числом")
+
+    for key in ("process", "market", "price", "ohlcv", "note"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"Status payload: '{key}' має бути непорожнім рядком")
+
+    session = payload.get("session")
+    if session is None:
+        return
+    if not isinstance(session, Mapping):
+        raise ValueError("Status payload: 'session' має бути mapping (dict)")
+
+    session_keys = set(session.keys())
+    extra_session = session_keys - STATUS_SESSION_ALLOWED_KEYS
+    if extra_session:
+        raise ValueError(
+            f"Status payload: session зайві поля (не в контракті): {sorted(extra_session)}"
+        )
+
+    for key in ("name", "tag", "state"):
+        if key in session and (not isinstance(session.get(key), str) or not session.get(key)):
+            raise ValueError(f"Status payload: session.{key} має бути непорожнім рядком")
+
+    for key in ("current_open_utc", "current_close_utc", "next_open_utc", "state_detail"):
+        if key in session and not isinstance(session.get(key), str):
+            raise ValueError(f"Status payload: session.{key} має бути рядком")
+
+    for key in ("seconds_to_close", "seconds_to_next_open"):
+        if key in session and not isinstance(session.get(key), (int, float)):
+            raise ValueError(f"Status payload: session.{key} має бути числом")
+
+    symbols = session.get("symbols")
+    if symbols is None:
+        return
+    if not isinstance(symbols, Sequence) or isinstance(symbols, (str, bytes)):
+        raise ValueError("Status payload: session.symbols має бути масивом")
+
+    for idx, row in enumerate(symbols):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"Status payload: session.symbols[{idx}] має бути mapping (dict)")
+        row_keys = set(row.keys())
+        missing_row = STATUS_SESSION_SYMBOL_REQUIRED_KEYS - row_keys
+        if missing_row:
+            raise ValueError(
+                f"Status payload: session.symbols[{idx}] бракує полів: {sorted(missing_row)}"
+            )
+        extra_row = row_keys - STATUS_SESSION_SYMBOL_ALLOWED_KEYS
+        if extra_row:
+            raise ValueError(
+                f"Status payload: session.symbols[{idx}] зайві поля (не в контракті): {sorted(extra_row)}"
+            )
+        if not isinstance(row.get("symbol"), str) or not row.get("symbol"):
+            raise ValueError(f"Status payload: session.symbols[{idx}].symbol має бути непорожнім рядком")
+        if not isinstance(row.get("tf"), str) or not row.get("tf"):
+            raise ValueError(f"Status payload: session.symbols[{idx}].tf має бути непорожнім рядком")
+        for key in ("high", "low", "avg"):
+            if not isinstance(row.get(key), (int, float)):
+                raise ValueError(
+                    f"Status payload: session.symbols[{idx}].{key} має бути числом"
+                )

@@ -4,12 +4,17 @@
 """
 
 import json
+import datetime as dt
 
 import pandas as pd
 
-from connector import PriceTickSnap, _publish_price_snapshot, publish_ohlcv_to_redis
+from connector import PriceTickSnap, _build_status_snapshot_from_heartbeat, _publish_price_snapshot, publish_ohlcv_to_redis
 from connector import TickOhlcvWorker
-from fxcm_schema import validate_ohlcv_payload_contract, validate_price_tik_payload_contract
+from fxcm_schema import (
+    validate_ohlcv_payload_contract,
+    validate_price_tik_payload_contract,
+    validate_status_payload_contract,
+)
 from tick_ohlcv import OhlcvBar
 
 
@@ -134,3 +139,51 @@ def test_tick_ohlcv_live_publish_is_throttled(monkeypatch) -> None:
     t["v"] += 0.20
     worker._publish_tick_bar(bar)
     assert len(published) == 2
+
+
+def test_build_status_payload_includes_session_symbol_tf_high_low_avg() -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    open_dt = now - dt.timedelta(minutes=30)
+    close_dt = now + dt.timedelta(minutes=30)
+
+    session_tag = "Default"
+    heartbeat = {
+        "state": "stream",
+        "last_bar_close_ms": int((now - dt.timedelta(seconds=10)).timestamp() * 1000),
+        "context": {
+            "session": {
+                "tag": session_tag,
+                "session_open_utc": open_dt.replace(microsecond=0).isoformat(),
+                "session_close_utc": close_dt.replace(microsecond=0).isoformat(),
+                "next_open_seconds": 123.0,
+                "stats": {
+                    session_tag: {
+                        "tag": session_tag,
+                        "timezone": "UTC",
+                        "session_open_utc": open_dt.replace(microsecond=0).isoformat(),
+                        "session_close_utc": close_dt.replace(microsecond=0).isoformat(),
+                        "symbols": [
+                            {
+                                "symbol": "XAUUSD",
+                                "tf": "1m",
+                                "bars": 10,
+                                "high": 2002.0,
+                                "low": 1998.0,
+                                "avg": 2000.5,
+                                "range": 4.0,
+                            }
+                        ],
+                    }
+                },
+            }
+        },
+    }
+
+    status = _build_status_snapshot_from_heartbeat(heartbeat)
+    assert status is not None
+    assert "session" in status
+    assert status["session"]["symbols"] == [
+        {"symbol": "XAUUSD", "tf": "1m", "high": 2002.0, "low": 1998.0, "avg": 2000.5}
+    ]
+
+    validate_status_payload_contract(status)

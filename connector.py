@@ -147,6 +147,24 @@ log: Logger = logging.getLogger("fxcm_connector")
 _LOGGING_CONFIGURED = False
 _RICH_CONSOLE: Optional[Console] = None
 
+# Рейт-ліміт для шумних повідомлень про відкидання барів.
+# Найчастіший нормальний сценарій: FXCM history повертає поточний (ще не закритий)
+# бар, а ми синтетично рахуємо close_time як open_time + tf - 1 → close_time у майбутньому.
+_DROP_TS_LOG_STATE: Dict[Tuple[str, str, str], float] = {}
+DROP_TS_LOG_INTERVAL_SECONDS = 60.0
+
+
+def _should_log_drop_ts(symbol_norm: str, tf: str, reason: str) -> bool:
+    """Неблокуючий rate-limit для логів про відкидання барів."""
+
+    now = time.monotonic()
+    key = (str(symbol_norm), str(tf), str(reason))
+    last = _DROP_TS_LOG_STATE.get(key)
+    if last is not None and now - last < DROP_TS_LOG_INTERVAL_SECONDS:
+        return False
+    _DROP_TS_LOG_STATE[key] = now
+    return True
+
 
 class VolumeCalibrator:
     """Калібрує tick-agg preview volume під FXCM history volume.
@@ -2018,6 +2036,62 @@ def _derive_session_state_detail(
     return "intrabreak"
 
 
+def _build_status_session_symbols_stats(
+    stats_obj: Any,
+    *,
+    session_tag: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """Будує мінімальний зріз session-статистики для публічного `fxcm:status`.
+
+    Повертає список рядків під таблицю `Symbol | TF | High | Low | Avg`.
+    """
+
+    if not isinstance(stats_obj, Mapping):
+        return None
+
+    entry_obj: Any = stats_obj.get(session_tag)
+    if not isinstance(entry_obj, Mapping):
+        # Фолбек: якщо є рівно один запис, беремо його.
+        if len(stats_obj) == 1:
+            try:
+                entry_obj = next(iter(stats_obj.values()))
+            except StopIteration:
+                return None
+        if not isinstance(entry_obj, Mapping):
+            return None
+
+    symbols_obj = entry_obj.get("symbols")
+    if not isinstance(symbols_obj, list):
+        return None
+
+    rows: List[Dict[str, Any]] = []
+    for item in symbols_obj:
+        if not isinstance(item, Mapping):
+            continue
+        symbol = item.get("symbol")
+        tf = item.get("tf")
+        if not isinstance(symbol, str) or not symbol:
+            continue
+        if not isinstance(tf, str) or not tf:
+            continue
+        high = _float_or_none(item.get("high"))
+        low = _float_or_none(item.get("low"))
+        avg = _float_or_none(item.get("avg"))
+        if high is None or low is None or avg is None:
+            continue
+        rows.append(
+            {
+                "symbol": symbol,
+                "tf": tf,
+                "high": float(high),
+                "low": float(low),
+                "avg": float(avg),
+            }
+        )
+
+    return rows or None
+
+
 def _build_status_session_block(
     session_ctx: Optional[Mapping[str, Any]],
 ) -> Optional[Dict[str, Any]]:
@@ -2085,6 +2159,13 @@ def _build_status_session_block(
     )
     if state_detail:
         payload["state_detail"] = state_detail
+
+    symbols_stats = _build_status_session_symbols_stats(
+        source.get("stats"),
+        session_tag=tag,
+    )
+    if symbols_stats is not None:
+        payload["symbols"] = symbols_stats
     return {key: value for key, value in payload.items() if value is not None}
 
 
@@ -4952,24 +5033,39 @@ def _normalize_history_to_ohlcv(
     # закритий) бар пройде валідацію, бо його close_time може бути на хвилини
     # попереду `now_ms` (особливо для 5m/15m і т.д.).
     close_max_allowed = now_ms + 10_000
-    valid_mask = (
-        (ohlcv["open_time"] >= MIN_ALLOWED_BAR_TIMESTAMP_MS)
-        & (ohlcv["open_time"] <= max_allowed)
-        & (ohlcv["close_time"] <= close_max_allowed)
+    invalid_open = (ohlcv["open_time"] < MIN_ALLOWED_BAR_TIMESTAMP_MS) | (
+        ohlcv["open_time"] > max_allowed
     )
-    if not valid_mask.all():
-        dropped = int(len(ohlcv) - int(valid_mask.sum()))
-        log.warning(
-            "Відкинуто %d барів з аномальним timestamp для %s %s (open_time вікно %s → %s; close_time max=%s).",
-            dropped,
-            symbol,
-            timeframe,
-            MIN_ALLOWED_BAR_TIMESTAMP_MS,
-            max_allowed,
-            close_max_allowed,
-        )
+    invalid_close = ohlcv["close_time"] > close_max_allowed
+    invalid_mask = invalid_open | invalid_close
+    if invalid_mask.any():
+        dropped = int(invalid_mask.sum())
+        dropped_open = int(invalid_open.sum())
+        dropped_close_only = int((invalid_close & ~invalid_open).sum())
+
+        if dropped_open > 0:
+            if _should_log_drop_ts(symbol_norm, timeframe, "open_time"):
+                log.warning(
+                    "Відкинуто %d барів з аномальним timestamp для %s %s (open_time вікно %s → %s; close_time max=%s).",
+                    dropped,
+                    symbol,
+                    timeframe,
+                    MIN_ALLOWED_BAR_TIMESTAMP_MS,
+                    max_allowed,
+                    close_max_allowed,
+                )
+        elif dropped_close_only > 0:
+            if _should_log_drop_ts(symbol_norm, timeframe, "close_time_future"):
+                log.debug(
+                    "Відкинуто %d незакритих history-барів для %s %s (close_time max=%s).",
+                    dropped_close_only,
+                    symbol,
+                    timeframe,
+                    close_max_allowed,
+                )
+
         PROM_DROPPED_BARS.labels(symbol=symbol_norm, tf=timeframe).inc(dropped)
-        ohlcv = ohlcv.loc[valid_mask]
+        ohlcv = ohlcv.loc[~invalid_mask]
 
     ohlcv = cast(pd.DataFrame, ohlcv.sort_values(by="open_time"))
     ohlcv = cast(pd.DataFrame, ohlcv.reset_index(drop=True))
