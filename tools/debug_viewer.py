@@ -1651,11 +1651,14 @@ def build_volume_calibration_panel(state: ViewerState) -> Panel:
     table.add_column("Symbol", style="bold", overflow="fold")
     table.add_column("TF", overflow="fold")
     table.add_column("k", justify="right", overflow="fold")
+    table.add_column("method", overflow="fold")
     table.add_column("samples", justify="right", overflow="fold")
     table.add_column("last_open", overflow="fold")
     table.add_column("history_vol", justify="right", overflow="fold")
     table.add_column("tick_count", justify="right", overflow="fold")
     table.add_column("ratio", justify="right", overflow="fold")
+    table.add_column("pred", justify="right", overflow="fold")
+    table.add_column("err%", justify="right", overflow="fold")
 
     rows: List[Tuple[str, str, Dict[str, Any]]] = []
     for symbol, tf_map in calibration.items():
@@ -1669,6 +1672,9 @@ def build_volume_calibration_panel(state: ViewerState) -> Panel:
     rows.sort(key=lambda item: (item[0], item[1]))
     for symbol, tf, payload in rows:
         k = _coerce_float(payload.get("k"))
+        method = payload.get("method")
+        if not isinstance(method, str) or not method:
+            method = "—"
         samples = _coerce_int(payload.get("samples"))
         last_raw = payload.get("last")
         last: Dict[str, Any] = last_raw if isinstance(last_raw, dict) else {}
@@ -1676,20 +1682,25 @@ def build_volume_calibration_panel(state: ViewerState) -> Panel:
         history_vol = _coerce_float(last.get("history_volume"))
         tick_count = _coerce_int(last.get("tick_count"))
         ratio = _coerce_float(last.get("ratio"))
+        predicted = _coerce_float(last.get("predicted_volume"))
+        err_pct = _coerce_float(last.get("err_pct"))
 
         table.add_row(
             symbol,
             tf,
             _format_float(k, digits=4),
+            str(method),
             "—" if samples is None else str(samples),
             _format_epoch_ms_compact(open_time),
             _format_float(history_vol, digits=2),
             "—" if tick_count is None else str(tick_count),
             _format_float(ratio, digits=4),
+            _format_float(predicted, digits=2),
+            "—" if err_pct is None else f"{err_pct:+.1f}",
         )
 
     hint = Text(
-        "Формула preview: volume ≈ tick_count × k (k=median(history_volume/tick_count)).\n"
+        "Формула preview: volume ≈ tick_count × k (k підбираємо адаптивно за історією).\n"
         "k оновлюється лише коли приходить новий complete бар із FXCM history і є tick_count для того ж open_time.",
         style="dim",
     )

@@ -182,8 +182,58 @@ class VolumeCalibrator:
     def __init__(self, *, max_samples: int = 50) -> None:
         self._max_samples = max(5, int(max_samples))
         self._ratios: Dict[Tuple[str, str], Deque[float]] = {}
+        self._samples: Dict[Tuple[str, str], Deque[Dict[str, Any]]] = {}
+        self._best: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._last_debug: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _safe_median(values: Sequence[float]) -> Optional[float]:
+        if not values:
+            return None
+        try:
+            return float(statistics.median(list(values)))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _compute_k_l2(samples: Sequence[Mapping[str, Any]]) -> Optional[float]:
+        num = 0.0
+        den = 0.0
+        for s in samples:
+            tc = s.get("tick_count")
+            hv = s.get("history_volume")
+            if not isinstance(tc, int) or tc <= 0:
+                continue
+            if not isinstance(hv, (int, float)) or hv < 0:
+                continue
+            num += float(tc) * float(hv)
+            den += float(tc) * float(tc)
+        if den <= 0.0:
+            return None
+        return num / den
+
+    @staticmethod
+    def _compute_mape_pct(samples: Sequence[Mapping[str, Any]], k: float) -> Optional[float]:
+        errors: List[float] = []
+        for s in samples:
+            tc = s.get("tick_count")
+            hv = s.get("history_volume")
+            if not isinstance(tc, int) or tc <= 0:
+                continue
+            if not isinstance(hv, (int, float)):
+                continue
+            hv_f = float(hv)
+            if hv_f <= 0.0:
+                continue
+            pred = float(tc) * float(k)
+            errors.append(abs(pred - hv_f) / hv_f * 100.0)
+        if not errors:
+            return None
+        try:
+            return float(statistics.median(errors))
+        except Exception:
+            return None
 
     def update_from_history_bar(
         self,
@@ -206,12 +256,65 @@ class VolumeCalibrator:
                 buf = deque(maxlen=self._max_samples)
                 self._ratios[key] = buf
             buf.append(ratio)
+
+            sbuf = self._samples.get(key)
+            if sbuf is None:
+                sbuf = deque(maxlen=self._max_samples)
+                self._samples[key] = sbuf
+            sample = {
+                "open_time": int(open_time_ms),
+                "history_volume": float(history_volume),
+                "tick_count": int(tick_count),
+                "ratio": float(ratio),
+            }
+            sbuf.append(sample)
+
+            ratios = [float(x.get("ratio")) for x in sbuf if isinstance(x.get("ratio"), (int, float))]
+            k_median = self._safe_median(ratios)
+            k_l2 = self._compute_k_l2(sbuf)
+
+            best_k: Optional[float] = None
+            best_method: Optional[str] = None
+            mape_median = self._compute_mape_pct(sbuf, float(k_median)) if k_median is not None else None
+            mape_l2 = self._compute_mape_pct(sbuf, float(k_l2)) if k_l2 is not None else None
+
+            if mape_median is not None and (mape_l2 is None or mape_median <= mape_l2):
+                best_k = float(k_median)
+                best_method = "median"
+            elif mape_l2 is not None:
+                best_k = float(k_l2)
+                best_method = "l2"
+            elif k_median is not None:
+                best_k = float(k_median)
+                best_method = "median"
+            elif k_l2 is not None:
+                best_k = float(k_l2)
+                best_method = "l2"
+
+            predicted_volume: Optional[float] = None
+            err_pct: Optional[float] = None
+            if best_k is not None and history_volume > 0:
+                predicted_volume = float(tick_count) * float(best_k)
+                err_pct = (predicted_volume - float(history_volume)) / float(history_volume) * 100.0
+
+            self._best[key] = {
+                "k": best_k,
+                "method": best_method,
+                "mape_pct": mape_median if best_method == "median" else mape_l2,
+                "k_median": k_median,
+                "k_l2": k_l2,
+                "mape_median_pct": mape_median,
+                "mape_l2_pct": mape_l2,
+            }
+
             self._last_debug[key] = {
                 "open_time": int(open_time_ms),
                 "history_volume": float(history_volume),
                 "tick_count": int(tick_count),
                 "ratio": float(ratio),
                 "samples": int(len(buf)),
+                "predicted_volume": predicted_volume,
+                "err_pct": err_pct,
             }
 
     def estimate_preview_volume(
@@ -226,37 +329,60 @@ class VolumeCalibrator:
             return 0.0
         key = (str(symbol_norm), str(tf_norm))
         with self._lock:
-            buf = self._ratios.get(key)
-            if not buf:
-                return float(fallback)
-            try:
-                k = float(statistics.median(list(buf)))
-            except Exception:
-                return float(fallback)
+            best = self._best.get(key)
+            k = None
+            if isinstance(best, Mapping):
+                k = best.get("k")
+            if not isinstance(k, (int, float)):
+                buf = self._ratios.get(key)
+                if not buf:
+                    return float(fallback)
+                try:
+                    k = float(statistics.median(list(buf)))
+                except Exception:
+                    return float(fallback)
         return float(tick_count) * float(k)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             ratios = {key: list(values) for key, values in self._ratios.items()}
             last_debug = dict(self._last_debug)
+            best = dict(self._best)
         summary: Dict[str, Any] = {}
         for (symbol, tf), values in ratios.items():
             if not values:
                 continue
-            try:
-                k = float(statistics.median(values))
-            except Exception:
-                continue
+            best_entry = best.get((symbol, tf)) if isinstance(best, dict) else None
+            k_value: Optional[float] = None
+            if isinstance(best_entry, Mapping) and isinstance(best_entry.get("k"), (int, float)):
+                k_value = float(best_entry["k"])
+            if k_value is None:
+                try:
+                    k_value = float(statistics.median(values))
+                except Exception:
+                    continue
             sym_map = summary.setdefault(symbol, {})
             sym_map[tf] = {
-                "k": float(k),
+                "k": float(k_value),
                 "samples": int(len(values)),
                 "last": last_debug.get((symbol, tf)),
+                "method": (best_entry.get("method") if isinstance(best_entry, Mapping) else None),
+                "mape_pct": (best_entry.get("mape_pct") if isinstance(best_entry, Mapping) else None),
+                "k_median": (best_entry.get("k_median") if isinstance(best_entry, Mapping) else None),
+                "k_l2": (best_entry.get("k_l2") if isinstance(best_entry, Mapping) else None),
+                "mape_median_pct": (best_entry.get("mape_median_pct") if isinstance(best_entry, Mapping) else None),
+                "mape_l2_pct": (best_entry.get("mape_l2_pct") if isinstance(best_entry, Mapping) else None),
             }
         return summary
 
     def reset(self) -> None:
         """Очищає накопичені семпли (переважно для юніт-тестів)."""
+
+        with self._lock:
+            self._ratios.clear()
+            self._samples.clear()
+            self._best.clear()
+            self._last_debug.clear()
 
         with self._lock:
             self._ratios.clear()

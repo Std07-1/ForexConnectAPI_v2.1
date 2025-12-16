@@ -29,3 +29,5 @@
 
 - `fxcm:status`: у блоці `session` додано `symbols` з per-(Symbol, TF) статистикою `High/Low/Avg` (те саме, що показує debug viewer у режимі Session), щоб консьюмери могли читати ці значення напряму зі статус-каналу.
 - `fxcm_schema.py`: оновлено TypedDict-контракти для `fxcm:status.session.symbols` та додано runtime-валідацію `validate_status_payload_contract` + контрактний тест.
+- VolumeCalibrator: зроблено адаптивне підбирання `k` (порівняння median vs L2 по MAPE) та додано в heartbeat `predicted_volume` і `err_pct` для останнього семпла, щоб було видно “як ми вчимось” і чи тримаємо цільову похибку.
+- Debug viewer (VCAL): додано колонки `method`, `pred`, `err%` для швидкої оцінки точності калібрування.
