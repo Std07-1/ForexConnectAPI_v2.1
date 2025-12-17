@@ -269,19 +269,29 @@ class VolumeCalibrator:
             }
             sbuf.append(sample)
 
-            ratios = [float(x.get("ratio")) for x in sbuf if isinstance(x.get("ratio"), (int, float))]
+            ratios: List[float] = []
+            for s in sbuf:
+                ratio_value = s.get("ratio")
+                if isinstance(ratio_value, float):
+                    ratios.append(ratio_value)
+                elif isinstance(ratio_value, int):
+                    ratios.append(float(ratio_value))
             k_median = self._safe_median(ratios)
             k_l2 = self._compute_k_l2(sbuf)
 
             best_k: Optional[float] = None
             best_method: Optional[str] = None
-            mape_median = self._compute_mape_pct(sbuf, float(k_median)) if k_median is not None else None
-            mape_l2 = self._compute_mape_pct(sbuf, float(k_l2)) if k_l2 is not None else None
+            mape_median = self._compute_mape_pct(sbuf, k_median) if k_median is not None else None
+            mape_l2 = self._compute_mape_pct(sbuf, k_l2) if k_l2 is not None else None
 
-            if mape_median is not None and (mape_l2 is None or mape_median <= mape_l2):
+            if (
+                k_median is not None
+                and mape_median is not None
+                and (mape_l2 is None or mape_median <= mape_l2)
+            ):
                 best_k = float(k_median)
                 best_method = "median"
-            elif mape_l2 is not None:
+            elif k_l2 is not None and mape_l2 is not None:
                 best_k = float(k_l2)
                 best_method = "l2"
             elif k_median is not None:
@@ -328,13 +338,21 @@ class VolumeCalibrator:
         if tick_count <= 0:
             return 0.0
         key = (str(symbol_norm), str(tf_norm))
+        base_key = (str(symbol_norm), str(BASE_HISTORY_TF_NORM))
         with self._lock:
             best = self._best.get(key)
+            if best is None and key != base_key:
+                # MTF масштабування: ми калібруємо k лише на базовому TF (1m),
+                # але tick_count лінійно агрерується для 5m/15m/1h/4h.
+                # Тому, якщо для конкретного TF ще немає семплів, беремо k з 1m.
+                best = self._best.get(base_key)
             k = None
             if isinstance(best, Mapping):
                 k = best.get("k")
             if not isinstance(k, (int, float)):
                 buf = self._ratios.get(key)
+                if (not buf) and key != base_key:
+                    buf = self._ratios.get(base_key)
                 if not buf:
                     return float(fallback)
                 try:
@@ -597,6 +615,44 @@ class ConsoleStatusBar:
                     self._format_short_duration(lag_value) or f"{lag_value:.1f}s"
                 )
                 rows.append((Text("lag", style="dim"), Text(lag_label, style="cyan")))
+
+        ohlcv_live_age = snapshot.get("ohlcv_live_age_seconds")
+        if ohlcv_live_age is not None:
+            try:
+                live_age_value = float(ohlcv_live_age)
+            except (TypeError, ValueError):
+                live_age_value = None
+            if live_age_value is not None and live_age_value >= 0:
+                label = self._format_short_duration(live_age_value) or f"{live_age_value:.1f}s"
+                rows.append(
+                    (Text("ohlcv_live_age", style="dim"), Text(label, style="cyan"))
+                )
+
+        supervisor_q = snapshot.get("supervisor_ohlcv_queue")
+        supervisor_drop = snapshot.get("supervisor_ohlcv_dropped")
+        supervisor_bp = snapshot.get("supervisor_backpressure")
+        if supervisor_q is not None or supervisor_drop is not None or supervisor_bp is not None:
+            try:
+                q_value = int(supervisor_q) if supervisor_q is not None else None
+            except (TypeError, ValueError):
+                q_value = None
+            try:
+                d_value = int(supervisor_drop) if supervisor_drop is not None else None
+            except (TypeError, ValueError):
+                d_value = None
+            bp_value = bool(supervisor_bp) if supervisor_bp is not None else None
+            bp_style = "yellow" if bp_value else "green"
+            parts: List[str] = []
+            if q_value is not None:
+                parts.append(f"q={q_value}")
+            if d_value is not None:
+                parts.append(f"drop={d_value}")
+            if bp_value is not None:
+                parts.append("bp=1" if bp_value else "bp=0")
+            if parts:
+                rows.append(
+                    (Text("ohlcv_pipe", style="dim"), Text(" ".join(parts), style=bp_style))
+                )
 
         next_open = self._format_next_open(snapshot.get("next_open"))
         if next_open:
@@ -1694,6 +1750,293 @@ def _tf_to_minutes(tf_label: str) -> int:
     raise ValueError(f"Невідомий таймфрейм: {tf_label}")
 
 
+# Базовий таймфрейм FXCM history для масштабування MTF.
+# Важливо: для багатьох символів не тягнемо history по кожному TF, а беремо лише 1m,
+# а старші TF для `complete=true` будуємо локально.
+BASE_HISTORY_TF_NORM = "1m"
+BASE_HISTORY_TF_RAW = "m1"
+HISTORY_AGG_SOURCE = "history_agg"
+
+
+class HistoryMtfCompleteAggregator:
+    """Інкрементально агрегує `complete=true` 1m history-бари у старші TF.
+
+    Правила:
+    - Публікуємо `complete=true` для старших TF лише коли маємо повне вікно
+      кратних 1m барів з рівною дискретизацією (без пропусків у хвилинах).
+    - Якщо старт стріму всередині вікна (наприклад, посеред години) — перший
+      неповний bucket просто пропускаємо.
+    """
+
+    def __init__(self, *, symbol_norm: str, target_tf: str) -> None:
+        self._symbol = str(symbol_norm)
+        self._tf = str(target_tf)
+        target_minutes = _tf_to_minutes(self._tf)
+        self._target_ms = int(target_minutes) * BAR_INTERVAL_MS
+        self._lower_ms = int(BAR_INTERVAL_MS)
+        self._bars_per_window = max(1, int(self._target_ms // self._lower_ms))
+
+        self._bucket_start: Optional[int] = None
+        self._expected_next_open: Optional[int] = None
+        self._window: List[Dict[str, Any]] = []
+
+    @property
+    def tf(self) -> str:
+        return self._tf
+
+    def ingest_df_1m(self, df_1m: pd.DataFrame) -> pd.DataFrame:
+        if df_1m is None or df_1m.empty:
+            return pd.DataFrame()
+        if "open_time" not in df_1m.columns:
+            return pd.DataFrame()
+
+        rows_out: List[Dict[str, Any]] = []
+        # Працюємо у порядку часу.
+        df_sorted = cast(pd.DataFrame, df_1m.sort_values("open_time"))
+        for row in df_sorted.itertuples(index=False):
+            try:
+                open_time = int(getattr(row, "open_time"))
+            except Exception:  # noqa: BLE001
+                continue
+
+            bucket_start = (open_time // self._target_ms) * self._target_ms
+
+            # Якщо ми ще не в bucket-і або bucket змінився — стартуємо заново.
+            if self._bucket_start is None or bucket_start != self._bucket_start:
+                self._bucket_start = int(bucket_start)
+                self._window.clear()
+                self._expected_next_open = int(bucket_start)
+
+            # Публікуємо лише повні bucket-и: якщо почали не з початку bucket-а —
+            # пропускаємо, поки не дійдемо до рівно bucket_start.
+            if self._expected_next_open is None:
+                self._expected_next_open = int(bucket_start)
+            if open_time != int(self._expected_next_open):
+                # Пропуск/дірка у хвилинах або старт з середини bucket-а.
+                # Скидаємо вікно і чекаємо наступного валідного bucket_start.
+                self._window.clear()
+                self._expected_next_open = int(bucket_start)
+                if open_time != int(self._expected_next_open):
+                    continue
+
+            bar_open = float(getattr(row, "open"))
+            bar_high = float(getattr(row, "high"))
+            bar_low = float(getattr(row, "low"))
+            bar_close = float(getattr(row, "close"))
+            bar_volume = float(getattr(row, "volume"))
+
+            self._window.append(
+                {
+                    "open": bar_open,
+                    "high": bar_high,
+                    "low": bar_low,
+                    "close": bar_close,
+                    "volume": bar_volume,
+                }
+            )
+            self._expected_next_open = int(self._expected_next_open) + self._lower_ms
+
+            if len(self._window) < self._bars_per_window:
+                continue
+
+            # Закриваємо bucket.
+            window_start = int(self._bucket_start)
+            rows_out.append(
+                {
+                    "symbol": self._symbol,
+                    "tf": self._tf,
+                    "open_time": window_start,
+                    "close_time": window_start + self._target_ms - 1,
+                    "open": float(self._window[0]["open"]),
+                    "high": float(max(item["high"] for item in self._window)),
+                    "low": float(min(item["low"] for item in self._window)),
+                    "close": float(self._window[-1]["close"]),
+                    "volume": float(sum(item["volume"] for item in self._window)),
+                    "source": HISTORY_AGG_SOURCE,
+                }
+            )
+            self._window.clear()
+            self._bucket_start = None
+            self._expected_next_open = None
+
+        if not rows_out:
+            return pd.DataFrame()
+        return cast(pd.DataFrame, pd.DataFrame(rows_out))
+
+
+class MtfCrosscheckController:
+    """Періодично звіряє history_agg (1m→TF) з прямим FXCM history по TF.
+
+    Це діагностика/контроль якості:
+    - не змінює основний polling (він лишається лише 1m);
+    - не публікує FXCM H1/H4 назовні (щоб не змішувати джерела);
+    - лише логірує `WARNING` при розбіжності понад поріг.
+    """
+
+    def __init__(self, settings: Any) -> None:
+        self._settings = settings
+        self._last_check_monotonic: Dict[Tuple[str, str], float] = {}
+        self._last_checked_open_ms: Dict[Tuple[str, str], int] = {}
+        self._checks_in_cycle = 0
+
+    def begin_cycle(self) -> None:
+        self._checks_in_cycle = 0
+
+    def maybe_check_from_agg_df(
+        self,
+        fx: ForexConnect,
+        *,
+        symbol_raw: str,
+        target_tf: str,
+        df_agg: pd.DataFrame,
+    ) -> None:
+        if not bool(getattr(self._settings, "enabled", False)):
+            return
+        if df_agg is None or df_agg.empty:
+            return
+        max_per_cycle = int(getattr(self._settings, "max_checks_per_cycle", 0) or 0)
+        if self._checks_in_cycle >= max_per_cycle:
+            return
+
+        tf_norm = str(target_tf)
+        timeframes = getattr(self._settings, "timeframes", None)
+        if isinstance(timeframes, list) and timeframes and tf_norm not in set(timeframes):
+            return
+
+        symbol_norm = _normalize_symbol(symbol_raw)
+        key = (symbol_norm, tf_norm)
+
+        now_monotonic = time.monotonic()
+        last = self._last_check_monotonic.get(key)
+        min_interval = float(getattr(self._settings, "min_interval_seconds", 0.0) or 0.0)
+        if last is not None and now_monotonic - last < min_interval:
+            return
+
+        try:
+            # Перевіряємо лише найсвіжіший агрегований complete бар.
+            last_row = df_agg.iloc[-1]
+            open_ms = int(last_row.get("open_time"))
+            close_ms = int(last_row.get("close_time"))
+        except Exception:  # noqa: BLE001
+            return
+
+        if self._last_checked_open_ms.get(key) == open_ms:
+            return
+
+        try:
+            ok = self._check_one_bar(
+                fx,
+                symbol_raw=symbol_raw,
+                tf_norm=tf_norm,
+                open_ms=open_ms,
+                close_ms=close_ms,
+                agg_row=last_row,
+            )
+        except Exception:  # noqa: BLE001
+            return
+
+        self._last_check_monotonic[key] = now_monotonic
+        self._last_checked_open_ms[key] = open_ms
+        self._checks_in_cycle += 1
+        _ = ok
+
+    def _check_one_bar(
+        self,
+        fx: ForexConnect,
+        *,
+        symbol_raw: str,
+        tf_norm: str,
+        open_ms: int,
+        close_ms: int,
+        agg_row: Any,
+    ) -> bool:
+        tf_minutes = _tf_to_minutes(tf_norm)
+        tf_ms = int(tf_minutes) * 60_000
+
+        start_dt = _ms_to_dt(int(open_ms) - 2 * tf_ms)
+        end_dt = _ms_to_dt(int(close_ms) + 2 * tf_ms)
+
+        tf_fxcm = _to_fxcm_timeframe(tf_norm)
+        try:
+            history = fx.get_history(symbol_raw, tf_fxcm, start_dt, end_dt)
+        except Exception as exc:  # noqa: BLE001
+            if _is_price_history_not_ready(exc):
+                return True
+            log.debug(
+                "MTF cross-check: get_history не вдався для %s (%s): %s",
+                symbol_raw,
+                tf_fxcm,
+                exc,
+            )
+            return True
+
+        df_raw = pd.DataFrame(history)
+        if df_raw.empty:
+            return True
+        df_direct = _normalize_history_to_ohlcv(df_raw, symbol_raw, tf_norm)
+        if df_direct.empty:
+            return True
+
+        try:
+            df_match = cast(
+                pd.DataFrame,
+                df_direct.loc[df_direct["open_time"] == int(open_ms)],
+            )
+        except Exception:  # noqa: BLE001
+            return True
+
+        if df_match.empty:
+            log.warning(
+                "MTF cross-check: FXCM не повернув бар open_time=%s для %s %s (FXCM=%s).",
+                _ms_to_dt(int(open_ms)).isoformat(),
+                _normalize_symbol(symbol_raw),
+                tf_norm,
+                tf_fxcm,
+            )
+            return False
+
+        direct_row = df_match.iloc[-1]
+        issues: List[str] = []
+
+        try:
+            direct_close_ms = int(direct_row.get("close_time"))
+            if int(direct_close_ms) != int(close_ms):
+                issues.append(
+                    f"close_time_ms: agg={int(close_ms)} fxcm={int(direct_close_ms)}"
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+        price_abs_tol = float(getattr(self._settings, "price_abs_tol", 0.0) or 0.0)
+        price_rel_tol = float(getattr(self._settings, "price_rel_tol", 0.0) or 0.0)
+        volume_abs_tol = float(getattr(self._settings, "volume_abs_tol", 0.0) or 0.0)
+        volume_rel_tol = float(getattr(self._settings, "volume_rel_tol", 0.0) or 0.0)
+
+        def _cmp(field: str, *, abs_tol: float, rel_tol: float) -> None:
+            try:
+                a = float(agg_row.get(field))
+                b = float(direct_row.get(field))
+            except Exception:  # noqa: BLE001
+                return
+            if not math.isclose(a, b, abs_tol=abs_tol, rel_tol=rel_tol):
+                issues.append(f"{field}: agg={a} fxcm={b} diff={a - b}")
+
+        for price_field in ("open", "high", "low", "close"):
+            _cmp(price_field, abs_tol=price_abs_tol, rel_tol=price_rel_tol)
+        _cmp("volume", abs_tol=volume_abs_tol, rel_tol=volume_rel_tol)
+
+        if issues:
+            log.warning(
+                "MTF cross-check: розбіжність > порогу для %s %s open=%s: %s",
+                _normalize_symbol(symbol_raw),
+                tf_norm,
+                _ms_to_dt(int(open_ms)).isoformat(),
+                "; ".join(issues),
+            )
+            return False
+        return True
+
+
 def _ms_to_dt(value_ms: int) -> dt.datetime:
     return dt.datetime.fromtimestamp(value_ms / 1000.0, tz=dt.timezone.utc)
 
@@ -1710,11 +2053,13 @@ def _download_history_range(
         return pd.DataFrame()
 
     frames: List[pd.DataFrame] = []
+    tf_norm = _map_timeframe_label(timeframe_raw)
+    tf_fxcm = _to_fxcm_timeframe(tf_norm)
     for win_start, win_end in generate_request_windows(start_dt, end_dt):
         if win_start >= win_end:
             continue
         try:
-            history = fx.get_history(symbol, timeframe_raw, win_start, win_end)
+            history = fx.get_history(symbol, tf_fxcm, win_start, win_end)
         except Exception as exc:  # noqa: BLE001
             if _is_price_history_not_ready(exc):
                 PROM_PRICE_HISTORY_NOT_READY.inc()
@@ -1722,13 +2067,13 @@ def _download_history_range(
                 log.debug(
                     "History cache: PriceHistoryCommunicator не готовий для %s (%s).",
                     symbol,
-                    timeframe_raw,
+                    tf_fxcm,
                 )
             else:
                 log.exception(
                     "Помилка get_history(%s, %s, %s → %s): %s",
                     symbol,
-                    timeframe_raw,
+                    tf_fxcm,
                     win_start,
                     win_end,
                     exc,
@@ -1745,7 +2090,6 @@ def _download_history_range(
 
     df_raw = pd.concat(frames, ignore_index=True)
     df_raw = df_raw.drop_duplicates(subset=["Date"], keep="last")
-    tf_norm = _map_timeframe_label(timeframe_raw)
     return _normalize_history_to_ohlcv(df_raw, symbol, tf_norm)
 
 
@@ -2688,7 +3032,10 @@ def _denormalize_symbol(symbol_norm: str) -> str:
 
 
 def _to_fxcm_timeframe(tf_norm: str) -> str:
-    """Перетворює нормалізований timeframe (`1m`, `1h`) у FXCM tf (`m1`, `m60`)."""
+    """Перетворює нормалізований timeframe (`1m`, `1h`) у FXCM tf.
+
+    Важливо: у ForexConnect/FXCM годинні TF мають вигляд `H1`, `H4` (а не `m60`).
+    """
 
     raw = (tf_norm or "").strip().lower()
     if not raw:
@@ -2699,9 +3046,14 @@ def _to_fxcm_timeframe(tf_norm: str) -> str:
         "5m": "m5",
         "15m": "m15",
         "30m": "m30",
-        "1h": "m60",
-        "4h": "h4",
-        "1d": "d1",
+        "1h": "H1",
+        "4h": "H4",
+        "1d": "D1",
+        # Сумісність із «сирими» FXCM-позначеннями, якщо сюди випадково передали raw.
+        "m60": "H1",
+        "h1": "H1",
+        "h4": "H4",
+        "d1": "D1",
     }
     if raw in explicit:
         return explicit[raw]
@@ -2710,9 +3062,11 @@ def _to_fxcm_timeframe(tf_norm: str) -> str:
         return f"m{int(raw[:-1])}"
     if raw.endswith("h") and raw[:-1].isdigit():
         hours = int(raw[:-1])
-        if hours == 1:
-            return "m60"
-        return f"h{hours}"
+        return f"H{hours}"
+
+    if raw.endswith("d") and raw[:-1].isdigit():
+        days = int(raw[:-1])
+        return f"D{days}"
 
     return tf_norm
 
@@ -3360,7 +3714,12 @@ class AsyncStreamSupervisor:
         self._ensure_running()
         if self._ohlcv_queue is None:
             raise SinkSubmissionError("Supervisor queue ще ініціалізується")
-        self._submit_coroutine(self._enqueue(self._ohlcv_queue, batch, "ohlcv"))
+        # Для `fxcm:ohlcv` важливо не «зависати» через backpressure.
+        # Якщо Redis/консьюмер тимчасово повільні, краще дропнути найстаріший батч,
+        # ніж повністю зупинити доставку live-preview (`complete=false`) для UI.
+        self._submit_coroutine(
+            self._enqueue(self._ohlcv_queue, batch, "ohlcv", drop_oldest=True)
+        )
 
     def submit_heartbeat(self, event: HeartbeatEvent) -> None:
         self._ensure_running()
@@ -4099,6 +4458,9 @@ class TickOhlcvWorker:
         self._stop = threading.Event()
         self._agg_1m: Dict[str, TickOhlcvAggregator] = {}
         self._agg_5m: Dict[str, OhlcvFromLowerTfAggregator] = {}
+        self._agg_15m: Dict[str, OhlcvFromLowerTfAggregator] = {}
+        self._agg_1h: Dict[str, OhlcvFromLowerTfAggregator] = {}
+        self._agg_4h: Dict[str, OhlcvFromLowerTfAggregator] = {}
 
         # Якщо tick_ts приходить “у майбутньому” відносно локального time.time(),
         # tick-agg може будувати bucket-и з end_ms > now_ms, і clock-flush не
@@ -4209,6 +4571,46 @@ class TickOhlcvWorker:
         for sym in list(self._agg_5m.keys()):
             if sym not in active:
                 self._agg_5m.pop(sym, None)
+        for sym in list(self._agg_15m.keys()):
+            if sym not in active:
+                self._agg_15m.pop(sym, None)
+        for sym in list(self._agg_1h.keys()):
+            if sym not in active:
+                self._agg_1h.pop(sym, None)
+        for sym in list(self._agg_4h.keys()):
+            if sym not in active:
+                self._agg_4h.pop(sym, None)
+
+    def _ingest_into_higher_preview_aggs(
+        self, bar: TickOhlcvBar, *, now_monotonic: Optional[float] = None
+    ) -> None:
+        """Пробиває 1m бар (live або complete) у 5m/15m/1h/4h preview-агрегатори."""
+
+        symbol = str(bar.symbol)
+        agg_map: List[Tuple[str, Dict[str, OhlcvFromLowerTfAggregator], int]] = [
+            ("5m", self._agg_5m, 300),
+            ("15m", self._agg_15m, 900),
+            ("1h", self._agg_1h, 3600),
+            ("4h", self._agg_4h, 14400),
+        ]
+        for _label, mapping, target_seconds in agg_map:
+            agg = mapping.get(symbol)
+            if agg is None:
+                agg = OhlcvFromLowerTfAggregator(
+                    symbol,
+                    target_tf_seconds=int(target_seconds),
+                    lower_tf_seconds=60,
+                    source="tick_agg",
+                )
+                mapping[symbol] = agg
+            try:
+                res = agg.ingest_bar(bar)
+            except Exception:  # noqa: BLE001
+                continue
+            if res.live_bar is not None:
+                self._publish_tick_bar(res.live_bar, now_monotonic=now_monotonic)
+            for closed in res.closed_bars:
+                self._publish_tick_bar(closed)
 
     def enqueue_tick(self, symbol: str, bid: float, ask: float, tick_ts: float) -> None:
         if not self._enabled:
@@ -4288,20 +4690,13 @@ class TickOhlcvWorker:
                 # Вони використовуються лише як внутрішній тригер/агрегаційна база,
                 # а «авторитетний» complete бар (із реальним Volume) має прийти з FXCM history.
                 self._publish_tick_bar(bar)
-                agg_5m = self._agg_5m.get(symbol)
-                if agg_5m is None:
-                    continue
-                try:
-                    result_5m = agg_5m.ingest_bar(bar)
-                except Exception:  # noqa: BLE001
-                    continue
-                for higher_bar in result_5m.closed_bars:
-                    self._publish_tick_bar(higher_bar)
+                self._ingest_into_higher_preview_aggs(bar)
 
     def _process_tick(self, tick: PriceTick) -> None:
         symbol = tick.symbol
         PROM_TICK_AGG_TICKS_TOTAL.labels(symbol=symbol).inc()
-        self._last_tick_monotonic = time.monotonic()
+        now_monotonic = time.monotonic()
+        self._last_tick_monotonic = now_monotonic
 
         now_sec = time.time()
         skew_sec = float(tick.tick_ts) - float(now_sec)
@@ -4316,15 +4711,6 @@ class TickOhlcvWorker:
                 source="tick_agg",
             )
             self._agg_1m[symbol] = agg_1m
-        agg_5m = self._agg_5m.get(symbol)
-        if agg_5m is None:
-            agg_5m = OhlcvFromLowerTfAggregator(
-                symbol,
-                target_tf_seconds=300,
-                lower_tf_seconds=60,
-                source="tick_agg",
-            )
-            self._agg_5m[symbol] = agg_5m
 
         tick_ms = int(float(tick.tick_ts) * 1000)
         now_ms = int(float(now_sec) * 1000)
@@ -4350,18 +4736,21 @@ class TickOhlcvWorker:
         result_1m = agg_1m.ingest_tick(fx_tick)
 
         if result_1m.live_bar is not None:
-            self._publish_tick_bar(result_1m.live_bar)
+            self._publish_tick_bar(result_1m.live_bar, now_monotonic=now_monotonic)
+            self._ingest_into_higher_preview_aggs(
+                result_1m.live_bar, now_monotonic=now_monotonic
+            )
 
         for bar in result_1m.closed_bars:
             self._publish_tick_bar(bar)
-            result_5m = agg_5m.ingest_bar(bar)
-            for higher_bar in result_5m.closed_bars:
-                self._publish_tick_bar(higher_bar)
+            self._ingest_into_higher_preview_aggs(bar, now_monotonic=now_monotonic)
 
-    def _publish_tick_bar(self, bar: TickOhlcvBar) -> None:
+    def _publish_tick_bar(
+        self, bar: TickOhlcvBar, *, now_monotonic: Optional[float] = None
+    ) -> None:
         if not bar.complete:
             key = (str(bar.symbol), str(bar.tf))
-            now = time.monotonic()
+            now = now_monotonic if now_monotonic is not None else time.monotonic()
             last = self._last_live_publish_ts.get(key)
             if (
                 last is not None
@@ -4443,7 +4832,20 @@ class TickOhlcvWorker:
             fetched_at=time.time(),
             source=str(bar.source),
         )
-        self._ohlcv_sink(batch)
+        try:
+            self._ohlcv_sink(batch)
+        except Exception as exc:  # noqa: BLE001
+            # Важливо: sink може тимчасово відмовити (backpressure/Redis проблеми).
+            # Tick worker не має падати, інакше UI перестає отримувати live preview.
+            PROM_ERROR_COUNTER.labels(type="tick_agg_sink").inc()
+            log.debug(
+                "Tick-agg: не вдалося передати OhlcvBatch у sink (%s %s complete=%s): %s",
+                str(bar.symbol),
+                str(bar.tf),
+                bool(bar.complete),
+                exc,
+            )
+            return
 
 
 class FXCMOfferSubscription:
@@ -5287,8 +5689,9 @@ def publish_ohlcv_to_redis(
         #   критичні для діагностики та UI.
         # Тому gate застосовуємо лише до complete-блоків.
         if "complete" in df_to_publish.columns:
-            df_complete = cast(pd.DataFrame, df_to_publish.loc[df_to_publish["complete"] == True])
-            df_live = cast(pd.DataFrame, df_to_publish.loc[df_to_publish["complete"] == False])
+            mask_complete = df_to_publish["complete"].fillna(False).astype(bool)
+            df_complete = cast(pd.DataFrame, df_to_publish.loc[mask_complete])
+            df_live = cast(pd.DataFrame, df_to_publish.loc[~mask_complete])
             df_complete_filtered = data_gate.filter_new_bars(
                 df_complete, symbol=symbol, timeframe=timeframe
             )
@@ -5432,12 +5835,9 @@ def publish_ohlcv_to_redis(
             # - staleness/last_close_ms/lag — тільки по complete=true барах;
             # - live complete=false — окремо, для діагностики.
             if "complete" in df_to_publish.columns:
-                df_complete_only = cast(
-                    pd.DataFrame, df_to_publish.loc[df_to_publish["complete"] == True]
-                )
-                df_live_only = cast(
-                    pd.DataFrame, df_to_publish.loc[df_to_publish["complete"] == False]
-                )
+                mask_complete = df_to_publish["complete"].fillna(False).astype(bool)
+                df_complete_only = cast(pd.DataFrame, df_to_publish.loc[mask_complete])
+                df_live_only = cast(pd.DataFrame, df_to_publish.loc[~mask_complete])
                 if not df_live_only.empty:
                     PROM_OHLCV_LIVE_LAST_TS_SECONDS.labels(
                         symbol=symbol_norm, tf=timeframe
@@ -5544,9 +5944,10 @@ def _fetch_and_publish_recent(
 
     start_dt = end_dt - dt.timedelta(minutes=max(lookback_minutes, 1))
     timeframe_norm = _map_timeframe_label(timeframe_raw)
+    timeframe_fxcm = _to_fxcm_timeframe(timeframe_norm)
 
     try:
-        history = fx.get_history(symbol, timeframe_raw, start_dt, end_dt)
+        history = fx.get_history(symbol, timeframe_fxcm, start_dt, end_dt)
     except Exception as exc:  # noqa: BLE001
         if _is_price_history_not_ready(exc):
             PROM_PRICE_HISTORY_NOT_READY.inc()
@@ -5565,11 +5966,11 @@ def _fetch_and_publish_recent(
             log.debug(
                 "Стрім: FXCM PriceHistoryCommunicator не готовий для %s (%s).",
                 symbol,
-                timeframe_raw,
+                timeframe_fxcm,
             )
             raise MarketTemporarilyClosed("PriceHistoryCommunicator is not ready")
         raise FXCMRetryableError(
-            f"FXCM get_history помилився для {symbol} ({timeframe_raw})"
+            f"FXCM get_history помилився для {symbol} ({timeframe_fxcm})"
         ) from exc
 
     df_raw = pd.DataFrame(history)
@@ -5577,7 +5978,7 @@ def _fetch_and_publish_recent(
         log.debug(
             "Стрім: FXCM повернув порожні дані для %s (%s) у вікні %s хв.",
             symbol,
-            timeframe_raw,
+            timeframe_fxcm,
             lookback_minutes,
         )
         return pd.DataFrame()
@@ -5710,6 +6111,7 @@ def fetch_history_sample(
     symbol = sample_settings.symbol
     timeframe_raw = sample_settings.timeframe
     timeframe = _map_timeframe_label(timeframe_raw)
+    timeframe_fxcm = _to_fxcm_timeframe(timeframe)
     hours = max(1, int(sample_settings.hours))
 
     end_dt = _now_utc()
@@ -5722,13 +6124,13 @@ def fetch_history_sample(
         "Запит історії: %s, tf=%s (FXCM=%s), період %s → %s",
         symbol,
         timeframe,
-        timeframe_raw,
+        timeframe_fxcm,
         start_dt,
         end_dt,
     )
 
     try:
-        history = fx.get_history(symbol, timeframe_raw, start_dt, end_dt)
+        history = fx.get_history(symbol, timeframe_fxcm, start_dt, end_dt)
     except Exception as exc:  # noqa: BLE001
         if _is_price_history_not_ready(exc):
             PROM_PRICE_HISTORY_NOT_READY.inc()
@@ -5736,7 +6138,7 @@ def fetch_history_sample(
             log.debug(
                 "Warmup: FXCM PriceHistoryCommunicator не готовий для %s (%s).",
                 symbol,
-                timeframe_raw,
+                timeframe_fxcm,
             )
         else:
             log.exception("Помилка під час запиту історії через get_history: %s", exc)
@@ -5914,6 +6316,7 @@ def stream_fx_data(
     tick_cadence: Optional[TickCadenceController] = None,
     tick_aggregation_enabled: bool = False,
     tick_aggregation_timeframes: Optional[Sequence[str]] = None,
+    mtf_crosscheck: Optional[Any] = None,
     status_bar: Optional[ConsoleStatusBar] = None,
     universe: Optional[StreamUniverse] = None,
     universe_update_callback: Optional[Callable[[List[Tuple[str, str]]], None]] = None,
@@ -6024,20 +6427,16 @@ def stream_fx_data(
     publish_rate_limit: Dict[Tuple[str, str], float] = {}
     throttle_log_state: Dict[Tuple[str, str, str], float] = {}
 
+    # MTF: локальні агрегатори для `complete=true` барів (history_agg).
+    mtf_aggregators: Dict[Tuple[str, str], HistoryMtfCompleteAggregator] = {}
+    mtf_crosscheck_ctrl: Optional[MtfCrosscheckController] = (
+        MtfCrosscheckController(mtf_crosscheck)
+        if mtf_crosscheck is not None and bool(getattr(mtf_crosscheck, "enabled", False))
+        else None
+    )
+
     universe_active_symbols_count: Optional[int] = None
     universe_last_apply_ts: Optional[float] = None
-
-    tick_agg_timeframes: Set[str] = set()
-    if tick_aggregation_enabled:
-        if tick_aggregation_timeframes:
-            tick_agg_timeframes = {
-                _map_timeframe_label(tf)
-                for tf in tick_aggregation_timeframes
-                if isinstance(tf, str)
-            }
-        else:
-            # Phase B: tick-агрегація зараз генерує 1m і 5m.
-            tick_agg_timeframes = {"1m", "5m"}
 
     def _should_log_throttle(
         symbol_norm: str, timeframe_norm: str, reason: str
@@ -6104,6 +6503,8 @@ def stream_fx_data(
                     PROM_UNIVERSE_APPLY_TOTAL.labels(result="error").inc()
 
             cycle_start = time.monotonic()
+            if mtf_crosscheck_ctrl is not None:
+                mtf_crosscheck_ctrl.begin_cycle()
             restart_cycle = False
             market_pause = False
             closed_reference: Optional[dt.datetime] = None
@@ -6155,6 +6556,13 @@ def stream_fx_data(
             else:
                 history_call_attempted = False
                 cadence_allowances: Dict[str, bool] = {}
+                # MTF: з 1m history будуємо старші TF локально.
+                # Тримаємо агрегатори по (symbol_norm, target_tf).
+                mtf_targets_by_symbol: Dict[str, Set[str]] = {}
+                for symbol_raw, tf_raw in config:
+                    sym_norm = _normalize_symbol(symbol_raw)
+                    tf_norm = _map_timeframe_label(tf_raw)
+                    mtf_targets_by_symbol.setdefault(sym_norm, set()).add(tf_norm)
                 # Якщо tick-agg внутрішньо вже закрив бар, але history ще не
                 # опублікував complete=true (з Volume), форсуємо history poll
                 # якнайшвидше для відповідних таргетів.
@@ -6164,10 +6572,9 @@ def stream_fx_data(
                         tick_meta = tick_ohlcv_worker.snapshot_metadata()
                         last_complete = tick_meta.get("last_complete_close_ms")
                         if isinstance(last_complete, Mapping):
-                            for symbol_raw, tf_raw in config:
-                                tf_norm = _map_timeframe_label(tf_raw)
-                                if tf_norm not in tick_agg_timeframes:
-                                    continue
+                            for symbol_raw, _tf_raw in config:
+                                # History підтягуємо лише для 1m.
+                                tf_norm = BASE_HISTORY_TF_NORM
                                 symbol_norm = _normalize_symbol(symbol_raw)
                                 sym_map = last_complete.get(symbol_norm)
                                 if not isinstance(sym_map, Mapping):
@@ -6176,13 +6583,13 @@ def stream_fx_data(
                                 if tick_close_ms is None:
                                     continue
                                 published_close_ms = gate.last_close_ms(
-                                    symbol=symbol_raw, timeframe=tf_raw
+                                    symbol=symbol_raw, timeframe=BASE_HISTORY_TF_RAW
                                 )
                                 if (
                                     published_close_ms is None
                                     or int(tick_close_ms) > int(published_close_ms)
                                 ):
-                                    forced_history_targets.add((symbol_raw, tf_raw))
+                                    forced_history_targets.add((symbol_raw, BASE_HISTORY_TF_RAW))
                     except Exception:  # noqa: BLE001
                         # Діагностика не має ламати стрім.
                         pass
@@ -6192,19 +6599,22 @@ def stream_fx_data(
                 else:
                     # Спочатку пробуємо таргети, де tick-agg уже закрив бар,
                     # щоб швидше підтягнути complete=true з history.
+                    # Poll history лише по одному разу на символ (1m).
                     ordered_targets: List[Tuple[str, str]] = []
+                    seen_symbols: Set[str] = set()
+                    for symbol_raw, _tf_raw in config:
+                        if symbol_raw in seen_symbols:
+                            continue
+                        seen_symbols.add(symbol_raw)
+                        ordered_targets.append((symbol_raw, BASE_HISTORY_TF_RAW))
+
                     if forced_history_targets:
-                        ordered_targets.extend(
-                            [item for item in config if item in forced_history_targets]
+                        ordered_targets.sort(
+                            key=lambda item: 0 if item in forced_history_targets else 1
                         )
-                        ordered_targets.extend(
-                            [item for item in config if item not in forced_history_targets]
-                        )
-                    else:
-                        ordered_targets = list(config)
 
                     for symbol, tf_raw in ordered_targets:
-                        tf_norm = _map_timeframe_label(tf_raw)
+                        tf_norm = BASE_HISTORY_TF_NORM
                         if tick_cadence is not None:
                             allow_cadence = cadence_allowances.get(tf_norm)
                             if allow_cadence is None:
@@ -6307,6 +6717,62 @@ def stream_fx_data(
 
                         if df_new.empty:
                             continue
+
+                        # Після оновлення 1m history — агрегуємо complete бари у старші TF.
+                        try:
+                            symbol_norm = _normalize_symbol(symbol)
+                            desired_tfs = mtf_targets_by_symbol.get(symbol_norm, set())
+                            for target_tf in sorted(desired_tfs):
+                                if target_tf == BASE_HISTORY_TF_NORM:
+                                    continue
+                                key = (symbol_norm, str(target_tf))
+                                agg = mtf_aggregators.get(key)
+                                if agg is None:
+                                    agg = HistoryMtfCompleteAggregator(
+                                        symbol_norm=symbol_norm,
+                                        target_tf=str(target_tf),
+                                    )
+                                    mtf_aggregators[key] = agg
+                                df_agg = agg.ingest_df_1m(df_new)
+                                if df_agg is None or df_agg.empty:
+                                    continue
+                                if session_stats_tracker is not None:
+                                    session_stats_tracker.ingest(
+                                        symbol, str(target_tf), df_agg
+                                    )
+                                if ohlcv_sink_effective is not None:
+                                    batch = OhlcvBatch(
+                                        symbol=_normalize_symbol(symbol),
+                                        timeframe=str(target_tf),
+                                        data=df_agg.copy(deep=False),
+                                        fetched_at=time.time(),
+                                        source=HISTORY_AGG_SOURCE,
+                                    )
+                                    ohlcv_sink_effective(batch)
+                                else:
+                                    publish_ohlcv_to_redis(
+                                        df_agg,
+                                        symbol=symbol,
+                                        timeframe=str(target_tf),
+                                        redis_client=current_redis,
+                                        data_gate=gate,
+                                        min_publish_interval=publish_interval_seconds,
+                                        publish_rate_limit=publish_rate_limit,
+                                        hmac_secret=hmac_secret,
+                                        hmac_algo=hmac_algo,
+                                        source=HISTORY_AGG_SOURCE,
+                                    )
+
+                                if mtf_crosscheck_ctrl is not None:
+                                    mtf_crosscheck_ctrl.maybe_check_from_agg_df(
+                                        current_fx,
+                                        symbol_raw=symbol,
+                                        target_tf=str(target_tf),
+                                        df_agg=df_agg,
+                                    )
+                        except Exception:  # noqa: BLE001
+                            # MTF-агрегація не повинна ламати базовий стрім.
+                            pass
 
                         # Калібруємо preview volume під FXCM history: зіставляємо
                         # history Volume із tick_count з tick-agg (по open_time).
@@ -6599,6 +7065,45 @@ def stream_fx_data(
                     sleep_for = max(sleep_for, redis_backoff_remaining)
 
             if status_bar is not None:
+                ohlcv_live_age_seconds: Optional[float] = None
+                try:
+                    live_ages: List[float] = []
+                    for sym, tf_raw in config:
+                        value = gate.live_age_seconds(symbol=sym, timeframe=tf_raw)
+                        if value is not None:
+                            live_ages.append(float(value))
+                    if live_ages:
+                        ohlcv_live_age_seconds = float(min(live_ages))
+                except Exception:  # noqa: BLE001
+                    ohlcv_live_age_seconds = None
+
+                supervisor_backpressure: Optional[bool] = None
+                supervisor_ohlcv_queue: Optional[int] = None
+                supervisor_ohlcv_dropped: Optional[int] = None
+                if async_supervisor is not None:
+                    try:
+                        diag = async_supervisor.diagnostics_snapshot()
+                        if isinstance(diag, Mapping):
+                            supervisor_backpressure = bool(diag.get("backpressure"))
+                            queues = diag.get("queues")
+                            if isinstance(queues, list):
+                                for entry in queues:
+                                    if not isinstance(entry, Mapping):
+                                        continue
+                                    if str(entry.get("name")) != "ohlcv":
+                                        continue
+                                    try:
+                                        supervisor_ohlcv_queue = int(entry.get("size"))
+                                    except (TypeError, ValueError):
+                                        supervisor_ohlcv_queue = None
+                                    try:
+                                        supervisor_ohlcv_dropped = int(entry.get("dropped"))
+                                    except (TypeError, ValueError):
+                                        supervisor_ohlcv_dropped = None
+                                    break
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 status_bar.update(
                     {
                         "mode": "idle" if market_pause else "stream",
@@ -6609,11 +7114,15 @@ def stream_fx_data(
                         "next_open": last_idle_next_open,
                         "idle_reason": idle_reason,
                         "lag_seconds": lag_seconds,
+                        "ohlcv_live_age_seconds": ohlcv_live_age_seconds,
                         "redis_connected": current_redis is not None,
                         "sleep_for": sleep_for,
                         "cycle_published_bars": cycle_published_bars,
                         "history_backoff_seconds": history_backoff_remaining,
                         "redis_backoff_seconds": redis_backoff_remaining,
+                        "supervisor_backpressure": supervisor_backpressure,
+                        "supervisor_ohlcv_queue": supervisor_ohlcv_queue,
+                        "supervisor_ohlcv_dropped": supervisor_ohlcv_dropped,
                     }
                 )
 
@@ -6744,98 +7253,141 @@ def main() -> None:
             return
 
         if cache_manager is not None:
+            targets_by_symbol: Dict[str, Set[str]] = {}
             for symbol, tf_raw in stream_config:
+                tf_norm = _map_timeframe_label(tf_raw)
+                targets_by_symbol.setdefault(symbol, set()).add(tf_norm)
+
+            for symbol, tf_set in targets_by_symbol.items():
+                # Кеш/FXCM history прогріваємо лише для 1m.
                 cache_manager.ensure_ready(
                     fx_active,
                     symbol_raw=symbol,
-                    timeframe_raw=tf_raw,
+                    timeframe_raw=BASE_HISTORY_TF_RAW,
                 )
                 redis_conn = redis_holder["client"]
                 if redis_conn is None:
                     continue
-                tf_norm = _map_timeframe_label(tf_raw)
-                force_warmup = _tf_to_minutes(tf_norm) == 1
-                warmup_slice = cache_manager.get_bars_to_publish(
+
+                # 1m warmup з кешу.
+                warmup_1m = cache_manager.get_bars_to_publish(
                     symbol_raw=symbol,
-                    timeframe_raw=tf_raw,
+                    timeframe_raw=BASE_HISTORY_TF_RAW,
                     limit=cache_manager.warmup_bars,
-                    force=force_warmup,
+                    force=True,
                 )
-                if warmup_slice.empty:
-                    continue
-                try:
-                    publish_ohlcv_to_redis(
-                        warmup_slice,
-                        symbol=symbol,
-                        timeframe=tf_norm,
-                        redis_client=redis_conn,
-                        data_gate=publish_gate,
-                        hmac_secret=config.hmac_secret,
-                        hmac_algo=config.hmac_algo,
-                    )
-                except RedisRetryableError as exc:
-                    PROM_ERROR_COUNTER.labels(type="redis").inc()
-                    log.warning("Warmup із кешу: Redis недоступний: %s", exc)
-                    if stream_mode and redis_reconnector is not None:
-                        redis_conn = redis_reconnector()
-                        try:
-                            publish_ohlcv_to_redis(
-                                warmup_slice,
-                                symbol=symbol,
-                                timeframe=tf_norm,
-                                redis_client=redis_conn,
-                                data_gate=publish_gate,
-                                hmac_secret=config.hmac_secret,
-                                hmac_algo=config.hmac_algo,
-                            )
-                        except RedisRetryableError as inner_exc:
-                            log.error(
-                                "Warmup із кешу: повторна помилка Redis: %s",
-                                inner_exc,
-                            )
+                if not warmup_1m.empty:
+                    try:
+                        publish_ohlcv_to_redis(
+                            warmup_1m,
+                            symbol=symbol,
+                            timeframe=BASE_HISTORY_TF_NORM,
+                            redis_client=redis_conn,
+                            data_gate=publish_gate,
+                            hmac_secret=config.hmac_secret,
+                            hmac_algo=config.hmac_algo,
+                        )
+                    except RedisRetryableError as exc:
+                        PROM_ERROR_COUNTER.labels(type="redis").inc()
+                        log.warning("Warmup із кешу: Redis недоступний: %s", exc)
+                        if stream_mode and redis_reconnector is not None:
+                            redis_conn = redis_reconnector()
+                            try:
+                                publish_ohlcv_to_redis(
+                                    warmup_1m,
+                                    symbol=symbol,
+                                    timeframe=BASE_HISTORY_TF_NORM,
+                                    redis_client=redis_conn,
+                                    data_gate=publish_gate,
+                                    hmac_secret=config.hmac_secret,
+                                    hmac_algo=config.hmac_algo,
+                                )
+                            except RedisRetryableError as inner_exc:
+                                log.error(
+                                    "Warmup із кешу: повторна помилка Redis: %s",
+                                    inner_exc,
+                                )
+                                redis_holder["client"] = None
+                                continue
+                        else:
                             redis_holder["client"] = None
                             continue
-                    else:
-                        redis_holder["client"] = None
-                        continue
 
-                last_published = int(warmup_slice["open_time"].max())
-                cache_manager.mark_published(
-                    symbol_raw=symbol,
-                    timeframe_raw=tf_raw,
-                    last_open_time=last_published,
-                )
-                _sync_market_status_with_calendar(redis_conn)
-                last_close_ms = int(warmup_slice["close_time"].max())
-                lag_seconds = _calc_lag_seconds(last_close_ms)
-                warmup_context: Dict[str, Any] = {
-                    "channel": config.observability.heartbeat_channel,
-                    "mode": "warmup_cache",
-                    "redis_connected": redis_conn is not None,
-                    "redis_required": config.redis_required,
-                    "redis_channel": REDIS_CHANNEL,
-                    "stream_targets": _stream_targets_summary(
-                        [(symbol, tf_raw)], publish_gate
-                    ),
-                    "published_bars": len(warmup_slice),
-                    "cache_source": "history_cache",
-                }
-                if lag_seconds is not None:
-                    warmup_context["lag_seconds"] = lag_seconds
-                warmup_context["session"] = _build_session_context(next_open=None)
-                _publish_heartbeat(
-                    redis_conn,
-                    config.observability.heartbeat_channel,
-                    state="warmup_cache",
-                    last_bar_close_ms=last_close_ms,
-                    context=warmup_context,
-                )
-                log.debug(
-                    "Warmup із локального кешу: %s %s → %d барів",
-                    symbol,
-                    tf_raw,
-                    len(warmup_slice),
-                )
+                    last_published = int(warmup_1m["open_time"].max())
+                    cache_manager.mark_published(
+                        symbol_raw=symbol,
+                        timeframe_raw=BASE_HISTORY_TF_RAW,
+                        last_open_time=last_published,
+                    )
+                    _sync_market_status_with_calendar(redis_conn)
+                    last_close_ms = int(warmup_1m["close_time"].max())
+                    lag_seconds = _calc_lag_seconds(last_close_ms)
+                    warmup_context: Dict[str, Any] = {
+                        "channel": config.observability.heartbeat_channel,
+                        "mode": "warmup_cache",
+                        "redis_connected": redis_conn is not None,
+                        "redis_required": config.redis_required,
+                        "redis_channel": REDIS_CHANNEL,
+                        "stream_targets": _stream_targets_summary(
+                            [(symbol, BASE_HISTORY_TF_RAW)], publish_gate
+                        ),
+                        "published_bars": len(warmup_1m),
+                        "cache_source": "history_cache",
+                    }
+                    if lag_seconds is not None:
+                        warmup_context["lag_seconds"] = lag_seconds
+                    warmup_context["session"] = _build_session_context(next_open=None)
+                    _publish_heartbeat(
+                        redis_conn,
+                        config.observability.heartbeat_channel,
+                        state="warmup_cache",
+                        last_bar_close_ms=last_close_ms,
+                        context=warmup_context,
+                    )
+                    log.debug(
+                        "Warmup із локального кешу: %s %s → %d барів",
+                        symbol,
+                        BASE_HISTORY_TF_RAW,
+                        len(warmup_1m),
+                    )
+
+                # Старші TF warmup: агрегація з 1m кешу.
+                try:
+                    symbol_norm = _normalize_symbol(symbol)
+                    record = cache_manager._load(symbol_norm, BASE_HISTORY_TF_NORM)
+                    df_cache_1m = record.data
+                except Exception:  # noqa: BLE001
+                    df_cache_1m = pd.DataFrame()
+
+                if df_cache_1m is None or df_cache_1m.empty:
+                    continue
+
+                for tf_norm in sorted({tf for tf in tf_set if tf != BASE_HISTORY_TF_NORM}):
+                    agg = HistoryMtfCompleteAggregator(
+                        symbol_norm=_normalize_symbol(symbol),
+                        target_tf=tf_norm,
+                    )
+                    df_agg_all = agg.ingest_df_1m(df_cache_1m)
+                    if df_agg_all is None or df_agg_all.empty:
+                        continue
+                    warmup_limit = max(1, int(cache_manager.warmup_bars // max(1, _tf_to_minutes(tf_norm))))
+                    df_agg = cast(pd.DataFrame, df_agg_all.tail(int(warmup_limit)).reset_index(drop=True))
+                    if df_agg.empty:
+                        continue
+                    try:
+                        publish_ohlcv_to_redis(
+                            df_agg,
+                            symbol=symbol,
+                            timeframe=tf_norm,
+                            redis_client=redis_conn,
+                            data_gate=publish_gate,
+                            hmac_secret=config.hmac_secret,
+                            hmac_algo=config.hmac_algo,
+                            source=HISTORY_AGG_SOURCE,
+                        )
+                    except RedisRetryableError:
+                        # Warmup для старших TF не критичний: 1m все одно прогрівається.
+                        continue
         if stream_mode:
             if config.redis_required:
                 if redis is None:
@@ -7039,6 +7591,7 @@ def main() -> None:
                     tick_cadence=tick_cadence_controller,
                     tick_aggregation_enabled=config.tick_aggregation_enabled,
                     tick_aggregation_timeframes=("1m", "5m"),
+                    mtf_crosscheck=config.mtf_crosscheck,
                     status_bar=status_bar,
                     universe=universe,
                     universe_update_callback=_on_universe_update,

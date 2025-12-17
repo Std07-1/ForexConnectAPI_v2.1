@@ -31,3 +31,28 @@
 - `fxcm_schema.py`: оновлено TypedDict-контракти для `fxcm:status.session.symbols` та додано runtime-валідацію `validate_status_payload_contract` + контрактний тест.
 - VolumeCalibrator: зроблено адаптивне підбирання `k` (порівняння median vs L2 по MAPE) та додано в heartbeat `predicted_volume` і `err_pct` для останнього семпла, щоб було видно “як ми вчимось” і чи тримаємо цільову похибку.
 - Debug viewer (VCAL): додано колонки `method`, `pred`, `err%` для швидкої оцінки точності калібрування.
+- Cache: піднято `cache.max_bars` до 30000, щоб дефолтно вміщати 14d історії для 1m (20160 барів) і швидко віддавати warmup після рестарту SMC.
+- History get_history: нормалізовано передавання таймфрейму у FXCM (`1h` → `H1`, `4h` → `H4` тощо) в усіх шляхах завантаження історії, щоб уникати порожніх відповідей/помилок через неправильний формат tf.
+- Додано утиліту `tools/history_probe.py` для швидкої серверної перевірки, чи FXCM реально віддає history для `m15/m60/h4` (з тим самим мапінгом tf, що в конекторі).
+
+## v2.5 (2025-12-16)
+
+- MTF масштабування: стрім FXCM history тепер опитує лише базовий TF `1m` (FXCM=`m1`) по кожному символу, а старші TF для `complete=true` будуються локально з 1m історії.
+- Додано публікацію `complete=true` старших TF (`5m/15m/1h/4h`) зі штампом `source=history_agg` (всередині барів і на рівні root payload), щоб downstream міг явно відрізняти «істину з history» від похідних.
+- Tick preview (UI): додано агрегацію live-барів (complete=false) для `15m/1h/4h` (плюс виправлено пропуск публікації live-барів для `5m+`, які раніше рахувалися, але не віддавалися назовні).
+- Warmup із кешу: прогрів/ensure_ready виконується лише для `1m`, а warmup старших TF публікується як `history_agg`, побудований з 1m кешу (без окремого FXCM history polling для кожного TF).
+- Додано тест `tests/test_mtf_history_aggregation.py`, що перевіряє: (1) FXCM history викликається лише з `m1`, (2) у Redis з'являються `1h` бари, агреговані з 1m.
+- Tick preview: зменшено кількість викликів `time.monotonic()` у `TickOhlcvWorker` при fanout на кілька TF (передаємо один `now_monotonic` через `_process_tick` → `_ingest_into_higher_preview_aggs` → `_publish_tick_bar`).
+- Тести tick-preview: стабілізовано перевірки — після додавання публікації 5m/15m/1h/4h preview, вибір перевіряємого batch робиться по `timeframe=="1m"`, а не по `captured[-1]`.
+- Прибрано попередження Pylance у `publish_ohlcv_to_redis` (pandas маски без `== True/False`) та у `VolumeCalibrator` (звуження Optional/Any без зміни логіки).
+- VolumeCalibrator: для MTF tick-preview, якщо немає окремого `k` на старшому TF, використовується `k` з базового `1m` (tick_count агрегується лінійно).
+- Додано тест, що перевіряє fallback калібрування `1m → 5m` preview.
+
+## v2.6 (2025-12-17)
+
+- Додано MTF cross-check: періодично звіряємо `history_agg` (агрегація з 1m) з прямим FXCM history для `1h/4h` і сигналізуємо `WARNING` при розбіжності понад допустимий поріг.
+- Налаштування керуються через `config/runtime_settings.json` → `stream.mtf_crosscheck` (enabled, timeframes, min_interval_seconds, пороги для ціни/обʼєму).
+- Додано тест `tests/test_mtf_crosscheck.py` для warning при розбіжності.
+- Tick-agg: зроблено захист від падіння worker-а, якщо `ohlcv_sink` тимчасово не приймає батч (backpressure/помилка публікації) — тепер батч дропається, логується `DEBUG` і інкрементиться `PROM_ERROR_COUNTER(type="tick_agg_sink")`. Це знижує ризик, що після паузи ринку/Redis затримок UI перестає отримувати live-preview.
+- Async supervisor: для черги `ohlcv` увімкнено `drop_oldest=True` при переповненні, щоб backpressure не робив `fxcm:ohlcv` повністю «глухим» (особливо критично для live-preview `complete=false`).
+- Console status bar: додано `ohlcv_live_age` (час від останнього publish `complete=false`) та `ohlcv_pipe` (черга/drops/backpressure supervisor), щоб швидко відрізнити проблему FXCM тикового потоку від нашого пайплайна/Redis.

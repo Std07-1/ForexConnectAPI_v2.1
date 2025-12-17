@@ -160,6 +160,18 @@ def _coerce_float(value: Any, default: float, *, min_value: float = 0.1) -> floa
     return max(min_value, parsed)
 
 
+def _coerce_nonneg_float(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed != parsed:  # noqa: PLR1716 - перевірка NaN
+        return default
+    return max(0.0, parsed)
+
+
 def _coerce_ratio(value: Any, default: float) -> float:
     if value is None:
         return default
@@ -237,6 +249,18 @@ class BackoffSettings:
     fxcm_login: BackoffPolicy
     fxcm_stream: BackoffPolicy
     redis_stream: BackoffPolicy
+
+
+@dataclass(frozen=True)
+class MtfCrosscheckSettings:
+    enabled: bool
+    timeframes: List[str]
+    min_interval_seconds: float
+    max_checks_per_cycle: int
+    price_abs_tol: float
+    price_rel_tol: float
+    volume_abs_tol: float
+    volume_rel_tol: float
 
 
 @dataclass(frozen=True)
@@ -404,6 +428,7 @@ class FXCMConfig:
     tick_aggregation_enabled: bool
     tick_aggregation_max_synth_gap_minutes: int
     tick_aggregation_live_publish_interval_seconds: float
+    mtf_crosscheck: MtfCrosscheckSettings
     commands_channel: str
     dynamic_universe_enabled: bool
     dynamic_universe_default_targets: List[Tuple[str, str]]
@@ -593,6 +618,31 @@ def load_config() -> FXCMConfig:
         min_value=0.05,
     )
 
+    mtf_cross_raw = stream_cfg.get("mtf_crosscheck")
+    mtf_cross_cfg = mtf_cross_raw if isinstance(mtf_cross_raw, Mapping) else {}
+    mtf_cross_enabled = _coerce_bool(mtf_cross_cfg.get("enabled"), False)
+
+    tfs_raw = mtf_cross_cfg.get("timeframes")
+    if isinstance(tfs_raw, list):
+        mtf_cross_tfs = [str(x).strip() for x in tfs_raw if str(x).strip()]
+    else:
+        mtf_cross_tfs = ["1h", "4h"]
+
+    mtf_crosscheck = MtfCrosscheckSettings(
+        enabled=bool(mtf_cross_enabled),
+        timeframes=list(mtf_cross_tfs),
+        min_interval_seconds=float(
+            _coerce_nonneg_float(mtf_cross_cfg.get("min_interval_seconds"), 3600.0)
+        ),
+        max_checks_per_cycle=int(
+            _coerce_int(mtf_cross_cfg.get("max_checks_per_cycle"), 1, min_value=0)
+        ),
+        price_abs_tol=float(_coerce_nonneg_float(mtf_cross_cfg.get("price_abs_tol"), 1e-4)),
+        price_rel_tol=float(_coerce_nonneg_float(mtf_cross_cfg.get("price_rel_tol"), 1e-8)),
+        volume_abs_tol=float(_coerce_nonneg_float(mtf_cross_cfg.get("volume_abs_tol"), 1e-6)),
+        volume_rel_tol=float(_coerce_nonneg_float(mtf_cross_cfg.get("volume_rel_tol"), 1e-6)),
+    )
+
     sample_cfg_raw = runtime_settings.get("sample_request")
     sample_cfg = sample_cfg_raw if isinstance(sample_cfg_raw, dict) else {}
     sample_request = SampleRequestSettings(
@@ -713,6 +763,7 @@ def load_config() -> FXCMConfig:
         tick_aggregation_enabled=tick_aggregation_enabled,
         tick_aggregation_max_synth_gap_minutes=tick_aggregation_max_synth_gap_minutes,
         tick_aggregation_live_publish_interval_seconds=tick_aggregation_live_publish_interval_seconds,
+        mtf_crosscheck=mtf_crosscheck,
         commands_channel=commands_channel,
         dynamic_universe_enabled=dynamic_universe_enabled,
         dynamic_universe_default_targets=dynamic_universe_default_targets,

@@ -668,7 +668,7 @@ class TickAggFutureTickSkewTest(unittest.TestCase):
             worker._process_tick(tick)  # type: ignore[attr-defined]
 
         self.assertTrue(captured)
-        last = captured[-1]
+        last = next(b for b in reversed(captured) if b.timeframe == "1m")
         open_time = int(last.data["open_time"].iloc[0])
         self.assertLessEqual(open_time, now_ms)
 
@@ -705,7 +705,7 @@ class TickAggFutureTickSkewTest(unittest.TestCase):
             worker._process_tick(tick2)  # type: ignore[attr-defined]
 
         self.assertTrue(captured)
-        last = captured[-1]
+        last = next(b for b in reversed(captured) if b.timeframe == "1m")
         payload_volume = float(last.data["volume"].iloc[0])
         payload_ticks = int(last.data["tick_count"].iloc[0])
         self.assertEqual(payload_ticks, 2)
@@ -799,11 +799,60 @@ class TickAggFutureTickSkewTest(unittest.TestCase):
             worker._process_tick(tick4)  # type: ignore[attr-defined]
 
         self.assertTrue(captured)
-        last = captured[-1]
+        last = next(b for b in reversed(captured) if b.timeframe == "1m")
         payload_ticks = int(last.data["tick_count"].iloc[0])
         payload_volume = float(last.data["volume"].iloc[0])
         self.assertEqual(payload_ticks, 1)
         self.assertEqual(payload_volume, 5.0)
+
+    def test_tick_worker_uses_1m_calibration_for_higher_tf_preview(self) -> None:
+        captured: list[OhlcvBatch] = []
+        worker = connector.TickOhlcvWorker(
+            enabled=True,
+            symbols=["XAU/USD"],
+            max_synth_gap_minutes=0,
+            live_publish_min_interval_seconds=0.0,
+            ohlcv_sink=captured.append,
+        )
+
+        # Калібруємо лише 1m: history Volume=10 при tick_count=2 → k=5.
+        base = 1_700_000_000.0
+        bar1_open_ms = int(base * 1000) - (int(base * 1000) % 60_000)
+        connector._VOLUME_CALIBRATOR.update_from_history_bar(
+            symbol_norm="XAUUSD",
+            tf_norm="1m",
+            open_time_ms=bar1_open_ms,
+            history_volume=10.0,
+            tick_count=2,
+        )
+
+        # Два тики в одному 1m bucket мають дати 1m live-bar з tick_count=2.
+        tick1 = connector.PriceTick(
+            symbol="XAUUSD",
+            bid=2000.0,
+            ask=2000.2,
+            mid=2000.1,
+            tick_ts=base + 1.0,
+        )
+        tick2 = connector.PriceTick(
+            symbol="XAUUSD",
+            bid=2000.1,
+            ask=2000.3,
+            mid=2000.2,
+            tick_ts=base + 2.0,
+        )
+        with mock.patch("connector.time.time", return_value=base + 2.0), mock.patch(
+            "connector.time.monotonic", side_effect=[1.0, 1.1]
+        ):
+            worker._process_tick(tick1)  # type: ignore[attr-defined]
+            worker._process_tick(tick2)  # type: ignore[attr-defined]
+
+        # Очікуємо, що 5m preview також отримає калібрування з 1m (k=5).
+        batch_5m = next(b for b in reversed(captured) if b.timeframe == "5m")
+        payload_ticks_5m = int(batch_5m.data["tick_count"].iloc[0])
+        payload_volume_5m = float(batch_5m.data["volume"].iloc[0])
+        self.assertEqual(payload_ticks_5m, 2)
+        self.assertEqual(payload_volume_5m, 10.0)
 
 
 class NormalizeHistoryDropsIncompleteTest(unittest.TestCase):
