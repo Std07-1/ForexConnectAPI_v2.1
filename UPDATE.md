@@ -56,3 +56,11 @@
 - Tick-agg: зроблено захист від падіння worker-а, якщо `ohlcv_sink` тимчасово не приймає батч (backpressure/помилка публікації) — тепер батч дропається, логується `DEBUG` і інкрементиться `PROM_ERROR_COUNTER(type="tick_agg_sink")`. Це знижує ризик, що після паузи ринку/Redis затримок UI перестає отримувати live-preview.
 - Async supervisor: для черги `ohlcv` увімкнено `drop_oldest=True` при переповненні, щоб backpressure не робив `fxcm:ohlcv` повністю «глухим» (особливо критично для live-preview `complete=false`).
 - Console status bar: додано `ohlcv_live_age` (час від останнього publish `complete=false`) та `ohlcv_pipe` (черга/drops/backpressure supervisor), щоб швидко відрізнити проблему FXCM тикового потоку від нашого пайплайна/Redis.
+
+## v2.7 (2025-12-17)
+
+- Додано готовий профіль для прогону на ~20 активах: `config/runtime_settings_20_assets.json` (40+ таргетів: 20 символів × `m1/m5`, плюс `XAU/USD:h1/h4` для MTF probe).
+
+## v2.8 (2025-12-17)
+
+- `connector.py`: виправлено проблеми типізації (Pylance) у формуванні `ohlcv_live_age_seconds` та парсингу `supervisor_ohlcv_queue/supervisor_ohlcv_dropped` (без зміни runtime-логіки).

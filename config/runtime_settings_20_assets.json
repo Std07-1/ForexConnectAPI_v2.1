@@ -1,0 +1,113 @@
+{
+    "cache": {
+        "dir": "cache",
+        "max_bars": 30000,
+        "warmup_bars": 1600
+    },
+    "stream": {
+        "mode": 1,
+        "async_supervisor": true,
+        "poll_seconds": 5,
+        "fetch_interval_seconds": 5,
+        "publish_interval_seconds": 5,
+        "telemetry_min_publish_interval_seconds": 5,
+        "lookback_minutes": 5,
+        "config": "XAU/USD:m1,XAU/USD:m5,XAU/USD:h1,XAU/USD:h4,EUR/USD:m1,EUR/USD:m5,GBP/USD:m1,GBP/USD:m5,USD/JPY:m1,USD/JPY:m5,USD/CHF:m1,USD/CHF:m5,USD/CAD:m1,USD/CAD:m5,AUD/USD:m1,AUD/USD:m5,NZD/USD:m1,NZD/USD:m5,EUR/JPY:m1,EUR/JPY:m5,GBP/JPY:m1,GBP/JPY:m5,AUD/JPY:m1,AUD/JPY:m5,EUR/GBP:m1,EUR/GBP:m5,EUR/CHF:m1,EUR/CHF:m5,GBP/CHF:m1,GBP/CHF:m5,CAD/JPY:m1,CAD/JPY:m5,CHF/JPY:m1,CHF/JPY:m5,AUD/CAD:m1,AUD/CAD:m5,AUD/CHF:m1,AUD/CHF:m5,EUR/CAD:m1,EUR/CAD:m5",
+        "price_snap_channel": "fxcm:price_tik",
+        "price_snap_interval_seconds": 3,
+        "commands_channel": "fxcm:commands",
+        "dynamic_universe_enabled": false,
+        "dynamic_universe_default_targets": "XAU/USD:m1,XAU/USD:m5,XAU/USD:h1,XAU/USD:h4,EUR/USD:m1,EUR/USD:m5,GBP/USD:m1,GBP/USD:m5,USD/JPY:m1,USD/JPY:m5,USD/CHF:m1,USD/CHF:m5,USD/CAD:m1,USD/CAD:m5,AUD/USD:m1,AUD/USD:m5,NZD/USD:m1,NZD/USD:m5,EUR/JPY:m1,EUR/JPY:m5,GBP/JPY:m1,GBP/JPY:m5,AUD/JPY:m1,AUD/JPY:m5,EUR/GBP:m1,EUR/GBP:m5,EUR/CHF:m1,EUR/CHF:m5,GBP/CHF:m1,GBP/CHF:m5,CAD/JPY:m1,CAD/JPY:m5,CHF/JPY:m1,CHF/JPY:m5,AUD/CAD:m1,AUD/CAD:m5,AUD/CHF:m1,AUD/CHF:m5,EUR/CAD:m1,EUR/CAD:m5",
+        "dynamic_universe_max_targets": 60,
+        "backfill_min_minutes": 10,
+        "backfill_max_minutes": 360,
+        "tick_cadence": {
+            "live_threshold_seconds": 45,
+            "idle_threshold_seconds": 180,
+            "live_multiplier": 1.1,
+            "idle_multiplier": 3.0
+        },
+        "history_max_calls_per_min": 360,
+        "history_max_calls_per_hour": 7200,
+        "history_min_interval_seconds_m1": 2,
+        "history_min_interval_seconds_m5": 6,
+        "history_priority_targets": [
+            "XAU/USD:m1"
+        ],
+        "history_priority_reserve_per_min": 108,
+        "history_priority_reserve_per_hour": 2160,
+        "history_load_thresholds": {
+            "min_interval": 0.7,
+            "warn": 0.85,
+            "reserve": 0.9,
+            "critical": 0.95
+        },
+        "history_backoff": {
+            "base_seconds": 6,
+            "max_seconds": 120,
+            "multiplier": 2,
+            "jitter": 0.3
+        },
+        "redis_backoff": {
+            "base_seconds": 2,
+            "max_seconds": 45,
+            "multiplier": 2,
+            "jitter": 0.25
+        },
+        "tick_aggregation_enabled": true,
+        "tick_aggregation_max_synth_gap_minutes": 60,
+        "tick_aggregation_live_publish_interval_seconds": 0.25,
+        "mtf_crosscheck": {
+            "enabled": true,
+            "timeframes": [
+                "1h",
+                "4h"
+            ],
+            "min_interval_seconds": 3600,
+            "max_checks_per_cycle": 1,
+            "price_abs_tol": 0.0001,
+            "price_rel_tol": 0.00000001,
+            "volume_abs_tol": 0.000001,
+            "volume_rel_tol": 0.000001
+        }
+    },
+    "sample_request": {
+        "symbol": "XAU/USD",
+        "timeframe": "m1",
+        "hours": 24
+    },
+    "viewer": {
+        "heartbeat_channel": "fxcm:heartbeat",
+        "market_status_channel": "fxcm:market_status",
+        "ohlcv_channel": "fxcm:ohlcv",
+        "redis_health_interval": 8,
+        "lag_spike_threshold": 180,
+        "heartbeat_alert_seconds": 45,
+        "ohlcv_msg_idle_warn_seconds": 90,
+        "ohlcv_msg_idle_error_seconds": 180,
+        "ohlcv_lag_warn_seconds": 45,
+        "ohlcv_lag_error_seconds": 120,
+        "sleep_model_gap_threshold_minutes": 60,
+        "timeline_matrix_rows": 10,
+        "timeline_max_columns": 120,
+        "timeline_history_max": 2400,
+        "timeline_focus_minutes": 30
+    },
+    "backoff": {
+        "fxcm_login": {
+            "base_delay": 2.0,
+            "factor": 2.0,
+            "max_delay": 60.0
+        },
+        "fxcm_stream": {
+            "base_delay": 5.0,
+            "factor": 2.0,
+            "max_delay": 300.0
+        },
+        "redis_stream": {
+            "base_delay": 1.0,
+            "factor": 2.0,
+            "max_delay": 60.0
+        }
+    }
+}

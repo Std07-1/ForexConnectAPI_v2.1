@@ -6905,12 +6905,14 @@ def stream_fx_data(
                 }
                 targets_view = idle_context.get("stream_targets")
                 if isinstance(targets_view, list):
-                    live_ages = [
-                        _float_or_none(entry.get("live_age_seconds"))
-                        for entry in targets_view
-                        if isinstance(entry, Mapping)
-                    ]
-                    live_ages = [value for value in live_ages if value is not None]
+                    live_ages: List[float] = []
+                    for entry in targets_view:
+                        if not isinstance(entry, Mapping):
+                            continue
+                        value = _float_or_none(entry.get("live_age_seconds"))
+                        if value is None:
+                            continue
+                        live_ages.append(float(value))
                     if live_ages:
                         idle_context["ohlcv_live_age_seconds"] = float(min(live_ages))
                 if universe_active_symbols_count is not None:
@@ -6991,12 +6993,14 @@ def stream_fx_data(
                 }
                 targets_view = stream_context.get("stream_targets")
                 if isinstance(targets_view, list):
-                    live_ages = [
-                        _float_or_none(entry.get("live_age_seconds"))
-                        for entry in targets_view
-                        if isinstance(entry, Mapping)
-                    ]
-                    live_ages = [value for value in live_ages if value is not None]
+                    live_ages: List[float] = []
+                    for entry in targets_view:
+                        if not isinstance(entry, Mapping):
+                            continue
+                        value = _float_or_none(entry.get("live_age_seconds"))
+                        if value is None:
+                            continue
+                        live_ages.append(float(value))
                     if live_ages:
                         stream_context["ohlcv_live_age_seconds"] = float(min(live_ages))
                 if universe_active_symbols_count is not None:
@@ -7093,11 +7097,19 @@ def stream_fx_data(
                                     if str(entry.get("name")) != "ohlcv":
                                         continue
                                     try:
-                                        supervisor_ohlcv_queue = int(entry.get("size"))
+                                        raw_size = entry.get("size")
+                                        supervisor_ohlcv_queue = (
+                                            int(raw_size) if raw_size is not None else None
+                                        )
                                     except (TypeError, ValueError):
                                         supervisor_ohlcv_queue = None
                                     try:
-                                        supervisor_ohlcv_dropped = int(entry.get("dropped"))
+                                        raw_dropped = entry.get("dropped")
+                                        supervisor_ohlcv_dropped = (
+                                            int(raw_dropped)
+                                            if raw_dropped is not None
+                                            else None
+                                        )
                                     except (TypeError, ValueError):
                                         supervisor_ohlcv_dropped = None
                                     break
