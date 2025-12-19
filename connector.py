@@ -2157,6 +2157,18 @@ class HistoryCache:
                     self.records[key] = self._empty_record()
         return self.records[key]
 
+    def get_cached_df(self, symbol_raw: str, timeframe_raw: str) -> pd.DataFrame:
+        """Повертає поточний кешований DataFrame для `(symbol, tf)`.
+
+        Використовується для внутрішніх операцій (warmup/агрегації) без
+        дублювання читання з диска.
+        """
+
+        symbol_norm = _normalize_symbol(symbol_raw)
+        tf_norm = _map_timeframe_label(timeframe_raw)
+        record = self._load(symbol_norm, tf_norm)
+        return record.data
+
     def ensure_ready(
         self,
         fx: ForexConnect,
@@ -3225,6 +3237,53 @@ class FxcmCommandWorker:
             (_normalize_symbol(symbol), _map_timeframe_label(tf_raw))
             for symbol, tf_raw in (stream_targets or ())
         }
+        self._symbols_in_targets: Set[str] = {sym for sym, _ in self._targets}
+
+    @staticmethod
+    def _is_supported_mtf_warmup_tf(tf_norm: str) -> bool:
+        # Мінімальний набір, який нам реально потрібен для SMC warmup.
+        return str(tf_norm) in {"15m", "30m", "1h", "4h", "1d"}
+
+    def _prefetch_history_into_cache(
+        self,
+        fx: ForexConnect,
+        *,
+        symbol_fxcm: str,
+        timeframe_raw: str,
+        lookback_minutes: int,
+        min_history_bars: int,
+    ) -> None:
+        cache_manager = self._cache_manager
+        # У тестах `cache_manager` часто є mock. Prefetch не має
+        # робити реальні FXCM/pandas операції — лише для реального кеша.
+        if cache_manager is None or not isinstance(cache_manager, HistoryCache):
+            return
+        tf_norm = _map_timeframe_label(timeframe_raw)
+        tf_minutes = _tf_to_minutes(tf_norm)
+        desired_minutes = 0
+        if lookback_minutes > 0:
+            desired_minutes = int(lookback_minutes)
+        elif min_history_bars > 0:
+            desired_minutes = int(min_history_bars) * int(tf_minutes)
+        if desired_minutes <= 0:
+            return
+
+        end_dt = _now_utc()
+        start_dt = end_dt - dt.timedelta(minutes=int(desired_minutes))
+        df_range = _download_history_range(
+            fx,
+            symbol=symbol_fxcm,
+            timeframe_raw=timeframe_raw,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
+        if df_range is None or df_range.empty:
+            return
+        cache_manager.append_stream_bars(
+            symbol_raw=symbol_fxcm,
+            timeframe_raw=timeframe_raw,
+            df_new=df_range,
+        )
 
     def start(self) -> None:
         if self._redis_client is None:
@@ -3405,14 +3464,29 @@ class FxcmCommandWorker:
         symbol_fxcm = _denormalize_symbol(symbol_raw)
         symbol_norm = _normalize_symbol(symbol_fxcm)
 
-        if self._targets and (symbol_norm, tf_norm) not in self._targets:
-            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
-            log.info(
-                "S3: команда для нецільового інструменту, ігноруємо (%s %s)",
-                symbol_norm,
-                tf_norm,
-            )
-            return
+        if self._targets:
+            if symbol_norm not in self._symbols_in_targets:
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+                log.info(
+                    "S3: команда для нецільового інструменту, ігноруємо (%s %s)",
+                    symbol_norm,
+                    tf_norm,
+                )
+                return
+            if (symbol_norm, tf_norm) not in self._targets:
+                # Дозволяємо S3 warmup для MTF навіть якщо TF не прописаний у таргетах.
+                # Це потрібно, щоб SMC міг запросити прогрів 1h/4h, а ми віддали
+                # `history_agg` (похідний від 1m history) без прямого polling H1/H4.
+                if not (
+                    cmd_type == "fxcm_warmup" and self._is_supported_mtf_warmup_tf(tf_norm)
+                ):
+                    PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+                    log.info(
+                        "S3: команда для нецільового інструменту, ігноруємо (%s %s)",
+                        symbol_norm,
+                        tf_norm,
+                    )
+                    return
 
         key = (symbol_norm, tf_norm, cmd_type)
         now = time.monotonic()
@@ -3448,8 +3522,199 @@ class FxcmCommandWorker:
                 )
                 return
 
+            # Для tick TF (1m/5m): прогріваємо 1m history у кеш та публікуємо історичні бари,
+            # щоб SMC міг зробити повний warmup. Live tick-preview як і раніше лишається
+            # `complete=false`, тож правило "не змішувати" зберігається.
+            if tick_tf:
+                try:
+                    # Працюємо лише з базовим TF (1m) — без FXCM polling для m5.
+                    self._cache_manager.ensure_ready(
+                        fx,
+                        symbol_raw=symbol_fxcm,
+                        timeframe_raw=BASE_HISTORY_TF_RAW,
+                    )
+
+                    tf_minutes = _tf_to_minutes(tf_norm)
+                    bars_1m = (
+                        int(min_history_bars) * max(1, int(tf_minutes // _tf_to_minutes(BASE_HISTORY_TF_NORM)))
+                        if min_history_bars > 0
+                        else 0
+                    )
+                    # Опційний prefetch (лише для реального HistoryCache).
+                    self._prefetch_history_into_cache(
+                        fx,
+                        symbol_fxcm=symbol_fxcm,
+                        timeframe_raw=BASE_HISTORY_TF_RAW,
+                        lookback_minutes=lookback_minutes,
+                        min_history_bars=bars_1m,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+                    log.exception(
+                        "S3: fxcm_warmup помилка warmup-cache(%s, %s): %s",
+                        symbol_fxcm,
+                        tf_norm,
+                        exc,
+                    )
+                    return
+
+                # Для 1m публікуємо історію напряму з кешу (complete=true за замовчуванням).
+                if tf_norm == BASE_HISTORY_TF_NORM:
+                    if self._redis_client is None:
+                        PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+                        log.info(
+                            "S3: fxcm_warmup %s %s — Redis недоступний, оновлено лише кеш",
+                            symbol_norm,
+                            tf_norm,
+                        )
+                        return
+
+                    if min_history_bars > 0:
+                        limit = int(min_history_bars)
+                    elif lookback_minutes > 0:
+                        limit = int(max(1, math.ceil(float(lookback_minutes) / float(_tf_to_minutes(tf_norm)))))
+                    else:
+                        limit = int(self._cache_manager.warmup_bars)
+
+                    warmup_slice = self._cache_manager.get_bars_to_publish(
+                        symbol_raw=symbol_fxcm,
+                        timeframe_raw=BASE_HISTORY_TF_RAW,
+                        limit=limit,
+                        force=True,
+                    )
+                    if warmup_slice.empty:
+                        PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+                        log.info(
+                            "S3: fxcm_warmup %s %s — warmup_slice порожній",
+                            symbol_norm,
+                            tf_norm,
+                        )
+                        return
+
+                    publish_ohlcv_to_redis(
+                        warmup_slice,
+                        symbol=symbol_fxcm,
+                        timeframe=tf_norm,
+                        redis_client=self._redis_client,
+                        data_gate=None,
+                        hmac_secret=self._hmac_secret,
+                        hmac_algo=self._hmac_algo,
+                        source="history_s3",
+                    )
+                    last_published = int(warmup_slice["open_time"].max())
+                    self._cache_manager.mark_published(
+                        symbol_raw=symbol_fxcm,
+                        timeframe_raw=BASE_HISTORY_TF_RAW,
+                        last_open_time=last_published,
+                    )
+                    PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+                    log.info(
+                        "S3: fxcm_warmup опубліковано %d барів для %s %s",
+                        int(len(warmup_slice)),
+                        symbol_norm,
+                        tf_norm,
+                    )
+                    return
+
+            # Для MTF warmup (1h/4h/..): підтягуємо 1m history у кеш на потрібний lookback,
+            # локально будуємо `history_agg` і публікуємо саме його (без polling H1/H4).
+            if tf_norm != BASE_HISTORY_TF_NORM:
+                try:
+                    self._prefetch_history_into_cache(
+                        fx,
+                        symbol_fxcm=symbol_fxcm,
+                        timeframe_raw=BASE_HISTORY_TF_RAW,
+                        lookback_minutes=lookback_minutes,
+                        min_history_bars=(
+                            int(min_history_bars)
+                            * max(1, int(_tf_to_minutes(tf_norm) // _tf_to_minutes(BASE_HISTORY_TF_NORM)))
+                            if min_history_bars > 0
+                            else 0
+                        ),
+                    )
+                    df_1m = self._cache_manager.get_cached_df(
+                        symbol_fxcm,
+                        BASE_HISTORY_TF_RAW,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+                    log.exception(
+                        "S3: fxcm_warmup помилка під час prefetch 1m для %s %s: %s",
+                        symbol_norm,
+                        tf_norm,
+                        exc,
+                    )
+                    return
+
+                if df_1m is None or df_1m.empty:
+                    PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+                    log.info(
+                        "S3: fxcm_warmup %s %s — 1m кеш порожній після prefetch",
+                        symbol_norm,
+                        tf_norm,
+                    )
+                    return
+
+                agg = HistoryMtfCompleteAggregator(
+                    symbol_norm=symbol_norm,
+                    target_tf=str(tf_norm),
+                )
+                df_agg = agg.ingest_df_1m(df_1m)
+                if df_agg is None or df_agg.empty:
+                    PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+                    log.info(
+                        "S3: fxcm_warmup %s %s — history_agg не дав повних барів",
+                        symbol_norm,
+                        tf_norm,
+                    )
+                    return
+
+                if self._redis_client is None:
+                    PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+                    log.info(
+                        "S3: fxcm_warmup %s %s — Redis недоступний, агреговано без публікації",
+                        symbol_norm,
+                        tf_norm,
+                    )
+                    return
+
+                if min_history_bars > 0:
+                    limit = int(min_history_bars)
+                elif lookback_minutes > 0:
+                    limit = int(max(1, math.ceil(float(lookback_minutes) / float(_tf_to_minutes(tf_norm)))))
+                else:
+                    limit = 0
+                if limit > 0:
+                    df_agg = cast(pd.DataFrame, df_agg.tail(limit).reset_index(drop=True))
+
+                publish_ohlcv_to_redis(
+                    df_agg,
+                    symbol=symbol_fxcm,
+                    timeframe=str(tf_norm),
+                    redis_client=self._redis_client,
+                    data_gate=None,
+                    hmac_secret=self._hmac_secret,
+                    hmac_algo=self._hmac_algo,
+                    source="history_s3",
+                )
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+                log.info(
+                    "S3: fxcm_warmup опубліковано %d history_agg барів для %s %s",
+                    int(len(df_agg)),
+                    symbol_norm,
+                    tf_norm,
+                )
+                return
+
             fx_tf_raw = _to_fxcm_timeframe(tf_norm)
             try:
+                self._prefetch_history_into_cache(
+                    fx,
+                    symbol_fxcm=symbol_fxcm,
+                    timeframe_raw=fx_tf_raw,
+                    lookback_minutes=lookback_minutes,
+                    min_history_bars=min_history_bars,
+                )
                 self._cache_manager.ensure_ready(
                     fx,
                     symbol_raw=symbol_fxcm,
@@ -3462,15 +3727,6 @@ class FxcmCommandWorker:
                     symbol_fxcm,
                     fx_tf_raw,
                     exc,
-                )
-                return
-
-            if tick_tf:
-                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
-                log.info(
-                    "S3: fxcm_warmup виконано для %s %s (tick TF, кеш оновлено, без публікації)",
-                    symbol_norm,
-                    tf_norm,
                 )
                 return
 
@@ -3520,11 +3776,169 @@ class FxcmCommandWorker:
 
         # fxcm_backfill
         if tick_tf:
-            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+            fx = self._fx_holder.get("client")
+            if fx is None or self._cache_manager is None:
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+                log.warning(
+                    "S3: fxcm_backfill %s %s — FXCM або кеш недоступні",
+                    symbol_norm,
+                    tf_norm,
+                )
+                return
+
+            try:
+                # Працюємо лише з 1m history, без прямого backfill по m5.
+                self._cache_manager.ensure_ready(
+                    fx,
+                    symbol_raw=symbol_fxcm,
+                    timeframe_raw=BASE_HISTORY_TF_RAW,
+                )
+                tf_minutes = _tf_to_minutes(tf_norm)
+                bars_1m = int(max(1, int(tf_minutes // _tf_to_minutes(BASE_HISTORY_TF_NORM))))
+                if lookback_minutes > 0:
+                    bars_1m = int(max(1, lookback_minutes))
+                if min_history_bars > 0:
+                    bars_1m = int(min_history_bars) * int(max(1, tf_minutes // _tf_to_minutes(BASE_HISTORY_TF_NORM)))
+                self._prefetch_history_into_cache(
+                    fx,
+                    symbol_fxcm=symbol_fxcm,
+                    timeframe_raw=BASE_HISTORY_TF_RAW,
+                    lookback_minutes=lookback_minutes,
+                    min_history_bars=bars_1m,
+                )
+            except Exception as exc:  # noqa: BLE001
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+                log.exception(
+                    "S3: fxcm_backfill помилка під час prefetch 1m для %s %s: %s",
+                    symbol_norm,
+                    tf_norm,
+                    exc,
+                )
+                return
+
+            if self._redis_client is None:
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ignored").inc()
+                log.info(
+                    "S3: fxcm_backfill %s %s — Redis недоступний, оновлено лише кеш",
+                    symbol_norm,
+                    tf_norm,
+                )
+                return
+
+            # 1m: публікуємо історію з кешу; 5m: агрегація з 1m кешу.
+            if tf_norm == BASE_HISTORY_TF_NORM:
+                if lookback_minutes > 0:
+                    limit = int(max(1, lookback_minutes))
+                elif min_history_bars > 0:
+                    limit = int(min_history_bars)
+                else:
+                    limit = int(self._cache_manager.warmup_bars)
+
+                backfill_slice = self._cache_manager.get_bars_to_publish(
+                    symbol_raw=symbol_fxcm,
+                    timeframe_raw=BASE_HISTORY_TF_RAW,
+                    limit=limit,
+                    force=True,
+                )
+                if backfill_slice.empty:
+                    PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+                    log.info(
+                        "S3: fxcm_backfill %s %s — backfill_slice порожній",
+                        symbol_norm,
+                        tf_norm,
+                    )
+                    return
+
+                publish_ohlcv_to_redis(
+                    backfill_slice,
+                    symbol=symbol_fxcm,
+                    timeframe=tf_norm,
+                    redis_client=self._redis_client,
+                    data_gate=None,
+                    hmac_secret=self._hmac_secret,
+                    hmac_algo=self._hmac_algo,
+                    source="history_s3",
+                )
+                last_published = int(backfill_slice["open_time"].max())
+                self._cache_manager.mark_published(
+                    symbol_raw=symbol_fxcm,
+                    timeframe_raw=BASE_HISTORY_TF_RAW,
+                    last_open_time=last_published,
+                )
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+                log.info(
+                    "S3: fxcm_backfill опубліковано %d барів для %s %s (lookback=%d)",
+                    int(len(backfill_slice)),
+                    symbol_norm,
+                    tf_norm,
+                    int(lookback_minutes or 0),
+                )
+                return
+
+            # Для 5m/..: використовуємо існуючу MTF агрегацію з 1m кешу.
+            try:
+                df_1m = self._cache_manager.get_cached_df(
+                    symbol_fxcm,
+                    BASE_HISTORY_TF_RAW,
+                )
+            except Exception as exc:  # noqa: BLE001
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="error").inc()
+                log.exception(
+                    "S3: fxcm_backfill %s %s — не вдалося прочитати 1m кеш: %s",
+                    symbol_norm,
+                    tf_norm,
+                    exc,
+                )
+                return
+
+            if df_1m is None or df_1m.empty:
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+                log.info(
+                    "S3: fxcm_backfill %s %s — 1m кеш порожній",
+                    symbol_norm,
+                    tf_norm,
+                )
+                return
+
+            agg = HistoryMtfCompleteAggregator(
+                symbol_norm=symbol_norm,
+                target_tf=str(tf_norm),
+            )
+            df_agg = agg.ingest_df_1m(df_1m)
+            if df_agg is None or df_agg.empty:
+                PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
+                log.info(
+                    "S3: fxcm_backfill %s %s — history_agg не дав повних барів",
+                    symbol_norm,
+                    tf_norm,
+                )
+                return
+
+            limit = 0
+            if lookback_minutes > 0:
+                limit = int(max(1, math.ceil(float(lookback_minutes) / float(_tf_to_minutes(tf_norm)))))
+            elif min_history_bars > 0:
+                limit = int(min_history_bars)
+            if limit > 0:
+                df_agg = cast(pd.DataFrame, df_agg.tail(limit).reset_index(drop=True))
+
+            publish_ohlcv_to_redis(
+                df_agg,
+                symbol=symbol_fxcm,
+                timeframe=str(tf_norm),
+                redis_client=self._redis_client,
+                data_gate=None,
+                hmac_secret=self._hmac_secret,
+                hmac_algo=self._hmac_algo,
+                source="history_s3",
+            )
+            PROM_COMMANDS_TOTAL.labels(type=cmd_type, result="ok").inc()
             log.info(
-                "S3: fxcm_backfill %s %s (tick TF) поки не підтримано, пропускаємо",
+                "S3: fxcm_backfill опубліковано %d history_agg барів для %s %s (lookback=%d)",
+                int(len(df_agg)),
                 symbol_norm,
                 tf_norm,
+                int(lookback_minutes or 0),
             )
             return
 

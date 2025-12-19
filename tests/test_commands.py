@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import pandas as pd
+
 import connector
 
 
@@ -12,9 +14,23 @@ def _fx_holder_with_mock() -> dict[str, connector.ForexConnect | None]:
 
 
 class FxcmCommandWorkerTest(unittest.TestCase):
-    def test_warmup_for_tick_tf_updates_cache_only(self) -> None:
+    def test_warmup_for_tick_tf_publishes_history_slice(self) -> None:
         fx_holder = _fx_holder_with_mock()
         cache = mock.Mock()
+        cache.warmup_bars = 10
+        cache.get_bars_to_publish.return_value = pd.DataFrame(
+            [
+                {
+                    "open_time": 1000,
+                    "close_time": 2000,
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "volume": 1.0,
+                }
+            ]
+        )
 
         worker = connector.FxcmCommandWorker(
             redis_client=mock.Mock(),
@@ -40,32 +56,49 @@ class FxcmCommandWorkerTest(unittest.TestCase):
             worker._handle_command(payload)
 
         cache.ensure_ready.assert_called()
-        publish_mock.assert_not_called()
+        publish_mock.assert_called()
 
-    def test_backfill_for_tick_tf_is_ignored(self) -> None:
+    def test_backfill_for_tick_tf_publishes_history_slice(self) -> None:
         fx_holder = _fx_holder_with_mock()
+        cache = mock.Mock()
+        cache.warmup_bars = 10
+        cache.get_bars_to_publish.return_value = pd.DataFrame(
+            [
+                {
+                    "open_time": 1000,
+                    "close_time": 2000,
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "volume": 1.0,
+                }
+            ]
+        )
 
         worker = connector.FxcmCommandWorker(
             redis_client=mock.Mock(),
             fx_holder=fx_holder,
-            cache_manager=mock.Mock(),
+            cache_manager=cache,
             tick_aggregation_enabled=True,
             tick_agg_timeframes=("m1", "m5"),
             channel="fxcm:commands",
-            stream_targets=[("XAU/USD", "m5")],
+            stream_targets=[("XAU/USD", "m1"), ("XAU/USD", "m5")],
         )
 
         payload = {
             "type": "fxcm_backfill",
             "symbol": "XAUUSD",
-            "tf": "5m",
+            "tf": "1m",
             "lookback_minutes": 90,
         }
 
         with mock.patch.object(connector, "_fetch_and_publish_recent") as backfill_mock:
-            worker._handle_command(payload)
+            with mock.patch.object(connector, "publish_ohlcv_to_redis") as publish_mock:
+                worker._handle_command(payload)
 
         backfill_mock.assert_not_called()
+        publish_mock.assert_called()
 
     def test_command_for_non_target_is_ignored(self) -> None:
         worker = connector.FxcmCommandWorker(

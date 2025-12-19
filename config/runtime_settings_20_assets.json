@@ -16,9 +16,9 @@
         "price_snap_channel": "fxcm:price_tik",
         "price_snap_interval_seconds": 3,
         "commands_channel": "fxcm:commands",
-        "dynamic_universe_enabled": false,
+        "dynamic_universe_enabled": true,
         "dynamic_universe_default_targets": "XAU/USD:m1,XAU/USD:m5,XAU/USD:h1,XAU/USD:h4,EUR/USD:m1,EUR/USD:m5,GBP/USD:m1,GBP/USD:m5,USD/JPY:m1,USD/JPY:m5,USD/CHF:m1,USD/CHF:m5,USD/CAD:m1,USD/CAD:m5,AUD/USD:m1,AUD/USD:m5,NZD/USD:m1,NZD/USD:m5,EUR/JPY:m1,EUR/JPY:m5,GBP/JPY:m1,GBP/JPY:m5,AUD/JPY:m1,AUD/JPY:m5,EUR/GBP:m1,EUR/GBP:m5,EUR/CHF:m1,EUR/CHF:m5,GBP/CHF:m1,GBP/CHF:m5,CAD/JPY:m1,CAD/JPY:m5,CHF/JPY:m1,CHF/JPY:m5,AUD/CAD:m1,AUD/CAD:m5,AUD/CHF:m1,AUD/CHF:m5,EUR/CAD:m1,EUR/CAD:m5",
-        "dynamic_universe_max_targets": 60,
+        "dynamic_universe_max_targets": 5,
         "backfill_min_minutes": 10,
         "backfill_max_minutes": 360,
         "tick_cadence": {

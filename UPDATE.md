@@ -64,3 +64,17 @@
 ## v2.8 (2025-12-17)
 
 - `connector.py`: виправлено проблеми типізації (Pylance) у формуванні `ohlcv_live_age_seconds` та парсингу `supervisor_ohlcv_queue/supervisor_ohlcv_dropped` (без зміни runtime-логіки).
+
+## v2.9 (2025-12-19)
+
+- S3 warmup: `fxcm_warmup` для `1h/4h` більше не ігнорується, якщо символ є в таргетах, але TF не прописаний у `stream_targets` — конектор прогріває 1m history у кеш за `lookback_minutes/min_history_bars`, локально будує `history_agg` і публікує MTF бари в `fxcm:ohlcv`.
+
+## v3.0 (2025-12-19)
+
+- S3 warmup/backfill для tick TF: `fxcm_warmup` та `fxcm_backfill` для `1m/5m` тепер публікують історичні бари в `fxcm:ohlcv` (root `source=history_s3`).
+- Для `5m` історія будується як `history_agg`, похідна виключно від `1m` history (без прямого FXCM polling `m5`), тому правило "не змішувати" з tick-агрегацією зберігається.
+- Live tick-preview як і раніше публікується лише як `complete=false` і не стає authoritative-джерелом.
+
+## v3.1 (2025-12-19)
+
+- Профіль [config/runtime_settings.json](config/runtime_settings.json): `cache.max_bars` піднято до 60000, щоб уміщати ~30d історії для `1m` (і мати запас для рестартів/догрузок).

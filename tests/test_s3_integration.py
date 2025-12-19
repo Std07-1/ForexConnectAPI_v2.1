@@ -8,6 +8,8 @@ from contextlib import ExitStack
 from typing import Any, List, Optional
 from unittest import mock
 
+import pandas as pd
+
 import connector
 
 
@@ -54,6 +56,20 @@ class S3IntegrationTest(unittest.TestCase):
 
         fx_holder: dict[str, connector.ForexConnect | None] = {"client": mock.Mock(spec=connector.ForexConnect)}
         cache = mock.Mock()
+        cache.warmup_bars = 10
+        cache.get_bars_to_publish.return_value = pd.DataFrame(
+            [
+                {
+                    "open_time": 1000,
+                    "close_time": 2000,
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "volume": 1.0,
+                }
+            ]
+        )
 
         messages = [
             json.dumps(
@@ -104,11 +120,11 @@ class S3IntegrationTest(unittest.TestCase):
                 [("XAU/USD", "m1"), ("XAU/USD", "m5")],
             )
 
-            # fxcm_warmup для tick TF: ensure_ready викликається, publish не має бути.
+            # fxcm_warmup для tick TF: ensure_ready викликається і публікується історичний slice.
             ensure_ready_mock.assert_called()
-            publish_mock.assert_not_called()
+            self.assertTrue(publish_mock.called)
 
-            # fxcm_backfill для 1m/5m: ігнорується.
+            # fxcm_backfill для 1m/5m: тепер теж публікує історичний slice (без прямого FXCM polling m5).
             # fxcm_backfill для 15m: викликається з clamp lookback.
             self.assertTrue(backfill_mock.called)
             _, kwargs = backfill_mock.call_args
