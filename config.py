@@ -20,8 +20,27 @@ HEARTBEAT_DEFAULT_CHANNEL = "fxcm:heartbeat"
 STATUS_CHANNEL_DEFAULT = "fxcm:status"
 PRICE_SNAPSHOT_CHANNEL_DEFAULT = "fxcm:price_tik"
 COMMANDS_CHANNEL_DEFAULT = "fxcm:commands"
+OHLCV_CHANNEL_DEFAULT = "fxcm:ohlcv"
 CALENDAR_OVERRIDES_FILE = Path("config/calendar_overrides.json")
 RUNTIME_SETTINGS_FILE = Path("config/runtime_settings.json")
+
+
+def _get_fxcm_channel_prefix() -> str:
+    """Повертає префікс Redis Pub/Sub каналів FXCM-конектора.
+
+    Пріоритет:
+    - `FXCM_CHANNEL_PREFIX` (якщо задано і не порожній)
+    - дефолт `fxcm`
+    """
+
+    raw = os.environ.get("FXCM_CHANNEL_PREFIX")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return "fxcm"
+
+
+def _fxcm_channel(prefix: str, suffix: str) -> str:
+    return f"{prefix}:{suffix}"
 
 def _load_json_file(path: Path) -> Dict[str, Any]:
     if not path.exists():
@@ -430,6 +449,7 @@ class FXCMConfig:
     tick_aggregation_live_publish_interval_seconds: float
     mtf_crosscheck: MtfCrosscheckSettings
     commands_channel: str
+    ohlcv_channel: str
     dynamic_universe_enabled: bool
     dynamic_universe_default_targets: List[Tuple[str, str]]
     dynamic_universe_max_targets: int
@@ -534,11 +554,26 @@ def load_config() -> FXCMConfig:
     )
     if backfill_max_minutes < backfill_min_minutes:
         backfill_max_minutes = backfill_min_minutes
+
+    channel_prefix = _get_fxcm_channel_prefix()
+    default_price_channel = _fxcm_channel(channel_prefix, "price_tik")
+    default_status_channel = _fxcm_channel(channel_prefix, "status")
+    default_commands_channel = _fxcm_channel(channel_prefix, "commands")
+    default_heartbeat_channel = _fxcm_channel(channel_prefix, "heartbeat")
+    default_ohlcv_channel = _fxcm_channel(channel_prefix, "ohlcv")
+
+    price_channel_env = os.environ.get("FXCM_PRICE_SNAPSHOT_CHANNEL")
+    price_channel_env_norm = (
+        price_channel_env.strip()
+        if isinstance(price_channel_env, str) and price_channel_env.strip()
+        else ""
+    )
     price_stream = PriceStreamSettings(
-        channel=str(
-            stream_cfg.get("price_snap_channel", PRICE_SNAPSHOT_CHANNEL_DEFAULT)
-        ).strip()
-        or PRICE_SNAPSHOT_CHANNEL_DEFAULT,
+        channel=(
+            price_channel_env_norm
+            or str(stream_cfg.get("price_snap_channel") or "").strip()
+            or default_price_channel
+        ),
         interval_seconds=_coerce_float(
             stream_cfg.get("price_snap_interval_seconds"),
             3.0,
@@ -658,7 +693,7 @@ def load_config() -> FXCMConfig:
     else:
         status_cfg_raw = stream_cfg.get("status_channel")
         status_channel = str(status_cfg_raw).strip() if isinstance(status_cfg_raw, str) else None
-    status_channel = status_channel or STATUS_CHANNEL_DEFAULT
+    status_channel = status_channel or default_status_channel
 
     commands_channel_env = os.environ.get("FXCM_COMMANDS_CHANNEL")
     commands_channel: Optional[str]
@@ -667,7 +702,15 @@ def load_config() -> FXCMConfig:
     else:
         commands_cfg_raw = stream_cfg.get("commands_channel")
         commands_channel = str(commands_cfg_raw).strip() if isinstance(commands_cfg_raw, str) else None
-    commands_channel = commands_channel or COMMANDS_CHANNEL_DEFAULT
+    commands_channel = commands_channel or default_commands_channel
+
+    ohlcv_channel_env = os.environ.get("FXCM_OHLCV_CHANNEL")
+    if isinstance(ohlcv_channel_env, str) and ohlcv_channel_env.strip():
+        ohlcv_channel = ohlcv_channel_env.strip()
+    else:
+        ohlcv_cfg_raw = stream_cfg.get("ohlcv_channel")
+        ohlcv_channel = str(ohlcv_cfg_raw).strip() if isinstance(ohlcv_cfg_raw, str) else ""
+        ohlcv_channel = ohlcv_channel or default_ohlcv_channel
 
     # Єдиний тюнінг для всіх Redis-каналів телеметрії (status/heartbeat/market_status).
     # Підтримуємо два ключі для зворотної сумісності.
@@ -689,7 +732,7 @@ def load_config() -> FXCMConfig:
         ),
         heartbeat_channel=os.environ.get(
             "FXCM_HEARTBEAT_CHANNEL",
-            HEARTBEAT_DEFAULT_CHANNEL,
+            default_heartbeat_channel,
         ).strip(),
         status_channel=status_channel,
         telemetry_min_publish_interval_seconds=telemetry_min_publish_interval_seconds,
@@ -765,6 +808,7 @@ def load_config() -> FXCMConfig:
         tick_aggregation_live_publish_interval_seconds=tick_aggregation_live_publish_interval_seconds,
         mtf_crosscheck=mtf_crosscheck,
         commands_channel=commands_channel,
+        ohlcv_channel=ohlcv_channel,
         dynamic_universe_enabled=dynamic_universe_enabled,
         dynamic_universe_default_targets=dynamic_universe_default_targets,
         dynamic_universe_max_targets=dynamic_universe_max_targets,

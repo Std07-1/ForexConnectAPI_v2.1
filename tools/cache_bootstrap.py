@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 import pandas as pd
-from dotenv import load_dotenv
+from env_profile import load_env_profile
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -178,7 +178,7 @@ def main() -> None:
     from connector import setup_logging
 
     setup_logging()
-    load_dotenv()
+    load_env_profile()
 
     args = _parse_args()
     try:

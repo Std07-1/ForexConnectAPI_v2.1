@@ -98,6 +98,7 @@ class S3IntegrationTest(unittest.TestCase):
             tick_aggregation_enabled=True,
             tick_agg_timeframes=("m1", "m5"),
             channel="fxcm:commands",
+            ohlcv_channel="fxcm:ohlcv",
             stream_targets=base_targets,
             universe=universe,
             backfill_min_minutes=10,

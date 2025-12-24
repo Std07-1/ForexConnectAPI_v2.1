@@ -105,6 +105,21 @@ class BackoffConfigTest(unittest.TestCase):
         self.assertEqual(cfg_override.price_stream.channel, "fxcm:test:price")
         self.assertAlmostEqual(cfg_override.price_stream.interval_seconds, 1.25)
 
+    def test_channel_prefix_applies_to_default_channels(self) -> None:
+        cfg = self._load_with_payload({}, {"FXCM_CHANNEL_PREFIX": "fxcm_local"})
+        self.assertEqual(cfg.price_stream.channel, "fxcm_local:price_tik")
+        self.assertEqual(cfg.observability.status_channel, "fxcm_local:status")
+        self.assertEqual(cfg.commands_channel, "fxcm_local:commands")
+        self.assertEqual(cfg.observability.heartbeat_channel, "fxcm_local:heartbeat")
+        self.assertEqual(cfg.ohlcv_channel, "fxcm_local:ohlcv")
+
+    def test_ohlcv_channel_defaults_and_override(self) -> None:
+        cfg_default = self._load_with_payload({})
+        self.assertEqual(cfg_default.ohlcv_channel, config.OHLCV_CHANNEL_DEFAULT)
+
+        cfg_env = self._load_with_payload({}, {"FXCM_OHLCV_CHANNEL": "fxcm:env:ohlcv"})
+        self.assertEqual(cfg_env.ohlcv_channel, "fxcm:env:ohlcv")
+
     def test_status_channel_defaults_and_override(self) -> None:
         cfg_default = self._load_with_payload({})
         self.assertEqual(cfg_default.observability.status_channel, config.STATUS_CHANNEL_DEFAULT)

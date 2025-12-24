@@ -78,3 +78,12 @@
 ## v3.1 (2025-12-19)
 
 - Профіль [config/runtime_settings.json](config/runtime_settings.json): `cache.max_bars` піднято до 60000, щоб уміщати ~30d історії для `1m` (і мати запас для рестартів/догрузок).
+
+## v3.2 (2025-12-22)
+
+- Додано підтримку профілів середовища через “диспетчер” `.env`: змінна `AI_ONE_ENV_FILE` дозволяє завантажувати `.env.local`/`.env.prod` без ризику випадково підʼєднатися локально до прод-каналів.
+- Додано ізоляцію Redis Pub/Sub каналів через `FXCM_CHANNEL_PREFIX` та нові оверрайди `FXCM_OHLCV_CHANNEL` і `FXCM_PRICE_SNAPSHOT_CHANNEL`.
+- Конектор тепер публікує OHLCV у конфігурований `ohlcv_channel` (а не в жорстко заданий `fxcm:ohlcv`) і прокидує цей канал крізь warmup/backfill/healthcheck та контекст heartbeat.
+- Оновлено документацію (README + docs) з прикладами профілів `.env.local/.env.prod` та примітками про префіксування каналів (`fxcm:*` ↔ `fxcm_local:*`).
+- Додано утиліту для швидкої перевірки публікацій у локальні канали Redis: `python -m tools.redis_channel_probe`.
+- Виправлено баг: при `stream.async_supervisor=true` OHLCV батчі могли публікуватися в legacy-канал `fxcm:ohlcv` замість `config.ohlcv_channel` (наприклад, `fxcm_local:ohlcv`).

@@ -39,6 +39,7 @@ class FxcmCommandWorkerTest(unittest.TestCase):
             tick_aggregation_enabled=True,
             tick_agg_timeframes=("m1", "m5"),
             channel="fxcm:commands",
+            ohlcv_channel="fxcm:ohlcv",
             stream_targets=[("XAU/USD", "m1")],
             hmac_secret=None,
             hmac_algo="sha256",
@@ -83,6 +84,7 @@ class FxcmCommandWorkerTest(unittest.TestCase):
             tick_aggregation_enabled=True,
             tick_agg_timeframes=("m1", "m5"),
             channel="fxcm:commands",
+            ohlcv_channel="fxcm:ohlcv",
             stream_targets=[("XAU/USD", "m1"), ("XAU/USD", "m5")],
         )
 
@@ -107,6 +109,7 @@ class FxcmCommandWorkerTest(unittest.TestCase):
             cache_manager=mock.Mock(),
             tick_aggregation_enabled=False,
             channel="fxcm:commands",
+            ohlcv_channel="fxcm:ohlcv",
             stream_targets=[("EUR/USD", "m15")],
         )
 
@@ -145,6 +148,7 @@ class FxcmCommandWorkerTest(unittest.TestCase):
             cache_manager=mock.Mock(),
             tick_aggregation_enabled=False,
             channel="fxcm:commands",
+            ohlcv_channel="fxcm:ohlcv",
             stream_targets=[("EUR/USD", "m15")],
         )
         worker._stop_event = stop_event

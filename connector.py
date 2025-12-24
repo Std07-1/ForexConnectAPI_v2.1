@@ -47,7 +47,7 @@ from typing import (
 )
 
 import pandas as pd
-from dotenv import load_dotenv
+from env_profile import load_env_profile
 from prometheus_client import Counter, Gauge, start_http_server
 
 try:
@@ -847,7 +847,7 @@ else:
 
 
 # Константи конектора
-REDIS_CHANNEL = "fxcm:ohlcv"  # канал публікації OHLCV-барів
+REDIS_CHANNEL = "fxcm:ohlcv"  # legacy дефолт; реальний канал беремо з config.ohlcv_channel
 REDIS_STATUS_CHANNEL = "fxcm:market_status"  # канал публікації статусу ринку
 STATUS_CHANNEL_DEFAULT = "fxcm:status"
 STATUS_PRICE_STALE_SECONDS = 15.0
@@ -861,6 +861,7 @@ _LAST_MARKET_STATUS: Optional[Tuple[str, Optional[int]]] = (
 )
 _LAST_MARKET_STATUS_TS: Optional[float] = None  # час останньої трансляції статусу
 _STATUS_CHANNEL = STATUS_CHANNEL_DEFAULT
+_OHLCV_CHANNEL = REDIS_CHANNEL
 _LAST_STATUS_PUBLISHED_TS: Optional[float] = None
 _LAST_STATUS_PUBLISHED_KEY: Optional[Tuple[Any, ...]] = None
 _LAST_TELEMETRY_PUBLISHED_TS_BY_CHANNEL: Dict[str, float] = {}
@@ -3209,6 +3210,7 @@ class FxcmCommandWorker:
         tick_aggregation_enabled: bool,
         tick_agg_timeframes: Sequence[str] = ("m1", "m5"),
         channel: str,
+        ohlcv_channel: str,
         stream_targets: Sequence[Tuple[str, str]] = (),
         universe: Optional[StreamUniverse] = None,
         backfill_min_minutes: int = 0,
@@ -3224,6 +3226,7 @@ class FxcmCommandWorker:
             _map_timeframe_label(tf) for tf in (tick_agg_timeframes or ())
         }
         self._channel = str(channel or "").strip()
+        self._ohlcv_channel = str(ohlcv_channel or "").strip() or REDIS_CHANNEL
         self._universe = universe
         self._backfill_min_minutes = max(0, int(backfill_min_minutes))
         self._backfill_max_minutes = max(self._backfill_min_minutes, int(backfill_max_minutes) or 0)
@@ -3596,6 +3599,7 @@ class FxcmCommandWorker:
                         symbol=symbol_fxcm,
                         timeframe=tf_norm,
                         redis_client=self._redis_client,
+                        channel=self._ohlcv_channel,
                         data_gate=None,
                         hmac_secret=self._hmac_secret,
                         hmac_algo=self._hmac_algo,
@@ -3692,6 +3696,7 @@ class FxcmCommandWorker:
                     symbol=symbol_fxcm,
                     timeframe=str(tf_norm),
                     redis_client=self._redis_client,
+                    channel=self._ohlcv_channel,
                     data_gate=None,
                     hmac_secret=self._hmac_secret,
                     hmac_algo=self._hmac_algo,
@@ -3760,6 +3765,7 @@ class FxcmCommandWorker:
                 symbol=symbol_fxcm,
                 timeframe=tf_norm,
                 redis_client=self._redis_client,
+                channel=self._ohlcv_channel,
                 data_gate=None,
                 hmac_secret=self._hmac_secret,
                 hmac_algo=self._hmac_algo,
@@ -3854,6 +3860,7 @@ class FxcmCommandWorker:
                     symbol=symbol_fxcm,
                     timeframe=tf_norm,
                     redis_client=self._redis_client,
+                    channel=self._ohlcv_channel,
                     data_gate=None,
                     hmac_secret=self._hmac_secret,
                     hmac_algo=self._hmac_algo,
@@ -3927,6 +3934,7 @@ class FxcmCommandWorker:
                 symbol=symbol_fxcm,
                 timeframe=str(tf_norm),
                 redis_client=self._redis_client,
+                channel=self._ohlcv_channel,
                 data_gate=None,
                 hmac_secret=self._hmac_secret,
                 hmac_algo=self._hmac_algo,
@@ -3971,6 +3979,7 @@ class FxcmCommandWorker:
                 symbol=symbol_fxcm,
                 timeframe_raw=fx_tf_raw,
                 redis_client=self._redis_client,
+                ohlcv_channel=self._ohlcv_channel,
                 lookback_minutes=lookback,
                 last_open_time_ms={},
                 data_gate=None,
@@ -4053,6 +4062,7 @@ class AsyncStreamSupervisor:
         redis_supplier: Callable[[], Optional[Any]],
         redis_reconnector: Optional[Callable[[], Any]] = None,
         data_gate: Optional[PublishDataGate] = None,
+        ohlcv_channel: Optional[str] = None,
         heartbeat_channel: Optional[str] = None,
         price_channel: Optional[str] = None,
         hmac_secret: Optional[str] = None,
@@ -4063,6 +4073,7 @@ class AsyncStreamSupervisor:
         self._redis_reconnector = redis_reconnector
         self._redis_backoff = redis_backoff
         self._data_gate = data_gate
+        self._ohlcv_channel = (ohlcv_channel or "").strip() or None
         self._heartbeat_channel = heartbeat_channel
         self._price_channel = price_channel
         self._hmac_secret = hmac_secret
@@ -4347,9 +4358,11 @@ class AsyncStreamSupervisor:
                     symbol=batch.symbol,
                     timeframe=batch.timeframe,
                     redis_client=client,
+                    channel=self._ohlcv_channel,
                     data_gate=self._data_gate,
                     hmac_secret=self._hmac_secret,
                     hmac_algo=self._hmac_algo,
+                    source=batch.source,
                 )
                 self._mark_publish("ohlcv")
                 return
@@ -6077,6 +6090,7 @@ def publish_ohlcv_to_redis(
     symbol: str,
     timeframe: str,
     redis_client: Optional[Any],
+    channel: Optional[str] = None,
     data_gate: Optional[PublishDataGate] = None,
     min_publish_interval: float = 0.0,
     publish_rate_limit: Optional[Dict[Tuple[str, str], float]] = None,
@@ -6231,14 +6245,16 @@ def publish_ohlcv_to_redis(
 
     message = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
+    target_channel = (channel or "").strip() or REDIS_CHANNEL
+
     try:
-        redis_client.publish(REDIS_CHANNEL, message)
+        redis_client.publish(target_channel, message)
         if publish_rate_limit is not None:
             publish_rate_limit[rate_limit_key] = time.monotonic()
         log.debug(
             "Опубліковано %d барів у Redis канал %s (%s %s).",
             len(bars),
-            REDIS_CHANNEL,
+            target_channel,
             symbol_norm,
             timeframe,
         )
@@ -6324,6 +6340,7 @@ def _fetch_and_publish_recent(
     symbol: str,
     timeframe_raw: str,
     redis_client: Optional[Any],
+    ohlcv_channel: Optional[str] = None,
     lookback_minutes: int,
     last_open_time_ms: Dict[Tuple[str, str], int],
     data_gate: Optional[PublishDataGate] = None,
@@ -6443,6 +6460,7 @@ def _fetch_and_publish_recent(
             symbol=symbol,
             timeframe=timeframe_norm,
             redis_client=redis_client,
+            channel=ohlcv_channel,
             data_gate=data_gate,
             min_publish_interval=min_publish_interval,
             publish_rate_limit=publish_rate_limit,
@@ -6469,7 +6487,7 @@ def _fetch_and_publish_recent(
     return df_to_publish
 
 
-def run_redis_healthcheck(redis_client: Optional[Any]) -> bool:
+def run_redis_healthcheck(redis_client: Optional[Any], *, ohlcv_channel: Optional[str] = None) -> bool:
     """Перевіряє доступність Redis і здатність приймати повідомлення."""
 
     if redis_client is None:
@@ -6493,7 +6511,8 @@ def run_redis_healthcheck(redis_client: Optional[Any]) -> bool:
         separators=(",", ":"),
     )
     try:
-        redis_client.publish(REDIS_CHANNEL, probe_payload)
+        target_channel = (ohlcv_channel or "").strip() or REDIS_CHANNEL
+        redis_client.publish(target_channel, probe_payload)
         publish_ok = True
     except Exception as exc:  # noqa: BLE001
         log.exception("Redis health-check: publish неуспішний: %s", exc)
@@ -6514,6 +6533,7 @@ def fetch_history_sample(
     redis_client: Optional[Any],
     sample_settings: SampleRequestSettings,
     heartbeat_channel: Optional[str] = None,
+    ohlcv_channel: Optional[str] = None,
     data_gate: Optional[PublishDataGate] = None,
     hmac_secret: Optional[str] = None,
     hmac_algo: str = "sha256",
@@ -6584,6 +6604,7 @@ def fetch_history_sample(
             symbol=symbol,
             timeframe=timeframe,
             redis_client=redis_client,
+            channel=ohlcv_channel,
             data_gate=data_gate,
             hmac_secret=hmac_secret,
             hmac_algo=hmac_algo,
@@ -6603,7 +6624,7 @@ def fetch_history_sample(
             "channel": heartbeat_channel,
             "mode": "warmup_sample",
             "redis_connected": redis_client is not None,
-            "redis_channel": REDIS_CHANNEL,
+            "redis_channel": (ohlcv_channel or "").strip() or REDIS_CHANNEL,
             "stream_targets": _stream_targets_summary([(symbol, timeframe)], None),
             "published_bars": len(df_ohlcv),
         }
@@ -7080,6 +7101,7 @@ def stream_fx_data(
                                 symbol=symbol,
                                 timeframe_raw=tf_raw,
                                 redis_client=current_redis,
+                                ohlcv_channel=_OHLCV_CHANNEL,
                                 lookback_minutes=lookback_minutes,
                                 last_open_time_ms=last_open_time_ms,
                                 data_gate=gate,
@@ -7169,6 +7191,7 @@ def stream_fx_data(
                                         symbol=symbol,
                                         timeframe=str(target_tf),
                                         redis_client=current_redis,
+                                        channel=_OHLCV_CHANNEL,
                                         data_gate=gate,
                                         min_publish_interval=publish_interval_seconds,
                                         publish_rate_limit=publish_rate_limit,
@@ -7306,7 +7329,8 @@ def stream_fx_data(
                     "effective_market_open": market_open,
                     "redis_connected": current_redis is not None,
                     "redis_required": require_redis,
-                    "redis_channel": REDIS_CHANNEL,
+                    "redis_channel": (getattr(config, "ohlcv_channel", "") or "").strip()
+                    or REDIS_CHANNEL,
                     "poll_seconds": poll_seconds,
                     "lookback_minutes": lookback_minutes,
                     "publish_interval_seconds": publish_interval_seconds,
@@ -7396,7 +7420,8 @@ def stream_fx_data(
                     "effective_market_open": market_open,
                     "redis_connected": current_redis is not None,
                     "redis_required": require_redis,
-                    "redis_channel": REDIS_CHANNEL,
+                    "redis_channel": (getattr(config, "ohlcv_channel", "") or "").strip()
+                    or REDIS_CHANNEL,
                     "poll_seconds": poll_seconds,
                     "lookback_minutes": lookback_minutes,
                     "publish_interval_seconds": publish_interval_seconds,
@@ -7570,7 +7595,7 @@ def main() -> None:
     """Мінімальний тест підключення до FXCM та запиту історії.
 
     Логіка:
-    - читаємо креденшали з .env (через python-dotenv);
+    - читаємо креденшали з `.env` dispatcher та профілю (через python-dotenv);
     - логін через ForexConnect;
     - POC-запит історії свічок та нормалізація у OHLCV;
     - коректний логаут.
@@ -7578,7 +7603,7 @@ def main() -> None:
     _enforce_required_connector_version()
     log.info("Запуск FXCM Connector %s", FXCM_CONNECTOR_VERSION)
     setup_logging()
-    load_dotenv()
+    load_env_profile()
 
     log.debug("Зчитуємо конфігурацію FXCM з ENV...")
     try:
@@ -7589,6 +7614,9 @@ def main() -> None:
 
     global _STATUS_CHANNEL
     _STATUS_CHANNEL = config.observability.status_channel or STATUS_CHANNEL_DEFAULT
+
+    global _OHLCV_CHANNEL
+    _OHLCV_CHANNEL = (getattr(config, "ohlcv_channel", "") or "").strip() or REDIS_CHANNEL
 
     global STATUS_PUBLISH_MIN_INTERVAL_SECONDS
     STATUS_PUBLISH_MIN_INTERVAL_SECONDS = float(
@@ -7608,7 +7636,7 @@ def main() -> None:
 
     redis_client = _create_redis_client(config.redis)
     if redis_client is not None and config.redis_required:
-        redis_ok = run_redis_healthcheck(redis_client)
+        redis_ok = run_redis_healthcheck(redis_client, ohlcv_channel=_OHLCV_CHANNEL)
         if not redis_ok:
             log.error(
                 "Redis health-check не пройдено. Публікацію буде вимкнено на цю сесію."
@@ -7709,6 +7737,7 @@ def main() -> None:
                             symbol=symbol,
                             timeframe=BASE_HISTORY_TF_NORM,
                             redis_client=redis_conn,
+                            channel=config.ohlcv_channel,
                             data_gate=publish_gate,
                             hmac_secret=config.hmac_secret,
                             hmac_algo=config.hmac_algo,
@@ -7724,6 +7753,7 @@ def main() -> None:
                                     symbol=symbol,
                                     timeframe=BASE_HISTORY_TF_NORM,
                                     redis_client=redis_conn,
+                                    channel=config.ohlcv_channel,
                                     data_gate=publish_gate,
                                     hmac_secret=config.hmac_secret,
                                     hmac_algo=config.hmac_algo,
@@ -7806,6 +7836,7 @@ def main() -> None:
                             symbol=symbol,
                             timeframe=tf_norm,
                             redis_client=redis_conn,
+                            channel=config.ohlcv_channel,
                             data_gate=publish_gate,
                             hmac_secret=config.hmac_secret,
                             hmac_algo=config.hmac_algo,
@@ -7889,6 +7920,7 @@ def main() -> None:
                     redis_supplier=lambda: redis_holder["client"],
                     redis_reconnector=redis_reconnector,
                     data_gate=publish_gate,
+                    ohlcv_channel=config.ohlcv_channel,
                     heartbeat_channel=config.observability.heartbeat_channel,
                     price_channel=config.price_stream.channel,
                     hmac_secret=config.hmac_secret,
@@ -7903,6 +7935,7 @@ def main() -> None:
                     symbol=batch.symbol,
                     timeframe=batch.timeframe,
                     redis_client=redis_holder["client"],
+                    channel=config.ohlcv_channel,
                     data_gate=publish_gate,
                     hmac_secret=config.hmac_secret,
                     hmac_algo=config.hmac_algo,
@@ -7943,6 +7976,7 @@ def main() -> None:
                     tick_aggregation_enabled=config.tick_aggregation_enabled,
                     tick_agg_timeframes=("m1", "m5"),
                     channel=config.commands_channel,
+                    ohlcv_channel=config.ohlcv_channel,
                     stream_targets=config.stream_targets,
                     universe=universe,
                     backfill_min_minutes=int(config.backfill_min_minutes),

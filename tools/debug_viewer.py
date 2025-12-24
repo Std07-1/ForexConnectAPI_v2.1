@@ -33,7 +33,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
-from dotenv import load_dotenv
+from env_profile import load_env_profile
 from rich import box
 from rich.console import Console, Group
 from rich.layout import Layout
@@ -3193,7 +3193,7 @@ def run_viewer(args: argparse.Namespace) -> None:
 
 def main() -> None:
     """Завантажує .env, читає аргументи CLI та запускає viewer."""
-    load_dotenv()
+    load_env_profile()
     args = parse_args()
     run_viewer(args)
 

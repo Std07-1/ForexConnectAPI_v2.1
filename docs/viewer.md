@@ -13,6 +13,8 @@ python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 - Канали Redis беруться з блоку `viewer.*` у `config/runtime_settings.json`; CLI-прапорці дозволяють тимчасово підмінити host/port.
 - Отримані дані зберігаються лише в оперативному стані `ViewerState`, тож запуск безпечний для продакшн Redis.
 
+> Примітка про ізоляцію local/prod: у тексті нижче згадуються канали `fxcm:*`, але якщо активний профіль конектора/SMC використовує `FXCM_CHANNEL_PREFIX=fxcm_local`, то viewer також має читати `fxcm_local:*` (через `viewer.ohlcv_channel`, `viewer.heartbeat_channel`, `viewer.market_status_channel`, `viewer.commands_channel`).
+
 ### Гарячі клавіші
 
 | Клавіша | Дія |
@@ -41,7 +43,7 @@ python tools/debug_viewer.py --redis-host 127.0.0.1 --redis-port 6379
 
 ### 1. Summary
 
-- **FXCM diagnostics:** все з `heartbeat.context` — режим, цикловий час, lag, Redis-стан, publish interval, цілі стріму та блок `price_stream` (канал `fxcm:price_tik`, інтервал, останній тик/снепшот, `tick_silence_seconds`).
+- **FXCM diagnostics:** все з `heartbeat.context` — режим, цикловий час, lag, Redis-стан, publish interval, цілі стріму та блок `price_stream` (канал `fxcm:price_tik` / `${prefix}:price_tik`, інтервал, останній тик/снепшот, `tick_silence_seconds`).
 - **Recent incidents:** останні 24 переходи станів (`fxcm_pause`, `redis_disconnect`, `ohlcv_msg_idle`, тощо) з позначками ACTIVE/CLEAR.
 
 ### 2. Session

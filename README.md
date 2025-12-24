@@ -26,6 +26,8 @@ Stage 3 закрито повністю: усі три підпроекти пр
 
 Конектор логіниться в FXCM через ForexConnect, витягує OHLCV-бари, нормалізує їх до AiOne_t-схеми та транслює у Redis:
 
+> У документації нижче використовується продакшн-префікс каналів `fxcm:*`. Для ізоляції локальної розробки можна змінити префікс через `FXCM_CHANNEL_PREFIX` (наприклад, `fxcm_local:*`).
+
 - `fxcm:ohlcv` — основні дані (із опційним HMAC-підписом `sig`).
 - `fxcm:market_status` — події `open/closed` з `next_open_utc`, `next_open_ms`, `next_open_in_seconds` та блоком `session` (таймзона, години роботи, перерви).
 - `fxcm:heartbeat` (налаштовується) — технічний стан процесу з розширеним `context` (канал, Redis-стан, лаг, стрім-таргети, причина паузи, тривалість циклу тощо).
@@ -158,8 +160,22 @@ tools/debug_viewer.py → Redis subscriber → Live UI/діагностика
     ```powershell
     git clone <repo>
     cd fxcm_connector
-    copy .env.template .env  # додай власні креденшали FXCM
+    copy .env.template .env.local  # локальний профіль (ізольовані канали)
+    copy .env.template .env.prod   # прод-профіль (сумісний з fxcm:*)
     ```
+
+    Потім:
+
+    - у `.env.local` вистав `FXCM_CHANNEL_PREFIX=fxcm_local` (або інший префікс) і підстав FXCM креденшали / Redis
+    - у `.env.prod` залиш `FXCM_CHANNEL_PREFIX=fxcm` і підстав прод значення
+    - створи `.env` як диспетчер (1–2 рядки):
+
+      ```dotenv
+      AI_ONE_ENV_FILE=.env.local
+      FXCM_CONNECTOR_VERSION_OVERRIDE=2.2
+      ```
+
+    > **Зворотна сумісність:** якщо не хочеш профілі, можеш як і раніше покласти всі змінні напряму в `.env` і не задавати `AI_ONE_ENV_FILE`.
 
 1. **Створи Python 3.7 venv і постав залежності:**
 
@@ -186,6 +202,7 @@ tools/debug_viewer.py → Redis subscriber → Live UI/діагностика
 
 | Назва | Значення за замовчуванням | Опис |
 | --- | --- | --- |
+| `AI_ONE_ENV_FILE` | – | Опційний “диспетчер” профілю: якщо задано, конектор завантажує `.env` і додатково файл профілю (наприклад, `.env.local` / `.env.prod`). |
 | `FXCM_USERNAME` / `FXCM_PASSWORD` | – | Обов’язкові креденшали FXCM. |
 | `FXCM_CONNECTION` | `Demo` | Demo/Real. |
 | `FXCM_HOST_URL` | `http://www.fxcorporate.com/Hosts.jsp` | Endpoint для SDK. |
@@ -195,9 +212,12 @@ tools/debug_viewer.py → Redis subscriber → Live UI/діагностика
 | `FXCM_CACHE_ENABLED` | `1` | Керує HistoryCache. |
 | `FXCM_METRICS_ENABLED` | `1` | Вмикає Prometheus-server. |
 | `FXCM_METRICS_PORT` | `9200` | Порт `/metrics`. |
-| `FXCM_HEARTBEAT_CHANNEL` | `fxcm:heartbeat` | Куди шлеться heartbeat. |
-| `FXCM_STATUS_CHANNEL` | `fxcm:status` | Канал публічного статусу (process/market/price/ohlcv/session). |
-| `FXCM_COMMANDS_CHANNEL` | `fxcm:commands` | Канал команд від SMC (S3): `fxcm_warmup`/`fxcm_backfill`. |
+| `FXCM_CHANNEL_PREFIX` | `fxcm` | Префікс Redis Pub/Sub каналів конектора (ізоляція локальне/прод). Якщо не задані явні канали нижче, вони будуються як `${FXCM_CHANNEL_PREFIX}:<suffix>`. |
+| `FXCM_OHLCV_CHANNEL` | `${FXCM_CHANNEL_PREFIX}:ohlcv` | Канал для OHLCV payload-ів (override для `stream.ohlcv_channel`). |
+| `FXCM_PRICE_SNAPSHOT_CHANNEL` | `${FXCM_CHANNEL_PREFIX}:price_tik` | Канал для price snapshots (override для `stream.price_snap_channel`). |
+| `FXCM_HEARTBEAT_CHANNEL` | `${FXCM_CHANNEL_PREFIX}:heartbeat` | Куди шлеться heartbeat. |
+| `FXCM_STATUS_CHANNEL` | `${FXCM_CHANNEL_PREFIX}:status` | Канал публічного статусу (process/market/price/ohlcv/session). |
+| `FXCM_COMMANDS_CHANNEL` | `${FXCM_CHANNEL_PREFIX}:commands` | Канал команд від SMC (S3): `fxcm_warmup`/`fxcm_backfill`. |
 | `FXCM_DYNAMIC_UNIVERSE_ENABLED` | `false` | Якщо `true`, ефективні `stream_targets` беруться з `fxcm_set_universe` (якщо SMC вже задав), інакше з `dynamic_universe_default_targets`. |
 | `FXCM_DYNAMIC_UNIVERSE_MAX_TARGETS` | `20` | Верхня межа кількості активних таргетів у dynamic режимі. |
 | `FXCM_BACKFILL_MIN_MINUTES` | `10` | Мінімальне значення `lookback_minutes` для `fxcm_backfill` (clamp). |
@@ -241,7 +261,9 @@ tools/debug_viewer.py → Redis subscriber → Live UI/діагностика
 >
 > Heartbeat/market-status `context.session` тепер містить актуальний тег, таймзону, `session_open_utc`/`session_close_utc` та секцію `stats` (range/avg) для кожної сесії за останні 24 години, тож UI може показувати реальний перехід «Tokyo → London → New York» без накладок.
 
-> **Секрети:** `.env.template` — лише плейсхолдер. Використовуй секрет-стор (Azure Key Vault, GitHub Secrets тощо). Не коміть `.env`.
+> **Секрети:** `.env.template` — лише плейсхолдер. Використовуй секрет-стор (Azure Key Vault, GitHub Secrets тощо). Не коміть `.env`, `.env.local`, `.env.prod`.
+
+> **Рекомендація:** зберігай у `.env` лише `AI_ONE_ENV_FILE` (і, за потреби, `FXCM_CONNECTOR_VERSION_OVERRIDE`). Усі креденшали/канали тримай у `.env.local/.env.prod`, щоб “перемикач” працював передбачувано.
 
 ### 6.2 Runtime JSON (`config/runtime_settings.json`)
 
