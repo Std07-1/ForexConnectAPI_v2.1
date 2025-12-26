@@ -87,3 +87,8 @@
 - Оновлено документацію (README + docs) з прикладами профілів `.env.local/.env.prod` та примітками про префіксування каналів (`fxcm:*` ↔ `fxcm_local:*`).
 - Додано утиліту для швидкої перевірки публікацій у локальні канали Redis: `python -m tools.redis_channel_probe`.
 - Виправлено баг: при `stream.async_supervisor=true` OHLCV батчі могли публікуватися в legacy-канал `fxcm:ohlcv` замість `config.ohlcv_channel` (наприклад, `fxcm_local:ohlcv`).
+
+## v3.3 (2025-12-26)
+
+- FXCM history: помилки QuotesManager `Reason='unsupported scope'` + `No data found` (типово під час свят/пауз, коли календар каже `open`, але котирувань нема) тепер обробляються як очікуваний кейс: без `ERROR`/traceback, з пропуском вікна та `DEBUG`-логом.
+- Додано тест `tests/test_history_no_data.py` на коректну поведінку `get_history` при відсутності даних.

@@ -172,7 +172,7 @@ tools/debug_viewer.py → Redis subscriber → Live UI/діагностика
 
       ```dotenv
       AI_ONE_ENV_FILE=.env.local
-      FXCM_CONNECTOR_VERSION_OVERRIDE=2.2
+      FXCM_CONNECTOR_VERSION_OVERRIDE=3.3
       ```
 
     > **Зворотна сумісність:** якщо не хочеш профілі, можеш як і раніше покласти всі змінні напряму в `.env` і не задавати `AI_ONE_ENV_FILE`.

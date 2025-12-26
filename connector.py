@@ -2070,6 +2070,17 @@ def _download_history_range(
                     symbol,
                     tf_fxcm,
                 )
+            elif _is_price_history_no_data(exc):
+                # FXCM інколи повертає "unsupported scope" / "No data found" на закритому ринку
+                # або під час свят/пауз — це не фатальна помилка для конектора.
+                _log_market_closed_once(_now_utc())
+                log.debug(
+                    "History cache: FXCM не має даних для %s (%s) у вікні %s → %s.",
+                    symbol,
+                    tf_fxcm,
+                    win_start,
+                    win_end,
+                )
             else:
                 log.exception(
                     "Помилка get_history(%s, %s, %s → %s): %s",
@@ -2354,6 +2365,22 @@ def _notify_market_closed(now: dt.datetime, redis_client: Optional[Any]) -> dt.d
 
 def _is_price_history_not_ready(exc: Exception) -> bool:
     return "PriceHistoryCommunicator is not ready" in str(exc)
+
+
+def _is_price_history_no_data(exc: Exception) -> bool:
+    """Повертає True, якщо FXCM явно повідомив, що даних немає.
+
+    Типовий текст ForexConnect/QuotesManager: "Reason='unsupported scope'" + "No data found".
+    Це очікувано під час закритого ринку/свят, і не має сприйматися як ERROR.
+    """
+
+    msg = str(exc).lower()
+    if "no data found" in msg and "unsupported scope" in msg:
+        return True
+    # На деяких збірках трапляється лише скорочений фрагмент.
+    if "no data found for symbolid" in msg:
+        return True
+    return False
 
 
 def _publish_market_status(
@@ -6400,6 +6427,16 @@ def _fetch_and_publish_recent(
                 timeframe_fxcm,
             )
             raise MarketTemporarilyClosed("PriceHistoryCommunicator is not ready")
+        if _is_price_history_no_data(exc):
+            _log_market_closed_once(end_dt)
+            log.debug(
+                "Стрім: FXCM не має історії для %s (%s) у вікні %s → %s.",
+                symbol,
+                timeframe_fxcm,
+                start_dt,
+                end_dt,
+            )
+            return pd.DataFrame()
         raise FXCMRetryableError(
             f"FXCM get_history помилився для {symbol} ({timeframe_fxcm})"
         ) from exc
@@ -6573,6 +6610,15 @@ def fetch_history_sample(
                 "Warmup: FXCM PriceHistoryCommunicator не готовий для %s (%s).",
                 symbol,
                 timeframe_fxcm,
+            )
+        elif _is_price_history_no_data(exc):
+            _log_market_closed_once(end_dt)
+            log.warning(
+                "FXCM не має історії для %s (%s) у вікні %s → %s.",
+                symbol,
+                timeframe_fxcm,
+                start_dt,
+                end_dt,
             )
         else:
             log.exception("Помилка під час запиту історії через get_history: %s", exc)
