@@ -27,6 +27,21 @@ class NoDataForexConnect:
         return
 
 
+class SessionInvalidForexConnect:
+    def get_history(
+        self, symbol: str, timeframe: str, start_dt: dt.datetime, end_dt: dt.datetime
+    ) -> Any:
+        raise RuntimeError(
+            "QuotesManager error: Session is not valid code: QuotesLoaderError subcode: 2"
+        )
+
+    def login(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
+        return
+
+    def logout(self) -> None:  # pragma: no cover
+        return
+
+
 class HistoryNoDataHandlingTest(unittest.TestCase):
     def setUp(self) -> None:
         connector._LAST_MARKET_STATUS = None
@@ -73,3 +88,40 @@ class HistoryNoDataHandlingTest(unittest.TestCase):
 
         self.assertIsInstance(df, pd.DataFrame)
         self.assertTrue(df.empty)
+
+    def test_download_history_range_session_invalid_returns_empty_df(self) -> None:
+        fx = SessionInvalidForexConnect()
+        start = dt.datetime(2025, 12, 22, 3, 0, tzinfo=dt.timezone.utc)
+        end = start + dt.timedelta(hours=1)
+
+        with mock.patch(
+            "connector.generate_request_windows",
+            return_value=iter([(start, end)]),
+        ):
+            df = connector._download_history_range(  # type: ignore[attr-defined]
+                fx,  # type: ignore[arg-type]
+                symbol="XAU/USD",
+                timeframe_raw="m1",
+                start_dt=start,
+                end_dt=end,
+            )
+
+        self.assertIsInstance(df, pd.DataFrame)
+        self.assertTrue(df.empty)
+
+    def test_fetch_and_publish_recent_session_invalid_raises_retryable(self) -> None:
+        fx = SessionInvalidForexConnect()
+        fixed_now = dt.datetime(2025, 12, 27, 0, 0, tzinfo=dt.timezone.utc)
+
+        with mock.patch("connector._now_utc", return_value=fixed_now), mock.patch(
+            "connector.is_trading_time", return_value=True
+        ):
+            with self.assertRaises(connector.FXCMRetryableError):
+                connector._fetch_and_publish_recent(  # type: ignore[attr-defined]
+                    fx,  # type: ignore[arg-type]
+                    symbol="XAU/USD",
+                    timeframe_raw="m1",
+                    redis_client=None,
+                    lookback_minutes=240,
+                    last_open_time_ms={},
+                )

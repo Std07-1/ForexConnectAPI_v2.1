@@ -1682,6 +1682,82 @@ def _login_fxcm_once(config: FXCMConfig) -> ForexConnect:
     return fx
 
 
+def _compute_fxcm_login_probe_sleep_seconds(
+    now: dt.datetime,
+    *,
+    next_open: dt.datetime,
+) -> float:
+    """Обчислює паузу між спробами FXCM login, коли календар каже `closed`.
+
+    Ціль: не «кошмарити» FXCM у вихідні/паузи/тех-роботи, але почати
+    акуратне прощупування перед відкриттям, щоб не прийти останнім.
+    """
+
+    now_utc = now if now.tzinfo is not None else now.replace(tzinfo=dt.timezone.utc)
+    now_utc = now_utc.astimezone(dt.timezone.utc)
+    next_open_utc = (
+        next_open
+        if next_open.tzinfo is not None
+        else next_open.replace(tzinfo=dt.timezone.utc)
+    )
+    next_open_utc = next_open_utc.astimezone(dt.timezone.utc)
+    seconds_to_open = max(0.0, (next_open_utc - now_utc).total_seconds())
+
+    # Груба шкала: далеко до open → рідкісні спроби; близько → часті.
+    if seconds_to_open >= 12 * 3600:
+        base = 30 * 60
+    elif seconds_to_open >= 6 * 3600:
+        base = 15 * 60
+    elif seconds_to_open >= 2 * 3600:
+        base = 5 * 60
+    elif seconds_to_open >= 30 * 60:
+        base = 2 * 60
+    elif seconds_to_open >= 10 * 60:
+        base = 30
+    elif seconds_to_open >= 2 * 60:
+        base = 10
+    else:
+        base = 2
+
+    # Гарантія: не «проспати» відкриття.
+    if seconds_to_open > 0:
+        base = min(float(base), max(1.0, seconds_to_open - 5.0))
+    return float(max(1.0, base))
+
+
+def _log_fxcm_login_closed_wait_once(
+    now: dt.datetime,
+    *,
+    next_open: dt.datetime,
+    sleep_seconds: float,
+    exc: Exception,
+) -> None:
+    """Рейт-лімітований лог про невдалий login у календарно закритий час."""
+
+    attr = "_next_notice_utc"
+    now_utc = now if now.tzinfo is not None else now.replace(tzinfo=dt.timezone.utc)
+    now_utc = now_utc.astimezone(dt.timezone.utc)
+    next_notice = getattr(_log_fxcm_login_closed_wait_once, attr, None)
+    if isinstance(next_notice, dt.datetime) and now_utc < next_notice:
+        return
+
+    # Логуємо максимум раз на хвилину, бо перед open спроби можуть бути частими.
+    next_notice_dt = now_utc + dt.timedelta(seconds=60)
+    setattr(_log_fxcm_login_closed_wait_once, attr, next_notice_dt)
+
+    log.warning(
+        "FXCM login неуспішний у календарно закритий час: %s; наступна спроба через %.1f с; next_open=%s UTC.",
+        str(exc),
+        float(sleep_seconds),
+        (
+            (next_open if next_open.tzinfo is not None else next_open.replace(tzinfo=dt.timezone.utc))
+            .astimezone(dt.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+        ),
+    )
+
+
 def _close_fxcm_session(fx: Optional[ForexConnect], *, announce: bool = True) -> None:
     if fx is None:
         return
@@ -1702,6 +1778,25 @@ def _obtain_fxcm_session(
             backoff.reset()
             return fx
         except Exception as exc:  # noqa: BLE001
+            now = _now_utc()
+            # Якщо календар каже "closed" — не робимо агресивний експоненційний backoff,
+            # а адаптуємось під відстань до next_open.
+            if not is_trading_time(now):
+                next_open = next_trading_open(now)
+                sleep_seconds = _compute_fxcm_login_probe_sleep_seconds(
+                    now,
+                    next_open=next_open,
+                )
+                _log_fxcm_login_closed_wait_once(
+                    now,
+                    next_open=next_open,
+                    sleep_seconds=sleep_seconds,
+                    exc=exc,
+                )
+                backoff.reset()
+                time.sleep(float(sleep_seconds))
+                continue
+
             backoff.wait(f"FXCM логін неуспішний: {exc}")
 
 
@@ -2081,6 +2176,9 @@ def _download_history_range(
                     win_start,
                     win_end,
                 )
+            elif _is_fxcm_session_not_valid(exc):
+                PROM_ERROR_COUNTER.labels(type="fxcm_session_invalid").inc()
+                _log_fxcm_session_invalid_once(_now_utc())
             else:
                 log.exception(
                     "Помилка get_history(%s, %s, %s → %s): %s",
@@ -2357,6 +2455,27 @@ def _log_market_closed_once(
     return next_open_dt
 
 
+def _log_fxcm_session_invalid_once(now: dt.datetime) -> dt.datetime:
+    """Лог «FXCM session invalid» з приглушенням спаму.
+
+    На практиці це трапляється після обриву/простоїв ForexConnect.
+    Для history-cache/warmup це не фатально: просто пропускаємо вікна,
+    але даємо оператору зрозуміти, що потрібен reconnect.
+    """
+
+    attr = "_next_notice_utc"
+    next_notice = getattr(_log_fxcm_session_invalid_once, attr, None)
+    if isinstance(next_notice, dt.datetime) and now < next_notice:
+        return next_notice
+
+    next_notice_dt = now + dt.timedelta(seconds=60)
+    log.warning(
+        "FXCM: сесія недійсна (Session is not valid) — history-запити пропущено; потрібен reconnect."
+    )
+    setattr(_log_fxcm_session_invalid_once, attr, next_notice_dt)
+    return next_notice_dt
+
+
 def _notify_market_closed(now: dt.datetime, redis_client: Optional[Any]) -> dt.datetime:
     next_open = _log_market_closed_once(now)
     _publish_market_status(redis_client, "closed", next_open=next_open)
@@ -2381,6 +2500,11 @@ def _is_price_history_no_data(exc: Exception) -> bool:
     if "no data found for symbolid" in msg:
         return True
     return False
+
+
+def _is_fxcm_session_not_valid(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "session is not valid" in msg
 
 
 def _publish_market_status(
@@ -6620,6 +6744,8 @@ def fetch_history_sample(
                 start_dt,
                 end_dt,
             )
+        elif _is_fxcm_session_not_valid(exc):
+            _log_fxcm_session_invalid_once(end_dt)
         else:
             log.exception("Помилка під час запиту історії через get_history: %s", exc)
         return False

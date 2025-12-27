@@ -1,5 +1,11 @@
 # UPDATE
 
+## Політика записів (з 2025-12-27)
+
+- Це журнал змін у репозиторії.
+- Формат кожного запису: `YYYY-MM-DD HH:MM UTC → що зроблено → де зроблено → причина → тести/перевірки → ризики/нотатки/очікуваний результат`.
+- Мова: українська; технічні терміни (ATR/EMA/TP/SL/Redis/FXCM) — допускаються.
+
 ## v2.2 (2025-12-13)
 
 - Додано повний, точний опис контрактів Redis-каналів `fxcm:*` (OHLCV / price_tik / market_status / heartbeat / status) з правилами семантики полів, required/optional ключами та нюансами HMAC.
@@ -90,5 +96,12 @@
 
 ## v3.3 (2025-12-26)
 
-- FXCM history: помилки QuotesManager `Reason='unsupported scope'` + `No data found` (типово під час свят/пауз, коли календар каже `open`, але котирувань нема) тепер обробляються як очікуваний кейс: без `ERROR`/traceback, з пропуском вікна та `DEBUG`-логом.
-- Додано тест `tests/test_history_no_data.py` на коректну поведінку `get_history` при відсутності даних.
+- 2025-12-26 00:00 UTC → FXCM history: обробка `Reason='unsupported scope'` + `No data found` як очікуваного кейсу (без ERROR/traceback, пропуск вікна, DEBUG) → connector.py (+ tests/test_history_no_data.py) → на свята/паузи календар може казати `open`, але котирувань/барів нема → `python -m pytest -q tests\test_history_no_data.py` → менше шуму в логах, стрім/кеш не «падають», очікувано: конектор спокійно переживає “no data”.
+
+## v3.4 (2025-12-27)
+
+- 2025-12-27 00:00 UTC → FXCM history-cache/warmup: `Session is not valid` більше не спамить traceback у `_download_history_range` (rate-limited WARNING, пропуск) → connector.py (+ tests/test_history_no_data.py) → після обривів/простоїв ForexConnect це очікувано; stream має робити reconnect без шуму → `python -m pytest -q tests\test_history_no_data.py` → ризик: можемо пропустити короткі вікна під час недійсної сесії; очікувано: логін/реконект відпрацює, а логи залишаться читабельними.
+
+## v3.5 (2025-12-27)
+
+- 2025-12-27 00:10 UTC → FXCM login: календарно-обізнаний retry (менше “кошмаримо” FXCM у вихідні/паузи, але частіше пробуємо перед відкриттям, щоб залогінитись вчасно) → connector.py (+ tests/test_fxcm_login_probe_policy.py) → на тех-роботах/вихідних логін може падати; треба “акуратно прощупувати” і не прийти останнім на market open → `python -m pytest -q tests\test_fxcm_login_probe_policy.py` → ризик: неправильний календар може змістити графік проб; очікувано: менше зайвих логін-спроб у closed, але гарантований прогрів логіну перед open.
